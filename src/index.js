@@ -13,6 +13,13 @@ import adminRoutes from "./routes/admin.js";
 
 const app = express();
 
+// Running behind a single reverse proxy on the VPS (adds X-Forwarded-For).
+// Without this, express-rate-limit throws on every request instead of
+// computing a client IP, since Express doesn't trust that header by default
+// — this was silently breaking every rate-limited route (login, register,
+// uploads, guest search/download/feedback) in production.
+app.set("trust proxy", 1);
+
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN || "http://localhost:5173",
