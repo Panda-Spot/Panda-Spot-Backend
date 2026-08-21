@@ -6,7 +6,7 @@ Delegates only the actual face detection/embedding math to the internal
 `face-engine` Python microservice (`../face-engine`) — this app never touches
 InsightFace directly.
 
-## Architecture
+## Architecture 
 
 - **Auth**: photographer accounts (email/password via bcrypt), JWT in an
   httpOnly cookie. No guest accounts — guests reach an event via its public
