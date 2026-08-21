@@ -12,6 +12,7 @@ import { loadAccessibleEvent } from "../lib/access.js";
 import { sendCollaboratorInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import { uploadLimiter } from "../lib/rateLimiters.js";
+import { generateThumbnail } from "../lib/thumbnails.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -155,6 +156,7 @@ async function processUploadJob(jobId, event, files) {
           const photoId = randomUUID();
           const storedFilename = `${photoId}${ext}`;
           const storagePath = await saveEventPhoto(event.id, storedFilename, file.buffer);
+          const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
 
           const faces = detection.faces || [];
           const photo = await prisma.photo.create({
@@ -163,6 +165,7 @@ async function processUploadJob(jobId, event, files) {
               eventId: event.id,
               filename: file.originalname,
               storagePath,
+              thumbnailPath,
               faceCount: faces.length,
             },
           });
@@ -308,6 +311,7 @@ router.get("/:id/photos", async (req, res, next) => {
         face_count: p.faceCount,
         createdAt: p.createdAt,
         url: `/files/events/${event.id}/photos/${p.id}`,
+        thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
       }))
     );
   } catch (err) {

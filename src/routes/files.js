@@ -22,6 +22,28 @@ router.get("/events/:eventId/photos/:photoId", async (req, res, next) => {
   }
 });
 
+// Serves the resized preview generated at upload time — falls back to the
+// full-size original if thumbnailing failed or hasn't run for this photo
+// (e.g. a photo uploaded before this feature existed), so callers can
+// always just use this URL without checking first.
+router.get("/events/:eventId/photos/:photoId/thumb", async (req, res, next) => {
+  try {
+    const photo = await prisma.photo.findUnique({ where: { id: req.params.photoId } });
+    if (!photo || photo.eventId !== req.params.eventId) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+    if (photo.thumbnailPath && existsSync(photo.thumbnailPath)) {
+      return res.sendFile(photo.thumbnailPath);
+    }
+    if (!existsSync(photo.storagePath)) {
+      return res.status(404).json({ error: "Photo file missing on disk" });
+    }
+    res.sendFile(photo.storagePath);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Public by design: guests viewing an event's page need to see the
 // photographer's studio branding without logging in.
 router.get("/branding/:userId/logo", async (req, res, next) => {

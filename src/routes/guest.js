@@ -110,6 +110,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
             filename: photo.filename,
             similarity: Math.round(Number(r.similarity) * 10000) / 10000,
             url: `/files/events/${event.id}/photos/${photo.id}`,
+            thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
           };
         })
         .filter(Boolean)

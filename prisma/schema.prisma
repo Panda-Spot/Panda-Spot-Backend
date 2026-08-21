@@ -125,6 +125,10 @@ model Photo {
   event       Event    @relation(fields: [eventId], references: [id])
   filename    String
   storagePath String
+  /// Resized preview (~480px) generated at upload time for fast gallery
+  /// grids — null if generation failed, in which case callers fall back
+  /// to the full-size original. See lib/thumbnails.js.
+  thumbnailPath String?
   faceCount   Int      @default(0)
   createdAt   DateTime @default(now())
   faces       Face[]

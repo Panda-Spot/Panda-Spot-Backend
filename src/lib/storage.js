@@ -41,6 +41,23 @@ export function existsSync(filePath) {
   return fs.existsSync(filePath);
 }
 
+/** Absolute directory for a given event's photo thumbnails (kept separate from originals). */
+export function eventThumbDir(eventId) {
+  return path.join(eventDir(eventId), "thumbs");
+}
+
+/** Absolute path for one photo's thumbnail — always saved as .jpg regardless of the original's format. */
+export function eventThumbPath(eventId, photoId) {
+  return path.join(eventThumbDir(eventId), `${photoId}.jpg`);
+}
+
+/** Ensures an event's thumbnail directory exists on disk. */
+export async function ensureEventThumbDir(eventId) {
+  const dir = eventThumbDir(eventId);
+  await fsp.mkdir(dir, { recursive: true });
+  return dir;
+}
+
 /** Absolute directory for a given user's branding assets. */
 export function brandingDir(userId) {
   return path.join(storageRoot(), "branding", userId);

@@ -185,13 +185,24 @@ local test wasn't worth it given the real target is this Linux VPS, where
    - Upload a selfie of someone *not* in the photos → expect zero or near-zero matches.
    - Confirm a second photographer account can't see or upload to the first one's events (owner-scoping check).
 
+## Thumbnails
+
+Every uploaded photo gets a resized JPEG preview (~480px on the long edge,
+quality 78) generated at upload time via `sharp`/libvips (`src/lib/thumbnails.js`),
+saved alongside the original under `STORAGE_DIR/events/{eventId}/thumbs/`.
+`GET /events/:id/photos` and `POST /e/:slug/search`'s matches both include a
+`thumbnail_url` field for gallery grids; `GET /files/events/:eventId/photos/:photoId/thumb`
+serves it, falling back to the full-size original if generation failed or a
+photo predates this feature. Downloads/zips/watermarked shares still use the
+full-size original (`url`) — only grid previews use the thumbnail.
+
 ## What this deliberately does NOT do yet
 
 Same spirit as the original face-search spike this replaces: no billing/plans,
 no real antivirus scanning (upload validation is content-type/magic-byte
 sniffing only — a deliberate lightweight choice over standing up a ClamAV
-daemon on the VPS for this pass), no image thumbnailing, no CDN. Rate
-limiting, upload content validation, password reset, soft email verification,
-and Google Sign-In are now in place (see the tables above) — MVP first, these
-were the deliberately-deferred items from the previous pass, now done; the
-ones above remain the next steps before a real public launch.
+daemon on the VPS for this pass), no CDN. Rate limiting, upload content
+validation, password reset, soft email verification, Google Sign-In, and
+thumbnailing are now in place (see the tables/sections above) — MVP first,
+these were the deliberately-deferred items from previous passes, now done;
+the ones above remain the next steps before a real public launch.
