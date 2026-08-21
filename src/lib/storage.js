@@ -58,6 +58,19 @@ export async function ensureEventThumbDir(eventId) {
   return dir;
 }
 
+/** Deletes a single file if it exists — best-effort, never throws (a missing
+ * file on disk shouldn't block deleting the DB row that pointed to it). */
+export async function deleteFileIfExists(filePath) {
+  if (!filePath) return;
+  await fsp.unlink(filePath).catch(() => {});
+}
+
+/** Recursively removes an entire event's photo/thumbnail directory (used when
+ * deleting a whole event) — best-effort, never throws. */
+export async function removeEventDir(eventId) {
+  await fsp.rm(eventDir(eventId), { recursive: true, force: true }).catch(() => {});
+}
+
 /** Absolute directory for a given user's branding assets. */
 export function brandingDir(userId) {
   return path.join(storageRoot(), "branding", userId);

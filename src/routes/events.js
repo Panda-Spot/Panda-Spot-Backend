@@ -4,7 +4,8 @@ import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
-import { ALLOWED_EXTENSIONS, saveEventPhoto } from "../lib/storage.js";
+import { ALLOWED_EXTENSIONS, saveEventPhoto, deleteFileIfExists, removeEventDir } from "../lib/storage.js";
+import { zipDownloadPath } from "../lib/zip.js";
 import { detectFaces } from "../lib/faceEngine.js";
 import { insertFace } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
@@ -122,6 +123,40 @@ async function loadOwnedEvent(req, res) {
   }
   return event;
 }
+
+// Owner-only — deleting the whole event (guest link, every photo, every
+// collaborator) is a much bigger action than removing one bad photo.
+// Deletes in FK dependency order (children before the Event row itself),
+// then removes the event's entire photo/thumbnail directory from disk in
+// one shot, plus any pre-built zip files from the email-download flow.
+router.delete("/:id", async (req, res, next) => {
+  try {
+    const event = await loadOwnedEvent(req, res);
+    if (!event) return;
+
+    const zipDownloads = await prisma.zipDownload.findMany({ where: { eventId: event.id } });
+
+    await prisma.matchFeedback.deleteMany({
+      where: { search: { eventId: event.id } },
+    });
+    await prisma.guestSearch.deleteMany({ where: { eventId: event.id } });
+    await prisma.face.deleteMany({ where: { eventId: event.id } });
+    await prisma.photo.deleteMany({ where: { eventId: event.id } });
+    await prisma.zipDownload.deleteMany({ where: { eventId: event.id } });
+    await prisma.eventCollaborator.deleteMany({ where: { eventId: event.id } });
+    await prisma.eventInvite.deleteMany({ where: { eventId: event.id } });
+    await prisma.event.delete({ where: { id: event.id } });
+
+    await removeEventDir(event.id);
+    for (const z of zipDownloads) {
+      await deleteFileIfExists(z.filePath || zipDownloadPath(z.id));
+    }
+
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
 
 // Processes uploaded files sequentially against face-engine (a single
 // process — calls to it must not be parallelized), emitting a `progress`
@@ -314,6 +349,34 @@ router.get("/:id/photos", async (req, res, next) => {
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
       }))
     );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Owner or collaborator — mirrors upload permissions, since removing a bad
+// shot is a natural part of managing an event's photos.
+router.delete("/:id/photos/:photoId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    // Face rows have a real FK to Photo (RESTRICT) — must go first.
+    await prisma.face.deleteMany({ where: { photoId: photo.id } });
+    await prisma.photo.delete({ where: { id: photo.id } });
+
+    await deleteFileIfExists(photo.storagePath);
+    await deleteFileIfExists(photo.thumbnailPath);
+
+    res.status(204).end();
   } catch (err) {
     next(err);
   }
