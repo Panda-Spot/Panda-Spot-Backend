@@ -1,0 +1,199 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  /// Null for Google-only accounts (no password was ever set) — see routes/auth.js's
+  /// /auth/google handler and the login route's null-check.
+  passwordHash String?
+  name         String
+  createdAt    DateTime @default(now())
+  events       Event[]
+
+  /// Studio-wide branding, applied to every guest page across all of this
+  /// photographer's events (not per-event — see server/README.md's branding notes).
+  studioName String?
+  logoPath   String?
+  brandColor String?
+
+  collaboratesOn EventCollaborator[]
+
+  /// Google account id (the JWT `sub` claim) once linked via Sign in with
+  /// Google — null for accounts that have never used it.
+  googleId String? @unique
+
+  /// Null until the user clicks their emailed verification link. Verification
+  /// is soft/non-blocking (see routes/auth.js) — this only drives a UI nudge,
+  /// it never gates login or feature access.
+  emailVerifiedAt DateTime?
+
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+}
+
+/// A single-use, time-limited token emailed to confirm account ownership.
+/// Non-blocking (see User.emailVerifiedAt) — purely a soft nudge.
+model EmailVerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  token     String    @unique
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  @@index([userId])
+}
+
+/// A single-use, time-limited token emailed to let a user set a new password
+/// without knowing their old one. See routes/auth.js's /auth/password-reset/*.
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  token     String    @unique
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  @@index([userId])
+}
+
+model Event {
+  id        String   @id @default(uuid())
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id])
+  name      String
+  guestSlug String   @unique
+  createdAt DateTime @default(now())
+  photos    Photo[]
+
+  /// Per-event override of the global FACE_MATCH_THRESHOLD env default —
+  /// null until a guest's "not me" feedback nudges it. See lib/threshold.js.
+  matchThreshold Float?
+
+  guestSearches GuestSearch[]
+  zipDownloads  ZipDownload[]
+  collaborators EventCollaborator[]
+  invites       EventInvite[]
+}
+
+/// A second shooter/assistant granted upload+view access to one event without
+/// sharing the owner's login. Only the owner can manage collaborators/branding;
+/// collaborators can view the event, upload photos, and see its analytics.
+/// See lib/access.js for the owner-or-collaborator authorization helper.
+model EventCollaborator {
+  id        String   @id @default(uuid())
+  eventId   String
+  event     Event    @relation(fields: [eventId], references: [id])
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([eventId, userId])
+  @@index([userId])
+}
+
+/// A pending collaborator invite sent to an email address that may not have
+/// a PandaSpot account yet. Accepted (see routes/invites.js) either right
+/// away if the account already existed, or once the invitee registers/logs
+/// in via the invite link — at which point an EventCollaborator row is
+/// created and acceptedAt is stamped.
+model EventInvite {
+  id         String    @id @default(uuid())
+  eventId    String
+  event      Event     @relation(fields: [eventId], references: [id])
+  email      String
+  token      String    @unique
+  createdAt  DateTime  @default(now())
+  acceptedAt DateTime?
+
+  @@index([eventId])
+  @@index([email])
+}
+
+model Photo {
+  id          String   @id @default(uuid())
+  eventId     String
+  event       Event    @relation(fields: [eventId], references: [id])
+  filename    String
+  storagePath String
+  faceCount   Int      @default(0)
+  createdAt   DateTime @default(now())
+  faces       Face[]
+}
+
+/// Face rows are inserted/queried via raw SQL because the `embedding` column
+/// is an Unsupported pgvector type that Prisma Client cannot bind directly.
+/// See lib/faces.js for the raw INSERT / SELECT helpers. The migration also
+/// creates an HNSW index on `embedding` (Prisma's schema DSL can't express
+/// pgvector index types itself, so it's hand-written SQL, not declared here).
+model Face {
+  id        String                  @id @default(uuid())
+  photoId   String
+  photo     Photo                   @relation(fields: [photoId], references: [id])
+  eventId   String
+  bbox      Json
+  embedding Unsupported("vector(512)")
+  detScore  Float
+  createdAt DateTime                @default(now())
+
+  @@index([eventId])
+}
+
+/// One row per guest selfie search — stores the (averaged, if multi-selfie)
+/// query embedding so a later "not me" feedback report can be tied back to
+/// it, and doubles as the analytics source (search counts, unique guests via
+/// guestClientId, match rate). See lib/guestSearches.js for the raw
+/// INSERT (embedding is Unsupported, same reason as Face.embedding).
+model GuestSearch {
+  id            String   @id @default(uuid())
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id])
+  embedding     Unsupported("vector(512)")
+  facesDetected Int
+  matchCount    Int
+  guestClientId String?
+  createdAt     DateTime @default(now())
+
+  feedback MatchFeedback[]
+
+  @@index([eventId])
+}
+
+/// A guest marking one match as "not me". Used to auto-nudge Event.matchThreshold
+/// upward (see lib/threshold.js) and as an analytics signal.
+model MatchFeedback {
+  id         String      @id @default(uuid())
+  searchId   String
+  search     GuestSearch @relation(fields: [searchId], references: [id])
+  photoId    String
+  similarity Float
+  createdAt  DateTime    @default(now())
+
+  @@index([searchId])
+}
+
+/// A pre-built zip, generated asynchronously and emailed to a guest as a
+/// download link instead of blocking their browser tab on a large selection.
+model ZipDownload {
+  id           String    @id @default(uuid())
+  eventId      String
+  event        Event     @relation(fields: [eventId], references: [id])
+  photoIds     Json
+  email        String?
+  status       String    @default("pending") // pending | ready | failed
+  filePath     String?
+  errorMessage String?
+  createdAt    DateTime  @default(now())
+  readyAt      DateTime?
+
+  @@index([eventId])
+}

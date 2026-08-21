@@ -1,0 +1,77 @@
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+const STORAGE_DIR = process.env.STORAGE_DIR || "./storage";
+
+export const ALLOWED_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+
+/** Resolves STORAGE_DIR to an absolute path (relative to process cwd if not absolute). */
+export function storageRoot() {
+  return path.resolve(STORAGE_DIR);
+}
+
+/** Absolute directory for a given event's photos. */
+export function eventDir(eventId) {
+  return path.join(storageRoot(), "events", eventId);
+}
+
+/** Absolute path for a specific photo file within an event's directory. */
+export function eventPhotoPath(eventId, filename) {
+  return path.join(eventDir(eventId), filename);
+}
+
+/** Ensures an event's photo directory exists on disk. */
+export async function ensureEventDir(eventId) {
+  const dir = eventDir(eventId);
+  await fsp.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+/** Writes a buffer to disk under the given event's directory, returns the absolute path. */
+export async function saveEventPhoto(eventId, filename, buffer) {
+  await ensureEventDir(eventId);
+  const fullPath = eventPhotoPath(eventId, filename);
+  await fsp.writeFile(fullPath, buffer);
+  return fullPath;
+}
+
+/** True if a path exists on disk (sync, used for quick 404 checks before streaming). */
+export function existsSync(filePath) {
+  return fs.existsSync(filePath);
+}
+
+/** Absolute directory for a given user's branding assets. */
+export function brandingDir(userId) {
+  return path.join(storageRoot(), "branding", userId);
+}
+
+/**
+ * Saves (or overwrites) a photographer's studio logo. Always keeps exactly
+ * one logo file per user — if a previous logo exists under a different
+ * extension (e.g. they re-upload a .png after a .jpg), the old file is
+ * deleted first so it doesn't linger as an orphan.
+ */
+export async function saveBrandingLogo(userId, filename, buffer) {
+  const dir = brandingDir(userId);
+  await fsp.mkdir(dir, { recursive: true });
+
+  const ext = path.extname(filename).toLowerCase();
+  const newPath = path.join(dir, `logo${ext}`);
+
+  // Remove any previous logo file(s) under other extensions.
+  let existing = [];
+  try {
+    existing = await fsp.readdir(dir);
+  } catch {
+    existing = [];
+  }
+  for (const entry of existing) {
+    if (entry.startsWith("logo") && path.join(dir, entry) !== newPath) {
+      await fsp.unlink(path.join(dir, entry)).catch(() => {});
+    }
+  }
+
+  await fsp.writeFile(newPath, buffer);
+  return newPath;
+}

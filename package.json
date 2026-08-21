@@ -1,0 +1,33 @@
+{
+  "name": "pandaspot-server",
+  "version": "1.0.0",
+  "description": "PandaSpot backend API - event photo face search",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.20.0",
+    "archiver": "^7.0.1",
+    "bcrypt": "^5.1.1",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "google-auth-library": "^9.14.1",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.1",
+    "nodemailer": "^9.0.5"
+  },
+  "devDependencies": {
+    "prisma": "^5.20.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
