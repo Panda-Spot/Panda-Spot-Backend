@@ -16,6 +16,7 @@ import { uploadLimiter } from "../lib/rateLimiters.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, countOwnedEvents, eventStorageUsedBytes } from "../lib/planLimits.js";
 import { computeExpiresAt } from "../lib/expiry.js";
+import { bucketByDay } from "../lib/dailyBuckets.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -425,11 +426,24 @@ router.get("/:id/analytics", async (req, res, next) => {
       where: { search: { eventId: event.id } },
     });
 
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const recentSearches = await prisma.guestSearch.findMany({
+      where: { eventId: event.id, createdAt: { gte: thirtyDaysAgo } },
+      select: { createdAt: true, matchCount: true },
+    });
+    const dailySearches = bucketByDay(recentSearches.map((s) => s.createdAt));
+    const dailyMatches = bucketByDay(
+      recentSearches.filter((s) => s.matchCount > 0).map((s) => s.createdAt)
+    );
+
     res.json({
       total_searches: totalSearches,
       unique_guests: uniqueGuests,
       match_rate: matchRate,
       feedback_count: feedbackCount,
+      daily_searches: dailySearches,
+      daily_matches: dailyMatches,
     });
   } catch (err) {
     next(err);

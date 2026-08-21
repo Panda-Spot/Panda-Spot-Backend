@@ -133,7 +133,7 @@ Routes marked "owner or collaborator" below accept either; routes marked
 | GET | `/events/:id/uploads/:jobId/stream` | owner or collaborator | Server-Sent Events stream of `progress` events (`total`, `completed`, `current_file`, `photos_per_second`, `eta_seconds`, `faces_found_so_far`, `skipped_so_far`) for an upload job started above, ending in a terminal `done` or `error` event. If the job already finished before you connect, sends that last event immediately and closes. |
 | GET | `/events/:id/photos` | owner or collaborator | List photos in an event |
 | DELETE | `/events/:id/photos/:photoId` | owner or collaborator | Deletes one photo (its faces, DB row, and both the original + thumbnail files on disk). `204` on success, `404` if not found |
-| GET | `/events/:id/analytics` | owner or collaborator | `{ total_searches, unique_guests, match_rate, feedback_count }` aggregated from that event's `GuestSearch`/`MatchFeedback` rows |
+| GET | `/events/:id/analytics` | owner or collaborator | `{ total_searches, unique_guests, match_rate, feedback_count, daily_searches, daily_matches }` — the first four aggregated from that event's `GuestSearch`/`MatchFeedback` rows; `daily_searches`/`daily_matches` are zero-filled 30-day `[{ date: "YYYY-MM-DD", count }]` series (see `src/lib/dailyBuckets.js`) for trend charts |
 | POST | `/events/:id/collaborators` | owner-only | `{ email }` → if a `User` with that email already exists, adds them as a collaborator immediately (`{ status: "added", email }`); otherwise creates (or reuses) a pending `EventInvite` and emails them an invite link (`{ status: "invited", email }`, a no-op console warning if `SMTP_HOST` isn't configured). 400 if `email` is missing/malformed or matches the owner's own email. |
 | GET | `/events/:id/collaborators` | owner-only | `{ collaborators: [{ user_id, email, name }], pending_invites: [{ invite_id, email, invited_at }] }` |
 | DELETE | `/events/:id/collaborators/:userId` | owner-only | Removes that collaborator. `204` on success, `404` if not a collaborator |
@@ -234,7 +234,7 @@ system; it's a hardcoded allowlist for the operator's own use.
 
 | Method | Path | Auth | What |
 |---|---|---|---|
-| GET | `/admin/overview` | admin allowlist only | `{ total_users, total_events, total_photos, total_storage_bytes, total_searches, recent_events: [{ id, name, owner_email, photo_count, created_at }] }`. `403 { error: "Admin access required" }` for any authenticated non-admin user; `401` if not authenticated at all. |
+| GET | `/admin/overview` | admin allowlist only | `{ total_users, total_events, total_photos, total_storage_bytes, total_searches, daily_signups, daily_events, recent_events: [{ id, name, owner_email, photo_count, created_at }] }` — `daily_signups`/`daily_events` are zero-filled 30-day `[{ date, count }]` series (`src/lib/dailyBuckets.js`) for trend charts. `403 { error: "Admin access required" }` for any authenticated non-admin user; `401` if not authenticated at all. |
 
 ## Verifying the full flow (do this on the VPS)
 
