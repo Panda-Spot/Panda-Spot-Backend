@@ -13,6 +13,7 @@ import { sendZipReadyEmail } from "../lib/mailer.js";
 import { ALLOWED_EXTENSIONS } from "../lib/storage.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import { guestSearchLimiter, guestDownloadLimiter, guestFeedbackLimiter } from "../lib/rateLimiters.js";
+import { isExpired } from "../lib/expiry.js";
 
 const router = Router();
 
@@ -33,6 +34,7 @@ router.get("/:slug", async (req, res, next) => {
       studio_name: event.owner?.studioName ?? null,
       logo_url: event.owner?.logoPath ? `/files/branding/${event.owner.id}/logo` : null,
       brand_color: event.owner?.brandColor ?? null,
+      expired: isExpired(event),
     });
   } catch (err) {
     next(err);
@@ -44,6 +46,9 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
     const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
     }
 
     const files = req.files || [];
@@ -141,6 +146,9 @@ router.post("/:slug/feedback", guestFeedbackLimiter, async (req, res, next) => {
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
 
     const { search_id, photo_id } = req.body || {};
     if (!search_id || !photo_id) {
@@ -178,6 +186,9 @@ router.post("/:slug/download", guestDownloadLimiter, async (req, res, next) => {
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
 
     const photoIds = req.body?.photo_ids;
     if (!Array.isArray(photoIds) || photoIds.length === 0) {
@@ -209,6 +220,9 @@ router.post("/:slug/download/email", guestDownloadLimiter, async (req, res, next
     const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
     }
 
     const { photo_ids: photoIds, email } = req.body || {};
@@ -274,6 +288,9 @@ router.get("/:slug/downloads/:downloadId", async (req, res, next) => {
     const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
     }
 
     const zipDownload = await prisma.zipDownload.findUnique({ where: { id: req.params.downloadId } });

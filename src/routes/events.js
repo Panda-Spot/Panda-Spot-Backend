@@ -14,6 +14,8 @@ import { sendCollaboratorInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import { uploadLimiter } from "../lib/rateLimiters.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
+import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, countOwnedEvents, eventStorageUsedBytes } from "../lib/planLimits.js";
+import { computeExpiresAt } from "../lib/expiry.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -45,9 +47,16 @@ router.post("/", async (req, res, next) => {
       return res.status(400).json({ error: "name is required" });
     }
 
+    const ownedCount = await countOwnedEvents(prisma, req.user.id);
+    if (ownedCount >= FREE_EVENT_LIMIT) {
+      return res.status(403).json({
+        error: "You've reached the free plan limit of 15 events. Upgrade coming soon.",
+      });
+    }
+
     const guestSlug = await generateUniqueSlug();
     const event = await prisma.event.create({
-      data: { name: name.trim(), ownerId: req.user.id, guestSlug },
+      data: { name: name.trim(), ownerId: req.user.id, guestSlug, expiresAt: computeExpiresAt() },
     });
 
     res.status(201).json({ ...event, guestLink: guestLinkPath(event.guestSlug) });
@@ -82,6 +91,7 @@ router.get("/", async (req, res, next) => {
         guestSlug: e.guestSlug,
         guestLink: guestLinkPath(e.guestSlug),
         createdAt: e.createdAt,
+        expires_at: e.expiresAt,
         photo_count: e._count.photos,
         role: e.role,
       }))
@@ -98,6 +108,7 @@ router.get("/:id", async (req, res, next) => {
     const { event, role } = accessible;
 
     const photoCount = await prisma.photo.count({ where: { eventId: event.id } });
+    const storageUsedBytes = await eventStorageUsedBytes(prisma, event.id);
 
     res.json({
       id: event.id,
@@ -105,7 +116,10 @@ router.get("/:id", async (req, res, next) => {
       guestSlug: event.guestSlug,
       guestLink: guestLinkPath(event.guestSlug),
       createdAt: event.createdAt,
+      expires_at: event.expiresAt,
       photo_count: photoCount,
+      storage_used_bytes: storageUsedBytes,
+      storage_limit_bytes: FREE_EVENT_STORAGE_BYTES,
       role,
     });
   } catch (err) {
@@ -169,6 +183,7 @@ async function processUploadJob(jobId, event, files) {
   let completed = 0;
   let facesFoundSoFar = 0;
   const startedAt = Date.now();
+  let usedBytes = await eventStorageUsedBytes(prisma, event.id);
 
   try {
     for (const file of files) {
@@ -178,6 +193,8 @@ async function processUploadJob(jobId, event, files) {
         skipped.push(`${file.originalname} (unsupported file type)`);
       } else if (!contentMatchesExtension(file.buffer, ext)) {
         skipped.push(`${file.originalname} (file content doesn't match its extension)`);
+      } else if (usedBytes + file.buffer.length > FREE_EVENT_STORAGE_BYTES) {
+        skipped.push(`${file.originalname} (event storage limit reached — 10GB free plan cap)`);
       } else {
         let detection;
         try {
@@ -202,6 +219,7 @@ async function processUploadJob(jobId, event, files) {
               storagePath,
               thumbnailPath,
               faceCount: faces.length,
+              fileSize: file.buffer.length,
             },
           });
 
@@ -216,6 +234,7 @@ async function processUploadJob(jobId, event, files) {
           }
 
           facesFoundSoFar += faces.length;
+          usedBytes += file.buffer.length;
         }
       }
 

@@ -6,6 +6,11 @@ Delegates only the actual face detection/embedding math to the internal
 `face-engine` Python microservice (`../face-engine`) — this app never touches
 InsightFace directly.
 
+**Milestone note**: the MVP is feature-complete. Billing is a "coming soon"
+placeholder — there's no real Stripe integration yet — but the free-tier
+limits below (event count, per-event storage) are hard-enforced in the
+meantime, not just cosmetic. See "Plan limits" and "Event expiry" below.
+
 ## Architecture 
 
 - **Auth**: photographer accounts (email/password via bcrypt), JWT in an
@@ -80,6 +85,7 @@ InsightFace directly.
 | `PUBLIC_SERVER_URL` | This server's own public base URL, used to build the emailed zip download link, default `http://localhost:4000` |
 | `PUBLIC_WEB_URL` | The frontend web app's public base URL, used to build collaborator invite links (`${PUBLIC_WEB_URL}/invites/:token`), default `http://localhost:5173` |
 | `GOOGLE_CLIENT_ID` | Google OAuth Client ID for "Sign in with Google" (Google Cloud Console > APIs & Services > Credentials). Unset by default — `POST /auth/google` responds `503` cleanly until this is configured. |
+| `ADMIN_EMAILS` | Comma-separated allowlist of email addresses allowed to hit `/admin/*` (the platform-operator overview — not a general role system). e.g. `"you@example.com,teammate@example.com"`. Unset = nobody can access `/admin/*`. |
 
 ## API
 
@@ -90,6 +96,11 @@ Every user response (`register`/`login`/`me`/`google`) now includes
 gates login or feature access, it's purely a UI nudge (see `emailVerifiedAt`
 on `User`). `POST /auth/login` returns a clear 401 if the account is
 Google-only (no `passwordHash` set) rather than attempting a password check.
+
+Every user response also now includes `is_admin: boolean` — `true` only if
+the account's email is in the `ADMIN_EMAILS` allowlist (see "Platform admin"
+below). This is purely so the frontend knows whether to show an Admin nav
+link; the real gate is server-side on `/admin/*`.
 
 | Method | Path | Auth | Rate limit | What |
 |---|---|---|---|---|
@@ -114,11 +125,11 @@ Routes marked "owner or collaborator" below accept either; routes marked
 
 | Method | Path | Auth | What |
 |---|---|---|---|
-| POST | `/events` | required | `{ name }` → creates an event with a unique `guestSlug` |
-| GET | `/events` | required | List events you own AND events you collaborate on, each tagged with `role: "owner" \| "collaborator"`, with photo counts |
-| GET | `/events/:id` | owner or collaborator | One event, now includes `role: "owner" \| "collaborator"` in the response: `{ id, name, guestSlug, guestLink, createdAt, photo_count, role }` |
+| POST | `/events` | required | `{ name }` → creates an event with a unique `guestSlug` and `expiresAt` stamped 90 days out (see "Event expiry" below). `403 { error }` if you already own `FREE_EVENT_LIMIT` (15) events — see "Plan limits" below. |
+| GET | `/events` | required | List events you own AND events you collaborate on, each tagged with `role: "owner" \| "collaborator"`, with photo counts and `expires_at`. (No per-event storage numbers here — that would be an N+1 aggregation; the frontend can compute "X/15 events used" from this list's own length.) |
+| GET | `/events/:id` | owner or collaborator | One event: `{ id, name, guestSlug, guestLink, createdAt, expires_at, photo_count, storage_used_bytes, storage_limit_bytes, role }` |
 | DELETE | `/events/:id` | owner-only | Permanently deletes the event and everything under it (photos, faces, guest searches/feedback, zip downloads, collaborators, invites) plus the event's entire photo/thumbnail directory on disk. `204` on success |
-| POST | `/events/:id/photos` | owner or collaborator | 30/hour/IP · **Breaking change:** multipart `files` (multiple) → now responds immediately with `202 { job_id }` instead of the old synchronous body; processing happens in-process, sequentially, in the background. Follow up with the SSE stream below to get progress and the final `photos_processed`/`faces_found`/`skipped` result (delivered as the terminal `done` event, same field names as the old response body). |
+| POST | `/events/:id/photos` | owner or collaborator | 30/hour/IP · **Breaking change:** multipart `files` (multiple) → now responds immediately with `202 { job_id }` instead of the old synchronous body; processing happens in-process, sequentially, in the background. Follow up with the SSE stream below to get progress and the final `photos_processed`/`faces_found`/`skipped` result (delivered as the terminal `done` event, same field names as the old response body). Each file is also checked against the event's 10GB free-plan storage cap (see "Plan limits" below) — a file that would push the event over the cap is skipped (added to `skipped`, reason `"... (event storage limit reached — 10GB free plan cap)"`) rather than blocking the rest of the batch. |
 | GET | `/events/:id/uploads/:jobId/stream` | owner or collaborator | Server-Sent Events stream of `progress` events (`total`, `completed`, `current_file`, `photos_per_second`, `eta_seconds`, `faces_found_so_far`, `skipped_so_far`) for an upload job started above, ending in a terminal `done` or `error` event. If the job already finished before you connect, sends that last event immediately and closes. |
 | GET | `/events/:id/photos` | owner or collaborator | List photos in an event |
 | DELETE | `/events/:id/photos/:photoId` | owner or collaborator | Deletes one photo (its faces, DB row, and both the original + thumbnail files on disk). `204` on success, `404` if not found |
@@ -137,14 +148,23 @@ extension (`src/lib/fileValidation.js`; a renamed non-image file is rejected
 even with a `.jpg` name). This is deliberately lightweight (no ClamAV/real
 antivirus scanning) — see "What this deliberately does NOT do yet" below.
 
+**Expiry**: every event soft-closes to guests 90 days after creation (see
+"Event expiry" below). `GET /e/:slug` still returns `200` for an expired
+event (with `expired: true`) so the frontend can render a graceful
+"this event's search window has closed" message. Every other guest route in
+this section — search/feedback/download/download-by-email/download-status —
+enforces this server-side too: `410 { error: "This event's guest access has
+closed." }` if the event has expired. This is defense-in-depth in case the
+frontend doesn't check the `expired` flag first.
+
 | Method | Path | Rate limit | What |
 |---|---|---|---|
-| GET | `/e/:slug` | — | Event's public name + owning photographer's branding: `{ id, name, studio_name, logo_url, brand_color }`. 404 if the slug doesn't exist |
-| POST | `/e/:slug/search` | 10/5min/IP | **Breaking change:** multipart `selfies` (1-3 files, repeated field — replaces the old single `selfie` field) + optional text field `guest_client_id` → averages each selfie's largest-face embedding (renormalized to unit length) as the query, using the event's adjustable match threshold. A selfie that fails the extension/content-type check is skipped (not the whole request); if all selfies fail or none have a detectable face, `422`. Response: `{ search_id, faces_detected_in_selfie, matches: [...] }` — same match shape as before, with `search_id` added. Persists a `GuestSearch` row per call (used by feedback + analytics below). |
-| POST | `/e/:slug/feedback` | 30/15min/IP | `{ search_id, photo_id }` → guest reporting a match as wrong; nudges that event's match threshold up slightly and records a `MatchFeedback` row. Responds `{ ok: true, new_threshold }`. 404 if the search doesn't exist or belongs to a different event. |
-| POST | `/e/:slug/download` | 20/15min/IP | `{ photo_ids: [...] }` (from a prior search's matches) → streams a zip of those photos immediately |
-| POST | `/e/:slug/download/email` | 20/15min/IP | `{ photo_ids: [...], email }` → for large/slow selections: creates a `ZipDownload` row and responds `{ ok: true }` right away, then builds the zip to disk in the background and emails the guest a download link (a no-op console warning if `SMTP_HOST` isn't configured yet) |
-| GET | `/e/:slug/downloads/:downloadId` | — | Streams the pre-built zip once ready. `409 { error }` if the `ZipDownload` isn't `status: "ready"` yet, `404` if it doesn't exist or belongs to a different event |
+| GET | `/e/:slug` | — | Event's public name + owning photographer's branding: `{ id, name, studio_name, logo_url, brand_color, expired }`. 404 if the slug doesn't exist |
+| POST | `/e/:slug/search` | 10/5min/IP | **Breaking change:** multipart `selfies` (1-3 files, repeated field — replaces the old single `selfie` field) + optional text field `guest_client_id` → averages each selfie's largest-face embedding (renormalized to unit length) as the query, using the event's adjustable match threshold. A selfie that fails the extension/content-type check is skipped (not the whole request); if all selfies fail or none have a detectable face, `422`. Response: `{ search_id, faces_detected_in_selfie, matches: [...] }` — same match shape as before, with `search_id` added. Persists a `GuestSearch` row per call (used by feedback + analytics below). `410` if the event has expired. |
+| POST | `/e/:slug/feedback` | 30/15min/IP | `{ search_id, photo_id }` → guest reporting a match as wrong; nudges that event's match threshold up slightly and records a `MatchFeedback` row. Responds `{ ok: true, new_threshold }`. 404 if the search doesn't exist or belongs to a different event. `410` if the event has expired. |
+| POST | `/e/:slug/download` | 20/15min/IP | `{ photo_ids: [...] }` (from a prior search's matches) → streams a zip of those photos immediately. `410` if the event has expired. |
+| POST | `/e/:slug/download/email` | 20/15min/IP | `{ photo_ids: [...], email }` → for large/slow selections: creates a `ZipDownload` row and responds `{ ok: true }` right away, then builds the zip to disk in the background and emails the guest a download link (a no-op console warning if `SMTP_HOST` isn't configured yet). `410` if the event has expired. |
+| GET | `/e/:slug/downloads/:downloadId` | — | Streams the pre-built zip once ready. `409 { error }` if the `ZipDownload` isn't `status: "ready"` yet, `404` if it doesn't exist or belongs to a different event, `410` if the event has expired |
 
 ### Invites (collaborator invite acceptance)
 | Method | Path | Auth | What |
@@ -163,6 +183,58 @@ antivirus scanning) — see "What this deliberately does NOT do yet" below.
 |---|---|---|
 | GET | `/files/events/:eventId/photos/:photoId` | Serves the actual image file |
 | GET | `/files/branding/:userId/logo` | Public — serves a photographer's studio logo (guests need to see it on the guest page without logging in). 404 if no logo is set |
+
+## Plan limits (free tier, billing coming soon)
+
+There's no real Stripe integration yet, but two free-tier limits are
+hard-enforced in the meantime (`src/lib/planLimits.js`):
+
+- **Event count**: a photographer can own at most `FREE_EVENT_LIMIT` (15)
+  events. `POST /events` responds `403 { error: "You've reached the free plan
+  limit of 15 events. Upgrade coming soon." }` once that's hit, and the event
+  is not created. This only counts events you *own* — events you collaborate
+  on don't count against your own limit.
+- **Per-event storage**: each event has a `FREE_EVENT_STORAGE_BYTES` (10GB)
+  cap on original photo bytes (thumbnails aren't counted — negligible size).
+  During `POST /events/:id/photos`, each file is checked against the running
+  total *before* it's sent to face-engine; a file that would push the event
+  over the cap is skipped (same `skipped[]` mechanism as unsupported-type/
+  bad-content skips) with reason `"... (event storage limit reached — 10GB
+  free plan cap)"` — it doesn't fail the rest of the batch. `GET /events/:id`
+  exposes `storage_used_bytes` and `storage_limit_bytes` so the frontend can
+  show a usage meter.
+
+## Event expiry (90-day soft close)
+
+Every event gets an `expiresAt` stamped at creation (`createdAt` + 90 days,
+`EVENT_EXPIRY_DAYS` in `src/lib/expiry.js`). Once past that date:
+
+- **Nothing is deleted.** The photographer (owner or collaborator) keeps
+  full access to the event, its photos, and analytics regardless of expiry —
+  `GET/DELETE /events/:id` and friends are completely unaffected.
+- **Guest access soft-closes.** `GET /e/:slug` still returns `200` with an
+  `expired: true` flag so the frontend can show a "this event's search
+  window has closed" message instead of a bare error. Every other
+  guest-facing route (search/feedback/download/download-by-email/
+  download-status) enforces this server-side with a `410 { error: "This
+  event's guest access has closed." }`, checked immediately after loading the
+  event — before any other work.
+
+`GET /events` and `GET /events/:id` both expose `expires_at` to the
+photographer so the frontend can show "closes in N days" ahead of time.
+
+## Platform admin (operator-only, not a general role system)
+
+A small `/admin/*` surface for the platform operator (you) to see aggregate
+usage — total users/events/photos/storage/searches and the 20 most recently
+created events. Gated by `ADMIN_EMAILS` (comma-separated allowlist env var),
+checked against the JWT's `email` claim — no DB round-trip needed
+(`src/middleware/admin.js`). This is deliberately *not* a general role/permission
+system; it's a hardcoded allowlist for the operator's own use.
+
+| Method | Path | Auth | What |
+|---|---|---|---|
+| GET | `/admin/overview` | admin allowlist only | `{ total_users, total_events, total_photos, total_storage_bytes, total_searches, recent_events: [{ id, name, owner_email, photo_count, created_at }] }`. `403 { error: "Admin access required" }` for any authenticated non-admin user; `401` if not authenticated at all. |
 
 ## Verifying the full flow (do this on the VPS)
 
@@ -200,11 +272,14 @@ full-size original (`url`) — only grid previews use the thumbnail.
 
 ## What this deliberately does NOT do yet
 
-Same spirit as the original face-search spike this replaces: no billing/plans,
-no real antivirus scanning (upload validation is content-type/magic-byte
-sniffing only — a deliberate lightweight choice over standing up a ClamAV
-daemon on the VPS for this pass), no CDN. Rate limiting, upload content
-validation, password reset, soft email verification, Google Sign-In, and
-thumbnailing are now in place (see the tables/sections above) — MVP first,
-these were the deliberately-deferred items from previous passes, now done;
-the ones above remain the next steps before a real public launch.
+Same spirit as the original face-search spike this replaces: no *real*
+billing (Stripe et al) — free-tier event count and per-event storage limits
+are hard-enforced (see "Plan limits" above), but there's no payment flow to
+actually upgrade past them yet. Also still missing: real antivirus scanning
+(upload validation is content-type/magic-byte sniffing only — a deliberate
+lightweight choice over standing up a ClamAV daemon on the VPS for this
+pass), no CDN. Rate limiting, upload content validation, password reset,
+soft email verification, Google Sign-In, thumbnailing, event expiry, and a
+platform admin overview are now in place (see the tables/sections above) —
+MVP first, these were the deliberately-deferred items from previous passes,
+now done; the ones above remain the next steps before a real public launch.

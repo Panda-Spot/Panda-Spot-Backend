@@ -79,6 +79,12 @@ model Event {
   /// null until a guest's "not me" feedback nudges it. See lib/threshold.js.
   matchThreshold Float?
 
+  /// Stamped at creation as createdAt + 90 days. Once past, guest-facing
+  /// routes (search/download/feedback) soft-close with a 410 — the
+  /// photographer keeps full access regardless; nothing is deleted.
+  /// See lib/expiry.js.
+  expiresAt DateTime
+
   guestSearches GuestSearch[]
   zipDownloads  ZipDownload[]
   collaborators EventCollaborator[]
@@ -129,6 +135,9 @@ model Photo {
   /// grids — null if generation failed, in which case callers fall back
   /// to the full-size original. See lib/thumbnails.js.
   thumbnailPath String?
+  /// Original file size in bytes — used to enforce the free-tier per-event
+  /// storage cap (see lib/planLimits.js). Thumbnails aren't counted (negligible).
+  fileSize    Int      @default(0)
   faceCount   Int      @default(0)
   createdAt   DateTime @default(now())
   faces       Face[]

@@ -9,6 +9,7 @@ import guestRoutes from "./routes/guest.js";
 import filesRoutes from "./routes/files.js";
 import brandingRoutes from "./routes/branding.js";
 import invitesRoutes from "./routes/invites.js";
+import adminRoutes from "./routes/admin.js";
 
 const app = express();
 
@@ -29,6 +30,7 @@ app.use("/e", guestRoutes);
 app.use("/files", filesRoutes);
 app.use("/branding", brandingRoutes);
 app.use("/invites", invitesRoutes);
+app.use("/admin", adminRoutes);
 
 // Multer file-size/type errors and anything passed to next(err) lands here.
 app.use((err, _req, res, _next) => {

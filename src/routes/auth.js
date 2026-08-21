@@ -6,6 +6,7 @@ import { prisma } from "../lib/prisma.js";
 import { signToken, setAuthCookie, clearAuthCookie, requireAuth } from "../middleware/auth.js";
 import { sendEmailVerificationEmail, sendPasswordResetEmail } from "../lib/mailer.js";
 import { authLimiter, registerLimiter } from "../lib/rateLimiters.js";
+import { isAdminEmail } from "../middleware/admin.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 
@@ -17,7 +18,13 @@ const BCRYPT_ROUNDS = 10;
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 
 function publicUser(user) {
-  return { id: user.id, email: user.email, name: user.name, email_verified: !!user.emailVerifiedAt };
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    email_verified: !!user.emailVerifiedAt,
+    is_admin: isAdminEmail(user.email),
+  };
 }
 
 router.post("/register", registerLimiter, async (req, res, next) => {
