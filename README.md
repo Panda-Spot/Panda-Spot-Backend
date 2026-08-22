@@ -13,9 +13,21 @@ meantime, not just cosmetic. See "Plan limits" and "Event expiry" below.
 
 ## Architecture 
 
-- **Auth**: photographer accounts (email/password via bcrypt), JWT in an
-  httpOnly cookie. No guest accounts — guests reach an event via its public
-  `guestSlug` link and never log in.
+- **Auth**: photographer accounts (email/password via bcrypt). `POST /auth/register`,
+  `/login`, and `/google` all return a JWT in the response body as `token` —
+  the frontend stores it (localStorage) and sends it back as
+  `Authorization: Bearer <token>` on every request. This is the primary auth
+  mechanism; an httpOnly cookie is also still set as a harmless bonus (works
+  fine if this API is ever made same-site with its frontend) but isn't relied
+  on, since a cross-site cookie between two unrelated domains (this API vs. a
+  frontend on a different domain, e.g. Vercel) gets silently dropped by
+  third-party-cookie blocking in Safari (default) and increasingly Chrome —
+  that class of bug is what motivated the switch. `requireAuth`
+  (`src/middleware/auth.js`) checks, in order: the `Authorization` header,
+  then a `?token=` query param (for the SSE upload-progress stream, since
+  `EventSource` can't set custom headers), then the cookie as a last resort.
+  No guest accounts — guests reach an event via its public `guestSlug` link
+  and never log in.
 - **Storage**: uploaded photos are saved to `STORAGE_DIR/events/{eventId}/`
   on local disk (this app's own VPS, no S3).
 - **Face data**: every uploaded photo is sent to `face-engine`'s `POST /detect`,
@@ -104,15 +116,15 @@ link; the real gate is server-side on `/admin/*`.
 
 | Method | Path | Auth | Rate limit | What |
 |---|---|---|---|---|
-| POST | `/auth/register` | — | 5/hour/IP | `{ email, password, name }` → creates account, sets cookie, sends a (non-blocking) verification email |
-| POST | `/auth/login` | — | 10/15min/IP | `{ email, password }` → sets cookie |
+| POST | `/auth/register` | — | 5/hour/IP | `{ email, password, name }` → creates account, response includes `token` (the primary auth mechanism — see "Auth" above), also sets the bonus cookie, sends a (non-blocking) verification email |
+| POST | `/auth/login` | — | 10/15min/IP | `{ email, password }` → response includes `token`, also sets the bonus cookie |
 | POST | `/auth/logout` | — | — | Clears the cookie |
 | GET | `/auth/me` | required | — | Current user, or 401 |
 | POST | `/auth/email-verification/request` | required | — | Sends a fresh verification email. `{ ok: true }`, or `{ ok: true, already_verified: true }` if already verified (no email sent) |
 | POST | `/auth/email-verification/:token/confirm` | — | — | Marks the account verified. `{ ok: true }`; `404` if the token is invalid/expired/already used |
 | POST | `/auth/password-reset/request` | — | 10/15min/IP | `{ email }` → **always** responds `{ ok: true }` regardless of whether the account exists (no user-enumeration); emails a reset link if it does |
 | POST | `/auth/password-reset/:token/confirm` | — | — | `{ password }` (min 8 chars) → sets the new password. `{ ok: true }`; `404` if the token is invalid/expired/already used |
-| POST | `/auth/google` | — | — | `{ id_token }` (a Google Identity Services credential) → verifies it server-side, creates the account on first sign-in or links `googleId` to a matching existing email, sets the cookie. `503` if `GOOGLE_CLIENT_ID` isn't configured; `401` if the token doesn't verify |
+| POST | `/auth/google` | — | — | `{ id_token }` (a Google Identity Services credential) → verifies it server-side, creates the account on first sign-in or links `googleId` to a matching existing email, response includes `token`. `503` if `GOOGLE_CLIENT_ID` isn't configured; `401` if the token doesn't verify |
 
 ### Events (photographer)
 

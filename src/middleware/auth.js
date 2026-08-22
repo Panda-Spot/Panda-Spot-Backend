@@ -32,9 +32,28 @@ export function clearAuthCookie(res) {
   res.clearCookie(COOKIE_NAME, COOKIE_OPTIONS);
 }
 
-/** Reads and verifies the JWT cookie, attaches { id, email } to req.user, or 401s. */
+/**
+ * The cookie above is kept as a harmless bonus (works fine if this ever ends
+ * up same-site with its frontend), but it's no longer the primary auth
+ * mechanism — cross-site cookies get silently dropped by third-party-cookie
+ * blocking in Safari (default) and increasingly Chrome, with no reliable way
+ * to detect that from the server side. The real mechanism is a Bearer token:
+ * every login/register/google response includes `token` in the JSON body;
+ * the frontend stores it (localStorage) and sends it back as
+ * `Authorization: Bearer <token>` on every request. The one exception is the
+ * SSE upload-progress stream, since EventSource can't set custom headers —
+ * that one passes the token as a `?token=` query param instead.
+ */
+function extractToken(req) {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith("Bearer ")) return authHeader.slice(7);
+  if (req.query?.token) return req.query.token;
+  return req.cookies?.[COOKIE_NAME];
+}
+
+/** Reads and verifies the auth token (header, query param, or cookie, in that order), attaches { id, email } to req.user, or 401s. */
 export function requireAuth(req, res, next) {
-  const token = req.cookies?.[COOKIE_NAME];
+  const token = extractToken(req);
   if (!token) {
     return res.status(401).json({ error: "Not authenticated" });
   }
@@ -47,9 +66,9 @@ export function requireAuth(req, res, next) {
   }
 }
 
-/** Non-throwing variant: attaches req.user if a valid cookie is present, otherwise leaves it undefined. */
+/** Non-throwing variant: attaches req.user if a valid token is present, otherwise leaves it undefined. */
 export function attachUserIfPresent(req, _res, next) {
-  const token = req.cookies?.[COOKIE_NAME];
+  const token = extractToken(req);
   if (token) {
     try {
       const payload = jwt.verify(token, JWT_SECRET);

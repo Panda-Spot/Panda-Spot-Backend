@@ -90,7 +90,7 @@ router.post("/register", registerLimiter, async (req, res, next) => {
 
     const token = signToken(user);
     setAuthCookie(res, token);
-    res.status(201).json(publicUser(user));
+    res.status(201).json({ ...publicUser(user), token });
   } catch (err) {
     next(err);
   }
@@ -119,7 +119,7 @@ router.post("/login", authLimiter, async (req, res, next) => {
 
     const token = signToken(user);
     setAuthCookie(res, token);
-    res.json(publicUser(user));
+    res.json({ ...publicUser(user), token });
   } catch (err) {
     next(err);
   }
@@ -286,7 +286,7 @@ router.post("/google", async (req, res, next) => {
 
     const token = signToken(user);
     setAuthCookie(res, token);
-    res.json(publicUser(user));
+    res.json({ ...publicUser(user), token });
   } catch (err) {
     next(err);
   }
