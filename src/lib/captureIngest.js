@@ -9,6 +9,9 @@ import { contentMatchesExtension } from "./fileValidation.js";
 import { FREE_EVENT_STORAGE_BYTES, eventStorageUsedBytes } from "./planLimits.js";
 import { publishLiveEvent } from "./liveEvents.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
+import { uploadToDriveFolder } from "./driveBackup.js";
+
+const MIME_BY_EXT = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
 
 /**
  * Runs one already-on-disk file (from Beam's FTP staging area — see
@@ -85,7 +88,29 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
     console.error(`Guest alert check failed for Beam photo ${photo.id}:`, err)
   );
 
+  // Advanced/beta: mirror this capture back into the connected Drive folder
+  // so Drive stays the complete archive — see lib/driveBackup.js. Never
+  // allowed to affect the capture itself; a failure here (expired grant,
+  // Drive quota, network) is logged and nothing more.
+  if (event.driveBackupEnabled && event.driveFolderId) {
+    backUpToDriveIfEnabled(event, originalFilename, ext, buffer).catch((err) =>
+      console.error(`Drive backup failed for Beam photo ${photo.id}:`, err)
+    );
+  }
+
   return { photo };
+}
+
+async function backUpToDriveIfEnabled(event, filename, ext, buffer) {
+  const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+  if (!owner?.driveBackupRefreshToken) return;
+  await uploadToDriveFolder({
+    refreshToken: owner.driveBackupRefreshToken,
+    folderId: event.driveFolderId,
+    filename,
+    mimeType: MIME_BY_EXT[ext] || "application/octet-stream",
+    buffer,
+  });
 }
 
 function skip(eventId, filename, reason) {

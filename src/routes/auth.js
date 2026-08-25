@@ -1,5 +1,6 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import { randomBytes } from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
 import { prisma } from "../lib/prisma.js";
@@ -7,6 +8,13 @@ import { signToken, setAuthCookie, clearAuthCookie, requireAuth } from "../middl
 import { sendEmailVerificationEmail, sendPasswordResetEmail } from "../lib/mailer.js";
 import { authLimiter, registerLimiter } from "../lib/rateLimiters.js";
 import { isAdminEmail } from "../middleware/admin.js";
+import {
+  isDriveBackupConfigured,
+  isDriveBackupBetaUser,
+  getConsentUrl,
+  exchangeCodeForRefreshToken,
+  revokeRefreshToken,
+} from "../lib/driveBackupAuth.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 
@@ -24,6 +32,11 @@ function publicUser(user) {
     name: user.name,
     email_verified: !!user.emailVerifiedAt,
     is_admin: isAdminEmail(user.email),
+    // Advanced/beta feature — see lib/driveBackupAuth.js. `drive_backup_beta`
+    // lets the frontend hide the whole feature from everyone else while
+    // it's still testing-only.
+    drive_backup_beta: isDriveBackupBetaUser(user.email),
+    drive_backup_connected: !!user.driveBackupRefreshToken,
   };
 }
 
@@ -287,6 +300,70 @@ router.post("/google", async (req, res, next) => {
     const token = signToken(user);
     setAuthCookie(res, token);
     res.json({ ...publicUser(user), token });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Drive backup (advanced/beta) — see lib/driveBackupAuth.js ---
+
+// A full-page browser redirect (not a fetch call), so it can't carry an
+// Authorization header — it relies on requireAuth's existing support for a
+// `?token=` query param instead (same trick the SSE upload-progress stream
+// uses). Gated behind isDriveBackupBetaUser on top of whatever allowlist
+// the Google Cloud OAuth consent screen itself enforces while in Testing
+// status (see server/README.md).
+router.get("/google/drive-backup/connect", requireAuth, async (req, res, next) => {
+  try {
+    if (!isDriveBackupConfigured()) {
+      return res.status(503).json({ error: "Drive backup isn't configured yet" });
+    }
+    if (!isDriveBackupBetaUser(req.user.email)) {
+      return res.status(403).json({ error: "Drive backup is a beta feature — this account isn't on the beta list yet" });
+    }
+    // Google echoes `state` back to the callback unmodified and it's not
+    // otherwise authenticated — sign the user id into it so the callback
+    // can trust who this grant belongs to without a session/cookie, and so
+    // nobody can forge a different user's id into their own callback hit.
+    const state = jwt.sign({ uid: req.user.id }, process.env.JWT_SECRET, { expiresIn: "10m" });
+    res.redirect(getConsentUrl(state));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/google/drive-backup/callback", async (req, res) => {
+  const redirectBase = `${process.env.PUBLIC_WEB_URL || "http://localhost:5173"}/branding`;
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.redirect(`${redirectBase}?drive_backup_error=${encodeURIComponent(String(error))}`);
+  }
+
+  let uid;
+  try {
+    ({ uid } = jwt.verify(state, process.env.JWT_SECRET));
+  } catch {
+    return res.redirect(`${redirectBase}?drive_backup_error=invalid_or_expired_state`);
+  }
+
+  try {
+    const refreshToken = await exchangeCodeForRefreshToken(code);
+    await prisma.user.update({ where: { id: uid }, data: { driveBackupRefreshToken: refreshToken } });
+    res.redirect(`${redirectBase}?drive_backup=connected`);
+  } catch (err) {
+    res.redirect(`${redirectBase}?drive_backup_error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+router.post("/google/drive-backup/disconnect", requireAuth, async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (user?.driveBackupRefreshToken) {
+      await revokeRefreshToken(user.driveBackupRefreshToken);
+    }
+    await prisma.user.update({ where: { id: req.user.id }, data: { driveBackupRefreshToken: null } });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }

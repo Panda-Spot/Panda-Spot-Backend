@@ -115,6 +115,7 @@ router.get("/:id", async (req, res, next) => {
 
     const photoCount = await prisma.photo.count({ where: { eventId: event.id } });
     const storageUsedBytes = await eventStorageUsedBytes(prisma, event.id);
+    const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
 
     res.json({
       id: event.id,
@@ -131,6 +132,12 @@ router.get("/:id", async (req, res, next) => {
       drive_sync_enabled: event.driveSyncEnabled,
       last_drive_sync_at: event.lastDriveSyncAt,
       beam_connected: !!event.ftpUsername,
+      // Advanced/beta: mirroring Beam captures back into the connected Drive
+      // folder — see lib/driveBackup.js. Only actually usable once a Drive
+      // folder is connected AND the owner has connected their Drive backup
+      // account (see /auth/google/drive-backup/connect).
+      drive_backup_enabled: event.driveBackupEnabled,
+      drive_backup_available: !!owner?.driveBackupRefreshToken,
     });
   } catch (err) {
     next(err);
@@ -569,6 +576,34 @@ router.get("/:id/live/stream", async (req, res, next) => {
       clearInterval(heartbeat);
       unsubscribe();
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Advanced/beta — toggles mirroring Beam captures into this event's
+// connected Drive folder. Requires both a connected Drive folder
+// (driveFolderId) and the owner having connected Drive backup for their
+// account (see /auth/google/drive-backup/connect) — 400s with a clear
+// reason otherwise rather than silently accepting a flag that can't do
+// anything yet.
+router.post("/:id/drive-backup/toggle", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.driveFolderId) {
+      return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
+    }
+    const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+    if (!owner?.driveBackupRefreshToken) {
+      return res.status(400).json({ error: "Connect Drive backup for your account first (Branding page)." });
+    }
+
+    const { enabled } = req.body || {};
+    await prisma.event.update({ where: { id: event.id }, data: { driveBackupEnabled: !!enabled } });
+    res.json({ drive_backup_enabled: !!enabled });
   } catch (err) {
     next(err);
   }

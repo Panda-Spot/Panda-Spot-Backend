@@ -36,6 +36,19 @@ model User {
 
   emailVerificationTokens EmailVerificationToken[]
   passwordResetTokens     PasswordResetToken[]
+
+  /// A Google OAuth refresh token with the narrow `drive.file` scope
+  /// (access only to files/folders this app itself created or opened —
+  /// never the user's whole Drive), granted via a separate consent flow
+  /// from Sign-In-with-Google (see lib/driveBackupAuth.js). Powers the
+  /// **advanced, beta-gated** Beam-to-Drive backup feature — null until a
+  /// photographer connects it, and only reachable at all if their email is
+  /// on DRIVE_BACKUP_BETA_EMAILS while the feature is still in testing.
+  /// Stored as plaintext for the same reason as Event.ftpPassword — see that
+  /// column's comment — though this one is a genuinely more sensitive
+  /// secret (it's reusable against Google, not scoped to one FTP folder),
+  /// so encrypting it at rest is the right next step before a wider release.
+  driveBackupRefreshToken String?
 }
 
 /// A single-use, time-limited token emailed to confirm account ownership.
@@ -111,6 +124,14 @@ model Event {
   /// can be regenerated any time. See lib/ftpBeam.js.
   ftpUsername String? @unique
   ftpPassword String?
+
+  /// Advanced/beta: when true (and the owner has connected Drive backup —
+  /// see User.driveBackupRefreshToken), each Beam capture is also uploaded
+  /// into this event's connected driveFolderId, so Drive stays the complete
+  /// archive instead of only holding what was imported from it. Independent
+  /// of driveSyncEnabled, which controls the opposite direction (Drive ->
+  /// PandaSpot). See lib/driveBackup.js.
+  driveBackupEnabled Boolean @default(false)
 }
 
 /// A second shooter/assistant granted upload+view access to one event without
