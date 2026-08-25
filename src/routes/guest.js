@@ -12,8 +12,10 @@ import { zipFilenameForEvent, streamPhotosZip, buildPhotosZipToDisk, zipDownload
 import { sendZipReadyEmail } from "../lib/mailer.js";
 import { ALLOWED_EXTENSIONS } from "../lib/storage.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
-import { guestSearchLimiter, guestDownloadLimiter, guestFeedbackLimiter } from "../lib/rateLimiters.js";
+import { guestSearchLimiter, guestDownloadLimiter, guestFeedbackLimiter, guestAlertLimiter, guestWhatsAppLinkLimiter } from "../lib/rateLimiters.js";
 import { isExpired } from "../lib/expiry.js";
+import { subscribeGuestAlert, unsubscribeGuestAlert, isValidEmail } from "../lib/guestAlerts.js";
+import { sendWhatsAppMessage, isValidE164 } from "../lib/whatsapp.js";
 
 const router = Router();
 
@@ -135,6 +137,88 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       faces_detected_in_selfie: facesDetected,
       matches,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Opts a guest in to being notified (email or WhatsApp) if more photos of
+// them show up later in this event — the natural follow-up to a search once
+// photos can keep arriving live via Beam. `guest_client_id` is the same
+// anonymous id already used for search/feedback (src/guestId.js on the
+// frontend) — like the rest of this API's guest identity model, it's an
+// unguessable id acting as its own bearer token, not paired with any login.
+router.post("/:slug/alerts/subscribe", guestAlertLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+
+    const { guest_client_id: guestClientId, channel, contact } = req.body || {};
+    if (!guestClientId) {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+    if (channel !== "email" && channel !== "whatsapp") {
+      return res.status(400).json({ error: "channel must be 'email' or 'whatsapp'" });
+    }
+    if (channel === "email" && !isValidEmail(contact)) {
+      return res.status(400).json({ error: "A valid email address is required" });
+    }
+    if (channel === "whatsapp" && !isValidE164(contact)) {
+      return res.status(400).json({ error: "A valid phone number in international format (e.g. +919876543210) is required" });
+    }
+
+    await subscribeGuestAlert({ eventId: event.id, guestClientId, channel, contact });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:slug/alerts/unsubscribe", guestAlertLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    const { guest_client_id: guestClientId } = req.body || {};
+    if (!guestClientId) {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+
+    await unsubscribeGuestAlert({ eventId: event.id, guestClientId });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// One-off "text me this gallery link on WhatsApp" — distinct from the alert
+// subscription above (this just sends the link once, right now; no ongoing
+// notifications). Uses the same lib/whatsapp.js wrapper.
+router.post("/:slug/whatsapp/send-link", guestWhatsAppLinkLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+
+    const { phone } = req.body || {};
+    if (!isValidE164(phone)) {
+      return res.status(400).json({ error: "A valid phone number in international format (e.g. +919876543210) is required" });
+    }
+
+    const galleryUrl = `${process.env.PUBLIC_WEB_URL || "http://localhost:5173"}/e/${event.guestSlug}`;
+    await sendWhatsAppMessage(phone, `Here's your PandaSpot gallery for "${event.name}": ${galleryUrl}`);
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }

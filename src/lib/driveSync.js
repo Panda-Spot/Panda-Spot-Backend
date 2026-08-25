@@ -8,6 +8,7 @@ import { downloadFile, guessExtension, listImageFiles } from "./googleDrive.js";
 import { contentMatchesExtension } from "./fileValidation.js";
 import { FREE_EVENT_STORAGE_BYTES, eventStorageUsedBytes } from "./planLimits.js";
 import { emitJobEvent } from "./jobQueue.js";
+import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 
 // Once per day — see runDueAutoSyncs below.
 const AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -72,7 +73,7 @@ async function importOneDriveFile(event, file, usedBytesRef) {
   }
 
   usedBytesRef.value += fileSize;
-  return { fileSize, facesFound: faces.length };
+  return { fileSize, facesFound: faces.length, photoId: photo.id };
 }
 
 /** Removes a Photo whose Drive source file is gone: its Face rows, its
@@ -112,18 +113,26 @@ export async function processDriveImportJob(jobId, event, files) {
   let facesFoundSoFar = 0;
   const startedAt = Date.now();
   const usedBytesRef = { value: await eventStorageUsedBytes(prisma, event.id) };
+  const newPhotoIds = [];
 
   try {
     for (const file of files) {
       const result = await importOneDriveFile(event, file, usedBytesRef);
       if (result.skipped) skipped.push(result.skipped);
-      else facesFoundSoFar += result.facesFound;
+      else {
+        facesFoundSoFar += result.facesFound;
+        newPhotoIds.push(result.photoId);
+      }
 
       completed += 1;
       emitProgress(jobId, { total, completed, currentFile: file.name, startedAt, facesFoundSoFar, skipped });
     }
 
     await prisma.event.update({ where: { id: event.id }, data: { lastDriveSyncAt: new Date() } });
+
+    checkAndNotifyForNewPhotos(event, newPhotoIds).catch((err) =>
+      console.error(`Guest alert check failed for Drive import job ${jobId}:`, err)
+    );
 
     emitJobEvent(jobId, {
       type: "done",
@@ -168,11 +177,15 @@ export async function processDriveSyncJob(jobId, event, currentFiles) {
     const total = newFiles.length + removedPhotos.length;
     let completed = 0;
     const usedBytesRef = { value: await eventStorageUsedBytes(prisma, event.id) };
+    const newPhotoIds = [];
 
     for (const file of newFiles) {
       const result = await importOneDriveFile(event, file, usedBytesRef);
       if (result.skipped) skipped.push(result.skipped);
-      else facesFoundSoFar += result.facesFound;
+      else {
+        facesFoundSoFar += result.facesFound;
+        newPhotoIds.push(result.photoId);
+      }
       completed += 1;
       emitProgress(jobId, { total, completed, currentFile: file.name, startedAt, facesFoundSoFar, skipped });
     }
@@ -184,6 +197,10 @@ export async function processDriveSyncJob(jobId, event, currentFiles) {
     }
 
     await prisma.event.update({ where: { id: event.id }, data: { lastDriveSyncAt: new Date() } });
+
+    checkAndNotifyForNewPhotos(event, newPhotoIds).catch((err) =>
+      console.error(`Guest alert check failed for Drive sync job ${jobId}:`, err)
+    );
 
     emitJobEvent(jobId, {
       type: "done",

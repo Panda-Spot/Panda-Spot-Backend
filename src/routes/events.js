@@ -21,6 +21,7 @@ import { processDriveImportJob, processDriveSyncJob } from "../lib/driveSync.js"
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, countOwnedEvents, eventStorageUsedBytes } from "../lib/planLimits.js";
 import { computeExpiresAt } from "../lib/expiry.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
+import { checkAndNotifyForNewPhotos } from "../lib/guestAlerts.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -166,6 +167,7 @@ router.delete("/:id", async (req, res, next) => {
     await prisma.face.deleteMany({ where: { eventId: event.id } });
     await prisma.photo.deleteMany({ where: { eventId: event.id } });
     await prisma.zipDownload.deleteMany({ where: { eventId: event.id } });
+    await prisma.guestAlertSubscription.deleteMany({ where: { eventId: event.id } });
     await prisma.eventCollaborator.deleteMany({ where: { eventId: event.id } });
     await prisma.eventInvite.deleteMany({ where: { eventId: event.id } });
     await prisma.event.delete({ where: { id: event.id } });
@@ -193,6 +195,7 @@ async function processUploadJob(jobId, event, files) {
   let facesFoundSoFar = 0;
   const startedAt = Date.now();
   let usedBytes = await eventStorageUsedBytes(prisma, event.id);
+  const newPhotoIds = [];
 
   try {
     for (const file of files) {
@@ -244,6 +247,7 @@ async function processUploadJob(jobId, event, files) {
 
           facesFoundSoFar += faces.length;
           usedBytes += file.buffer.length;
+          newPhotoIds.push(photo.id);
         }
       }
 
@@ -266,6 +270,10 @@ async function processUploadJob(jobId, event, files) {
         skipped_so_far: skipped,
       });
     }
+
+    checkAndNotifyForNewPhotos(event, newPhotoIds).catch((err) =>
+      console.error(`Guest alert check failed for upload job ${jobId}:`, err)
+    );
 
     emitJobEvent(jobId, {
       type: "done",

@@ -8,6 +8,7 @@ import { ALLOWED_EXTENSIONS, saveEventPhoto } from "./storage.js";
 import { contentMatchesExtension } from "./fileValidation.js";
 import { FREE_EVENT_STORAGE_BYTES, eventStorageUsedBytes } from "./planLimits.js";
 import { publishLiveEvent } from "./liveEvents.js";
+import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 
 /**
  * Runs one already-on-disk file (from Beam's FTP staging area — see
@@ -79,6 +80,10 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
     url: `/files/events/${event.id}/photos/${photo.id}`,
     thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
   });
+
+  checkAndNotifyForNewPhotos(event, [photo.id]).catch((err) =>
+    console.error(`Guest alert check failed for Beam photo ${photo.id}:`, err)
+  );
 
   return { photo };
 }

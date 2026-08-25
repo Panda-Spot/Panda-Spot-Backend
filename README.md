@@ -184,6 +184,9 @@ frontend doesn't check the `expired` flag first.
 | POST | `/e/:slug/download` | 20/15min/IP | `{ photo_ids: [...] }` (from a prior search's matches) → streams a zip of those photos immediately. `410` if the event has expired. |
 | POST | `/e/:slug/download/email` | 20/15min/IP | `{ photo_ids: [...], email }` → for large/slow selections: creates a `ZipDownload` row and responds `{ ok: true }` right away, then builds the zip to disk in the background and emails the guest a download link (a no-op console warning if `SMTP_HOST` isn't configured yet). `410` if the event has expired. |
 | GET | `/e/:slug/downloads/:downloadId` | — | Streams the pre-built zip once ready. `409 { error }` if the `ZipDownload` isn't `status: "ready"` yet, `404` if it doesn't exist or belongs to a different event, `410` if the event has expired |
+| POST | `/e/:slug/alerts/subscribe` | 10/15min/IP | `{ guest_client_id, channel: "email" \| "whatsapp", contact }` → opts this guest in to being notified if more photos of them show up later in this event (see "Guest match alerts" below). Upserts — searching again and subscribing again just updates the same subscription. `400` if `contact` isn't a valid email/E.164 phone number for the chosen channel. |
+| POST | `/e/:slug/alerts/unsubscribe` | 10/15min/IP | `{ guest_client_id }` → turns off alerts for this guest on this event. Idempotent, `{ ok: true }` even if there was no subscription. |
+| POST | `/e/:slug/whatsapp/send-link` | 5/15min/IP | `{ phone }` → sends this event's gallery link to that phone number over WhatsApp, once, right now — distinct from the alert subscription above (no ongoing notifications). A no-op console warning if Twilio isn't configured yet (see "WhatsApp delivery" below). `410` if the event has expired. |
 
 ### Invites (collaborator invite acceptance)
 | Method | Path | Auth | What |
@@ -396,6 +399,53 @@ correctly erroring because no local face-engine instance was running,
 which is unrelated to Beam itself). **Not yet verified against a real
 camera** or over a real network with `FTP_PUBLIC_HOST`/passive ports
 configured — do that once deployed.
+
+## Guest match alerts
+
+After a guest's first search, they can opt in (`POST /e/:slug/alerts/subscribe`
+— see the table above) to be notified if more photos of them show up later
+in the same event, instead of needing to remember to come back and re-search
+manually. This is the natural follow-up to Beam: photos can now keep landing
+live during a shoot, but until this feature nothing outside the
+photographer's own screen knew that happened.
+
+`src/lib/guestAlerts.js` is the whole feature: a `GuestAlertSubscription` row
+per `(eventId, guestClientId)` pair (upserted, so re-subscribing just updates
+it), and `checkAndNotifyForNewPhotos(event, newPhotoIds)` — called after
+every photo-ingestion path finishes a batch (`processUploadJob` in
+`routes/events.js`, `processDriveImportJob`/`processDriveSyncJob` in
+`lib/driveSync.js`) and after each single Beam capture
+(`lib/captureIngest.js`). For every active subscription, it re-checks that
+guest's most recent search embedding against only the newly-added photos'
+faces (a single pgvector query — the embedding itself never leaves
+Postgres, same reasoning as `lib/faces.js`'s `searchSimilarPhotos`), and
+sends an email or WhatsApp message if any of them clear the event's match
+threshold. A guest is never notified more than once every 15 minutes, so a
+burst of Beam captures during a shoot produces one ping, not a flood.
+
+Notification failures (unconfigured SMTP/Twilio, a bad phone number, a
+transient send error) are logged and swallowed — never allowed to affect the
+upload/import/capture they were triggered by.
+
+## WhatsApp delivery
+
+`src/lib/whatsapp.js` is a small REST wrapper around Twilio's WhatsApp
+messaging API (a plain `fetch` with Basic Auth — no SDK dependency, same
+lightweight style as `lib/googleDrive.js`'s raw Drive API calls). Left
+unconfigured (`TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`/`TWILIO_WHATSAPP_FROM`
+unset), `sendWhatsAppMessage` logs what it would have sent instead of
+sending — same safe no-op pattern as `lib/mailer.js` when `SMTP_HOST` is
+unset, so every route that uses it still responds normally during local dev.
+
+Two features use it: the `whatsapp` channel option on guest match alerts
+above, and the standalone `POST /e/:slug/whatsapp/send-link` — a guest
+tapping "send me this link on WhatsApp" once, with no ongoing subscription.
+
+**Verified locally** (server responding correctly, logging the would-be
+message) with Twilio left unconfigured — an actual Twilio account, a
+WhatsApp-enabled sender, and (for a non-sandbox number) template approval are
+needed before this can send a real message; get those before relying on it
+for a real event.
 
 ## What this deliberately does NOT do yet
 

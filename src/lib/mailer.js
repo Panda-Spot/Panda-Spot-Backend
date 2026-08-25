@@ -59,6 +59,22 @@ export async function sendEmailVerificationEmail(to, verifyUrl) {
   });
 }
 
+export async function sendGuestAlertEmail(to, eventName, galleryUrl, newPhotoCount) {
+  const t = getTransporter();
+  const plural = newPhotoCount === 1 ? "photo" : "photos";
+  if (!t) {
+    console.warn(`SMTP not configured — would have emailed ${to} about ${newPhotoCount} new match(es): ${galleryUrl}`);
+    return;
+  }
+  await t.sendMail({
+    from: process.env.SMTP_FROM || "PandaSpot <no-reply@pandaspot.example>",
+    to,
+    subject: `${newPhotoCount} new ${plural} of you at "${eventName}"`,
+    text: `${newPhotoCount} new ${plural} of you just showed up at "${eventName}": ${galleryUrl}`,
+    html: `<p>${newPhotoCount} new ${plural} of you just showed up at "${eventName}".</p><p><a href="${galleryUrl}">${galleryUrl}</a></p>`,
+  });
+}
+
 export async function sendPasswordResetEmail(to, resetUrl) {
   const t = getTransporter();
   if (!t) {

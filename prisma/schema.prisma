@@ -89,6 +89,7 @@ model Event {
   zipDownloads  ZipDownload[]
   collaborators EventCollaborator[]
   invites       EventInvite[]
+  alertSubscriptions GuestAlertSubscription[]
 
   /// Google Drive folder connected for this event's photo sync — set once
   /// the photographer confirms the initial import. See lib/driveSync.js.
@@ -225,6 +226,29 @@ model MatchFeedback {
 
 /// A pre-built zip, generated asynchronously and emailed to a guest as a
 /// download link instead of blocking their browser tab on a large selection.
+/// A guest opting in to be notified (email or WhatsApp) if more photos of
+/// them show up later in the same event — the natural follow-up once photos
+/// can keep arriving live via Beam after their first search. One row per
+/// (event, guestClientId): a guest who searches again just updates their
+/// existing subscription rather than creating a second one. See
+/// lib/guestAlerts.js for the matching/notify job.
+model GuestAlertSubscription {
+  id             String    @id @default(uuid())
+  eventId        String
+  event          Event     @relation(fields: [eventId], references: [id])
+  guestClientId  String
+  /// "email" | "whatsapp"
+  channel        String
+  /// An email address or E.164 phone number, depending on channel.
+  contact        String
+  createdAt      DateTime  @default(now())
+  lastNotifiedAt DateTime?
+  active         Boolean   @default(true)
+
+  @@unique([eventId, guestClientId])
+  @@index([eventId])
+}
+
 model ZipDownload {
   id           String    @id @default(uuid())
   eventId      String
