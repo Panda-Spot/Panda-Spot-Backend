@@ -130,13 +130,21 @@ model Photo {
   eventId     String
   event       Event    @relation(fields: [eventId], references: [id])
   filename    String
-  storagePath String
+  /// Null for Google Drive imports — the original is never written to local
+  /// disk for those (see lib/googleDrive.js); full-res access falls back to
+  /// driveFileId instead. Always set for directly-uploaded photos.
+  storagePath String?
   /// Resized preview (~480px) generated at upload time for fast gallery
   /// grids — null if generation failed, in which case callers fall back
   /// to the full-size original. See lib/thumbnails.js.
   thumbnailPath String?
+  /// Set only for Google Drive imports — the Drive file ID, used to
+  /// re-fetch the original on demand (download/share) since it's never
+  /// stored locally. Null for directly-uploaded photos.
+  driveFileId String?
   /// Original file size in bytes — used to enforce the free-tier per-event
-  /// storage cap (see lib/planLimits.js). Thumbnails aren't counted (negligible).
+  /// storage cap (see lib/planLimits.js), populated from Drive's reported
+  /// size for imports even though those bytes are never retained locally.
   fileSize    Int      @default(0)
   faceCount   Int      @default(0)
   createdAt   DateTime @default(now())

@@ -98,6 +98,7 @@ meantime, not just cosmetic. See "Plan limits" and "Event expiry" below.
 | `PUBLIC_WEB_URL` | The frontend web app's public base URL, used to build collaborator invite links (`${PUBLIC_WEB_URL}/invites/:token`), default `http://localhost:5173` |
 | `GOOGLE_CLIENT_ID` | Google OAuth Client ID for "Sign in with Google" (Google Cloud Console > APIs & Services > Credentials). Unset by default — `POST /auth/google` responds `503` cleanly until this is configured. |
 | `ADMIN_EMAILS` | Comma-separated allowlist of email addresses allowed to hit `/admin/*` (the platform-operator overview — not a general role system). e.g. `"you@example.com,teammate@example.com"`. Unset = nobody can access `/admin/*`. |
+| `GOOGLE_DRIVE_API_KEY` | Google Drive API key (Cloud Console > APIs & Services > Credentials > API key, with the Drive API enabled) for the "import from a public Google Drive folder" feature — see "Google Drive import" below. This is a **separate** credential from `GOOGLE_CLIENT_ID` above (that one is Sign-In OAuth; this one is a plain read-only Drive API v3 key). Unset by default — `POST /events/:id/import/drive` responds a clean `400` until this is configured. |
 
 ## API
 
@@ -142,7 +143,8 @@ Routes marked "owner or collaborator" below accept either; routes marked
 | GET | `/events/:id` | owner or collaborator | One event: `{ id, name, guestSlug, guestLink, createdAt, expires_at, photo_count, storage_used_bytes, storage_limit_bytes, role }` |
 | DELETE | `/events/:id` | owner-only | Permanently deletes the event and everything under it (photos, faces, guest searches/feedback, zip downloads, collaborators, invites) plus the event's entire photo/thumbnail directory on disk. `204` on success |
 | POST | `/events/:id/photos` | owner or collaborator | 30/hour/IP · **Breaking change:** multipart `files` (multiple) → now responds immediately with `202 { job_id }` instead of the old synchronous body; processing happens in-process, sequentially, in the background. Follow up with the SSE stream below to get progress and the final `photos_processed`/`faces_found`/`skipped` result (delivered as the terminal `done` event, same field names as the old response body). Each file is also checked against the event's 10GB free-plan storage cap (see "Plan limits" below) — a file that would push the event over the cap is skipped (added to `skipped`, reason `"... (event storage limit reached — 10GB free plan cap)"`) rather than blocking the rest of the batch. |
-| GET | `/events/:id/uploads/:jobId/stream` | owner or collaborator | Server-Sent Events stream of `progress` events (`total`, `completed`, `current_file`, `photos_per_second`, `eta_seconds`, `faces_found_so_far`, `skipped_so_far`) for an upload job started above, ending in a terminal `done` or `error` event. If the job already finished before you connect, sends that last event immediately and closes. |
+| GET | `/events/:id/uploads/:jobId/stream` | owner or collaborator | Server-Sent Events stream of `progress` events (`total`, `completed`, `current_file`, `photos_per_second`, `eta_seconds`, `faces_found_so_far`, `skipped_so_far`) for an upload job started above, ending in a terminal `done` or `error` event. If the job already finished before you connect, sends that last event immediately and closes. Also used for Drive import jobs (see below) — identical event shape. |
+| POST | `/events/:id/import/drive` | owner or collaborator · 30/hour/IP | `{ folder_url }` (a public Google Drive folder share link) → lists every image in the folder and responds `202 { job_id, files_found }` immediately, then imports them in the background — same job/SSE mechanism as `POST /events/:id/photos` above (poll the same `/uploads/:jobId/stream` route with this `job_id`, identical `progress`/`done`/`error` event field names, so the frontend's upload-progress UI is reused unchanged). `400 { error }` if `folder_url` isn't a Drive folder link, if the folder isn't publicly viewable (Drive 403/404), or if `GOOGLE_DRIVE_API_KEY` isn't configured — fails fast before creating any job. Each file is still checked against the event's 10GB storage cap and content-sniffed, exactly like a direct upload. See "Google Drive import" below for the storage model. |
 | GET | `/events/:id/photos` | owner or collaborator | List photos in an event |
 | DELETE | `/events/:id/photos/:photoId` | owner or collaborator | Deletes one photo (its faces, DB row, and both the original + thumbnail files on disk). `204` on success, `404` if not found |
 | GET | `/events/:id/analytics` | owner or collaborator | `{ total_searches, unique_guests, match_rate, feedback_count, daily_searches, daily_matches }` — the first four aggregated from that event's `GuestSearch`/`MatchFeedback` rows; `daily_searches`/`daily_matches` are zero-filled 30-day `[{ date: "YYYY-MM-DD", count }]` series (see `src/lib/dailyBuckets.js`) for trend charts |
@@ -281,6 +283,52 @@ saved alongside the original under `STORAGE_DIR/events/{eventId}/thumbs/`.
 serves it, falling back to the full-size original if generation failed or a
 photo predates this feature. Downloads/zips/watermarked shares still use the
 full-size original (`url`) — only grid previews use the thumbnail.
+
+## Google Drive import
+
+An alternative to browser upload: a photographer pastes a public Google
+Drive folder link (`POST /events/:id/import/drive`, see the table above)
+instead of picking files from disk. `src/lib/googleDrive.js` lists every
+image directly inside that folder via Drive API v3, then for each one:
+downloads its bytes just long enough to run face detection
+(`lib/faceEngine.js`, identical to a direct upload) and generate a thumbnail
+(`lib/thumbnails.js`, completely unchanged) — **but the full-resolution
+original is never written to local disk.** Only the thumbnail and the
+detected faces' embeddings are kept permanently; the `Photo` row gets
+`storagePath: null` and `driveFileId: <the Drive file's id>` instead of a
+local path. Each file still counts against the event's 10GB free-plan
+storage cap (`lib/planLimits.js`) using the byte size Drive reports for it,
+exactly like a direct upload.
+
+When the full-resolution original is needed later — viewing it full-size,
+downloading it, or zipping a guest's selected matches — the server re-fetches
+it live from Drive on demand instead of reading it off disk:
+
+- `GET /files/events/:eventId/photos/:photoId` falls back to a Drive
+  download (streamed back as the response body) when `storagePath` isn't set
+  or the file is missing on disk, as long as `driveFileId` is set. If the
+  Drive fetch fails (folder made private, file deleted, key unconfigured),
+  responds a clean `404` rather than erroring.
+- `lib/zip.js`'s `streamPhotosZip` and `buildPhotosZipToDisk` do the same
+  fallback per-photo when building a zip (instant guest download or the
+  email-download flow) — a Drive-backed photo whose download fails is simply
+  left out of that zip rather than failing the whole download.
+
+This means a Drive import trades a slower/network-dependent full-res fetch
+for zero local disk usage on originals — appropriate for photographers who
+already have their shoot backed up to Drive and don't want PandaSpot to
+duplicate gigabytes of full-res files on its own VPS.
+
+**Not verified against a real Drive folder.** No `GOOGLE_DRIVE_API_KEY` or
+public test folder was available in this environment — `GOOGLE_DRIVE_API_KEY`
+is unset here, so only the "unconfigured key" error path
+(`POST /events/:id/import/drive` responding a clean `400`, not crashing) was
+verified live. The actual Drive API v3 request shapes in
+`listImageFiles`/`downloadFile` (the `files.list` query/fields params and the
+`files.get?alt=media` download) were implemented by careful reading of the
+Drive API v3 docs but need a real end-to-end test — a real API key and a
+real public folder with a mix of file types/sizes — before this feature ships
+to real users.
 
 ## What this deliberately does NOT do yet
 

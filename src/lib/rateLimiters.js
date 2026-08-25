@@ -23,3 +23,4 @@ export const guestSearchLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, limit: 
 export const guestDownloadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 20 }); // guest zip download (instant + email)
 export const guestFeedbackLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 30 }); // guest "not me" feedback
 export const uploadLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 30 }); // photographer bulk photo upload
+export const driveImportLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 30 }); // photographer Google Drive folder import

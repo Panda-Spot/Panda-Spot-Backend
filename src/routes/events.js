@@ -12,8 +12,9 @@ import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { loadAccessibleEvent } from "../lib/access.js";
 import { sendCollaboratorInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
-import { uploadLimiter } from "../lib/rateLimiters.js";
+import { uploadLimiter, driveImportLimiter } from "../lib/rateLimiters.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
+import { extractFolderId, listImageFiles, downloadFile, guessExtension } from "../lib/googleDrive.js";
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, countOwnedEvents, eventStorageUsedBytes } from "../lib/planLimits.js";
 import { computeExpiresAt } from "../lib/expiry.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
@@ -343,6 +344,162 @@ router.get("/:id/uploads/:jobId/stream", async (req, res, next) => {
 
     job.emitter.on("event", onEvent);
     req.on("close", cleanup);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Processes photos imported from a public Google Drive folder — mirrors
+// processUploadJob's shape very closely (same emitJobEvent field names, so
+// the frontend's existing upload-progress UI works unchanged), but the
+// source of each file's bytes is a Drive download instead of a multipart
+// upload, and the original bytes are NEVER written to local disk
+// (saveEventPhoto is never called here) — only the thumbnail + face
+// embeddings are kept permanently. Full-res is re-fetched from Drive on
+// demand (see files.js / zip.js).
+async function processDriveImportJob(jobId, event, files) {
+  const total = files.length;
+  const skipped = [];
+  let completed = 0;
+  let facesFoundSoFar = 0;
+  const startedAt = Date.now();
+  let usedBytes = await eventStorageUsedBytes(prisma, event.id);
+
+  try {
+    for (const file of files) {
+      const fileSize = parseInt(file.size, 10) || 0;
+      const ext = guessExtension(file.mimeType, file.name);
+
+      if (!ext) {
+        skipped.push(`${file.name} (unsupported file type)`);
+      } else if (usedBytes + fileSize > FREE_EVENT_STORAGE_BYTES) {
+        skipped.push(`${file.name} (event storage limit reached — 10GB free plan cap)`);
+      } else {
+        let buffer = null;
+        try {
+          buffer = await downloadFile(file.id);
+        } catch (err) {
+          skipped.push(`${file.name} (${err.message})`);
+        }
+
+        if (buffer && !contentMatchesExtension(buffer, ext)) {
+          skipped.push(`${file.name} (file content doesn't match its extension)`);
+          buffer = null;
+        }
+
+        if (buffer) {
+          let detection;
+          try {
+            detection = await detectFaces(buffer, file.name);
+          } catch (err) {
+            skipped.push(`${file.name} (${err.isFaceEngineError ? err.message : "could not process image"})`);
+            detection = null;
+          }
+
+          if (detection) {
+            const photoId = randomUUID();
+            const thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
+
+            const faces = detection.faces || [];
+            const photo = await prisma.photo.create({
+              data: {
+                id: photoId,
+                eventId: event.id,
+                filename: file.name,
+                storagePath: null,
+                driveFileId: file.id,
+                thumbnailPath,
+                faceCount: faces.length,
+                fileSize,
+              },
+            });
+
+            for (const face of faces) {
+              await insertFace({
+                photoId: photo.id,
+                eventId: event.id,
+                bbox: face.bbox,
+                embedding: face.embedding,
+                detScore: face.det_score,
+              });
+            }
+
+            facesFoundSoFar += faces.length;
+            usedBytes += fileSize;
+          }
+        }
+      }
+
+      completed += 1;
+
+      const elapsedSeconds = (Date.now() - startedAt) / 1000;
+      const photosPerSecond = elapsedSeconds > 0 ? completed / elapsedSeconds : 0;
+      const etaSeconds =
+        photosPerSecond > 0 ? Math.round((total - completed) / photosPerSecond) : null;
+
+      emitJobEvent(jobId, {
+        type: "progress",
+        job_id: jobId,
+        total,
+        completed,
+        current_file: file.name,
+        photos_per_second: Math.round(photosPerSecond * 100) / 100,
+        eta_seconds: etaSeconds,
+        faces_found_so_far: facesFoundSoFar,
+        skipped_so_far: skipped,
+      });
+    }
+
+    emitJobEvent(jobId, {
+      type: "done",
+      job_id: jobId,
+      photos_processed: total - skipped.length,
+      faces_found: facesFoundSoFar,
+      skipped,
+    });
+  } catch (err) {
+    console.error(`Drive import job ${jobId} failed:`, err);
+    emitJobEvent(jobId, {
+      type: "error",
+      job_id: jobId,
+      message: err.message || "Unknown error while processing Google Drive import",
+    });
+  }
+}
+
+// Owner or collaborator — same access model as direct photo upload. Lists
+// the folder up front and fails fast (400) on a bad link/unconfigured key/
+// inaccessible folder before ever creating a job; once listing succeeds, the
+// actual downloads+face-detection happen in the background job, mirroring
+// POST /:id/photos.
+router.post("/:id/import/drive", driveImportLimiter, async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { folder_url } = req.body || {};
+
+    let folderId;
+    try {
+      folderId = extractFolderId(folder_url);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    let files;
+    try {
+      files = await listImageFiles(folderId);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    const { id: jobId } = createJob();
+    res.status(202).json({ job_id: jobId, files_found: files.length });
+
+    processDriveImportJob(jobId, event, files).catch((err) => {
+      console.error(`Unhandled error in drive import job ${jobId}:`, err);
+    });
   } catch (err) {
     next(err);
   }

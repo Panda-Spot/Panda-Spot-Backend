@@ -1,8 +1,22 @@
 import { Router } from "express";
+import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { existsSync } from "../lib/storage.js";
+import { downloadFile } from "../lib/googleDrive.js";
 
 const router = Router();
+
+const EXT_CONTENT_TYPES = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+function guessContentType(filename) {
+  const ext = path.extname(filename || "").toLowerCase();
+  return EXT_CONTENT_TYPES[ext] || "image/jpeg";
+}
 
 // Unauthenticated by design: photo/event IDs are UUIDs (not enumerable), and
 // this mirrors the original spike's trust model — whoever has a photo URL
@@ -13,10 +27,22 @@ router.get("/events/:eventId/photos/:photoId", async (req, res, next) => {
     if (!photo || photo.eventId !== req.params.eventId) {
       return res.status(404).json({ error: "Photo not found" });
     }
-    if (!existsSync(photo.storagePath)) {
-      return res.status(404).json({ error: "Photo file missing on disk" });
+    if (photo.storagePath && existsSync(photo.storagePath)) {
+      return res.sendFile(photo.storagePath);
     }
-    res.sendFile(photo.storagePath);
+    if (photo.driveFileId) {
+      try {
+        const buffer = await downloadFile(photo.driveFileId);
+        res.setHeader("Content-Type", guessContentType(photo.filename));
+        return res.send(buffer);
+      } catch (err) {
+        return res.status(404).json({
+          error:
+            "This photo's original is no longer accessible — the Google Drive folder may have been made private or the file may have been removed.",
+        });
+      }
+    }
+    return res.status(404).json({ error: "Photo file missing on disk" });
   } catch (err) {
     next(err);
   }

@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import archiver from "archiver";
 import { storageRoot } from "./storage.js";
+import { downloadFile } from "./googleDrive.js";
 
 /** Builds a sane zip filename from an event name, e.g. "Jane's Wedding" -> "janes-wedding-photos.zip". */
 export function zipFilenameForEvent(event) {
@@ -23,8 +24,15 @@ export async function streamPhotosZip(photos, res) {
   archive.pipe(res);
 
   for (const photo of photos) {
-    if (fs.existsSync(photo.storagePath)) {
+    if (photo.storagePath && fs.existsSync(photo.storagePath)) {
       archive.file(photo.storagePath, { name: photo.filename });
+    } else if (photo.driveFileId) {
+      try {
+        const buffer = await downloadFile(photo.driveFileId);
+        archive.append(buffer, { name: photo.filename });
+      } catch (err) {
+        console.error(`Skipping photo ${photo.id} in zip — Drive download failed:`, err.message);
+      }
     }
   }
 
@@ -50,6 +58,21 @@ export async function buildPhotosZipToDisk(photos, zipDownloadId) {
   await fsp.mkdir(zipsDir(), { recursive: true });
   const filePath = zipDownloadPath(zipDownloadId);
 
+  // Drive downloads are async and archiver's write pipeline is callback-
+  // driven, so resolve every Drive-backed photo's bytes up front (outside
+  // the Promise executor below, which can't itself be async) before
+  // building the archive.
+  const driveBuffers = new Map(); // photo.id -> Buffer, only for successful Drive fetches
+  for (const photo of photos) {
+    if (!(photo.storagePath && fs.existsSync(photo.storagePath)) && photo.driveFileId) {
+      try {
+        driveBuffers.set(photo.id, await downloadFile(photo.driveFileId));
+      } catch (err) {
+        console.error(`Skipping photo ${photo.id} in zip — Drive download failed:`, err.message);
+      }
+    }
+  }
+
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(filePath);
     const archive = archiver("zip", { zlib: { level: 9 } });
@@ -60,8 +83,10 @@ export async function buildPhotosZipToDisk(photos, zipDownloadId) {
     archive.pipe(output);
 
     for (const photo of photos) {
-      if (fs.existsSync(photo.storagePath)) {
+      if (photo.storagePath && fs.existsSync(photo.storagePath)) {
         archive.file(photo.storagePath, { name: photo.filename });
+      } else if (driveBuffers.has(photo.id)) {
+        archive.append(driveBuffers.get(photo.id), { name: photo.filename });
       }
     }
 
