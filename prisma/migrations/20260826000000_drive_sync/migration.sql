@@ -1,0 +1,4 @@
+ALTER TABLE "Event" ADD COLUMN "driveFolderId" TEXT;
+ALTER TABLE "Event" ADD COLUMN "driveFolderUrl" TEXT;
+ALTER TABLE "Event" ADD COLUMN "driveSyncEnabled" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "Event" ADD COLUMN "lastDriveSyncAt" TIMESTAMP(3);

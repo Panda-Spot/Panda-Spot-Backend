@@ -99,6 +99,7 @@ meantime, not just cosmetic. See "Plan limits" and "Event expiry" below.
 | `GOOGLE_CLIENT_ID` | Google OAuth Client ID for "Sign in with Google" (Google Cloud Console > APIs & Services > Credentials). Unset by default — `POST /auth/google` responds `503` cleanly until this is configured. |
 | `ADMIN_EMAILS` | Comma-separated allowlist of email addresses allowed to hit `/admin/*` (the platform-operator overview — not a general role system). e.g. `"you@example.com,teammate@example.com"`. Unset = nobody can access `/admin/*`. |
 | `GOOGLE_DRIVE_API_KEY` | Google Drive API key (Cloud Console > APIs & Services > Credentials > API key, with the Drive API enabled) for the "import from a public Google Drive folder" feature — see "Google Drive import" below. This is a **separate** credential from `GOOGLE_CLIENT_ID` above (that one is Sign-In OAuth; this one is a plain read-only Drive API v3 key). Unset by default — `POST /events/:id/import/drive` responds a clean `400` until this is configured. |
+| `FTP_PORT`, `FTP_PASV_MIN`, `FTP_PASV_MAX`, `FTP_PUBLIC_HOST`, `FTP_TLS_CERT_PATH`, `FTP_TLS_KEY_PATH` | Beam (camera-to-cloud live upload) FTP server config — see "Beam" below. `FTP_PUBLIC_HOST` and the passive port range must be reachable through the VPS firewall/NAT for camera uploads to work over the internet. |
 
 ## API
 
@@ -152,6 +153,10 @@ Routes marked "owner or collaborator" below accept either; routes marked
 | GET | `/events/:id/collaborators` | owner-only | `{ collaborators: [{ user_id, email, name }], pending_invites: [{ invite_id, email, invited_at }] }` |
 | DELETE | `/events/:id/collaborators/:userId` | owner-only | Removes that collaborator. `204` on success, `404` if not a collaborator |
 | DELETE | `/events/:id/invites/:inviteId` | owner-only | Cancels that pending invite. `204` on success, `404` if missing or already accepted (use the collaborator-removal route above for someone who already accepted) |
+| GET | `/events/:id/beam/credentials` | owner or collaborator | `{ connected: false }`, or `{ connected: true, ftp_host, ftp_port, ftp_username, ftp_password }` if Beam (camera-to-cloud live upload) is already set up — see "Beam" below. |
+| POST | `/events/:id/beam/credentials` | owner or collaborator · 20/hour/IP | Generates fresh Beam credentials (first setup, or a "Regenerate" — this simply overwrites the previous ones, which stop working immediately). Same response shape as the `GET` above. |
+| DELETE | `/events/:id/beam/credentials` | owner or collaborator | Revokes Beam access — the camera's saved FTP settings stop authenticating. Doesn't touch photos already ingested. `204` on success. |
+| GET | `/events/:id/live/stream` | owner or collaborator | Server-Sent Events stream of `photo_added`/`photo_skipped` events as Beam ingests camera captures — lets an open event page update its gallery live during a shoot. Purely additive; the gallery still loads fine without ever opening this stream. |
 
 ### Guest (public)
 
@@ -329,6 +334,68 @@ verified live. The actual Drive API v3 request shapes in
 Drive API v3 docs but need a real end-to-end test — a real API key and a
 real public folder with a mix of file types/sizes — before this feature ships
 to real users.
+
+## Beam (camera-to-cloud live upload)
+
+A third way photos get into an event, alongside browser upload and Drive
+import: the photographer's own camera uploads directly, over FTP, the
+instant each shot is taken — the same mechanism FotoOwl's "Beam" and
+press/sports photography workflows use. No proprietary hardware or
+companion app is needed; most professional mirrorless/DSLR bodies (Sony
+a9/a7 IV+, Canon R3/R5/R6 II, Nikon Z8/Z9/D5/D6, and others) have "FTP
+transfer" built into their own network settings menu, and older/consumer
+bodies can add it via an aftermarket WiFi transmitter grip.
+
+**How it works:**
+
+1. The photographer generates event-scoped credentials
+   (`POST /events/:id/beam/credentials`, see the table above) — a random
+   `evt_...` username and password, stored as **plaintext** in
+   `Event.ftpUsername`/`ftpPassword` (see `schema.prisma`'s comment on those
+   columns for why — unlike a login password, the photographer needs to read
+   it back to type into their camera, and it's a scoped upload-only token,
+   not an account credential).
+2. Those go into the camera's FTP transfer settings (host = `FTP_PUBLIC_HOST`,
+   port = `FTP_PORT`, plus the username/password).
+3. `src/lib/ftpBeam.js` runs an in-process FTP server (`ftp-srv`). On login,
+   it looks up the event by username/password and roots that connection's
+   entire filesystem view at a staging directory unique to that event
+   (`storage/beam-incoming/<eventId>/`) — a camera can only ever write into
+   (or see) its own event's folder, never anything else on disk.
+4. A `chokidar` watcher on that staging tree picks up each file once it
+   stops changing size (`awaitWriteFinish`, so a file mid-transfer is never
+   read early), then runs it through `lib/captureIngest.js` — the exact same
+   validation/`detectFaces`/`generateThumbnail`/`Photo.create` pipeline as a
+   direct browser upload (unlike a Drive import, the original **is** kept in
+   normal on-disk storage, since there's no external Drive folder backing
+   it up). The staging file is deleted afterward either way.
+5. On success, `lib/liveEvents.js` publishes a `photo_added` event; an open
+   event page (subscribed via `GET /events/:id/live/stream`) prepends it to
+   the gallery immediately, no polling or refresh needed.
+
+**Infra requirements before relying on this for a real event:**
+
+- `FTP_PORT` (control) and the whole `FTP_PASV_MIN`–`FTP_PASV_MAX` passive
+  range need to be opened on the VPS firewall — this is a hosting/network
+  task, not a code change, and the feature silently can't accept uploads
+  from outside the VPS until it's done.
+- `FTP_PUBLIC_HOST` must be set to the VPS's public IP/hostname, or passive
+  transfers (which almost every camera and FTP client use) will fail even
+  with the ports open.
+- Plain FTP sends the event's username/password unencrypted. Set
+  `FTP_TLS_CERT_PATH`/`FTP_TLS_KEY_PATH` to run FTPS instead — left unset,
+  the server logs a startup warning and runs unencrypted, an accepted
+  short-term risk since each credential is scoped to write-only access to
+  one event's folder.
+
+**Verified locally**: FTP login against real event credentials, per-event
+root isolation, file upload via `curl`, the chokidar pickup +
+`captureIngest.js` pipeline invocation, and staging-file cleanup — all
+confirmed working end-to-end (the only failure seen was `detectFaces`
+correctly erroring because no local face-engine instance was running,
+which is unrelated to Beam itself). **Not yet verified against a real
+camera** or over a real network with `FTP_PUBLIC_HOST`/passive ports
+configured — do that once deployed.
 
 ## What this deliberately does NOT do yet
 

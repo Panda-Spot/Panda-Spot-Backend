@@ -12,9 +12,12 @@ import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { loadAccessibleEvent } from "../lib/access.js";
 import { sendCollaboratorInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
-import { uploadLimiter, driveImportLimiter } from "../lib/rateLimiters.js";
+import { uploadLimiter, driveImportLimiter, beamCredentialLimiter } from "../lib/rateLimiters.js";
+import { generateBeamCredentials } from "../lib/ftpBeam.js";
+import { subscribeLiveEvents } from "../lib/liveEvents.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
-import { extractFolderId, listImageFiles, downloadFile, guessExtension } from "../lib/googleDrive.js";
+import { extractFolderId, listImageFiles } from "../lib/googleDrive.js";
+import { processDriveImportJob, processDriveSyncJob } from "../lib/driveSync.js";
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, countOwnedEvents, eventStorageUsedBytes } from "../lib/planLimits.js";
 import { computeExpiresAt } from "../lib/expiry.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
@@ -123,6 +126,10 @@ router.get("/:id", async (req, res, next) => {
       storage_used_bytes: storageUsedBytes,
       storage_limit_bytes: FREE_EVENT_STORAGE_BYTES,
       role,
+      drive_folder_url: event.driveFolderUrl,
+      drive_sync_enabled: event.driveSyncEnabled,
+      last_drive_sync_at: event.lastDriveSyncAt,
+      beam_connected: !!event.ftpUsername,
     });
   } catch (err) {
     next(err);
@@ -349,136 +356,25 @@ router.get("/:id/uploads/:jobId/stream", async (req, res, next) => {
   }
 });
 
-// Processes photos imported from a public Google Drive folder — mirrors
-// processUploadJob's shape very closely (same emitJobEvent field names, so
-// the frontend's existing upload-progress UI works unchanged), but the
-// source of each file's bytes is a Drive download instead of a multipart
-// upload, and the original bytes are NEVER written to local disk
-// (saveEventPhoto is never called here) — only the thumbnail + face
-// embeddings are kept permanently. Full-res is re-fetched from Drive on
-// demand (see files.js / zip.js).
-async function processDriveImportJob(jobId, event, files) {
-  const total = files.length;
-  const skipped = [];
-  let completed = 0;
-  let facesFoundSoFar = 0;
-  const startedAt = Date.now();
-  let usedBytes = await eventStorageUsedBytes(prisma, event.id);
-
-  try {
-    for (const file of files) {
-      const fileSize = parseInt(file.size, 10) || 0;
-      const ext = guessExtension(file.mimeType, file.name);
-
-      if (!ext) {
-        skipped.push(`${file.name} (unsupported file type)`);
-      } else if (usedBytes + fileSize > FREE_EVENT_STORAGE_BYTES) {
-        skipped.push(`${file.name} (event storage limit reached — 10GB free plan cap)`);
-      } else {
-        let buffer = null;
-        try {
-          buffer = await downloadFile(file.id);
-        } catch (err) {
-          skipped.push(`${file.name} (${err.message})`);
-        }
-
-        if (buffer && !contentMatchesExtension(buffer, ext)) {
-          skipped.push(`${file.name} (file content doesn't match its extension)`);
-          buffer = null;
-        }
-
-        if (buffer) {
-          let detection;
-          try {
-            detection = await detectFaces(buffer, file.name);
-          } catch (err) {
-            skipped.push(`${file.name} (${err.isFaceEngineError ? err.message : "could not process image"})`);
-            detection = null;
-          }
-
-          if (detection) {
-            const photoId = randomUUID();
-            const thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
-
-            const faces = detection.faces || [];
-            const photo = await prisma.photo.create({
-              data: {
-                id: photoId,
-                eventId: event.id,
-                filename: file.name,
-                storagePath: null,
-                driveFileId: file.id,
-                thumbnailPath,
-                faceCount: faces.length,
-                fileSize,
-              },
-            });
-
-            for (const face of faces) {
-              await insertFace({
-                photoId: photo.id,
-                eventId: event.id,
-                bbox: face.bbox,
-                embedding: face.embedding,
-                detScore: face.det_score,
-              });
-            }
-
-            facesFoundSoFar += faces.length;
-            usedBytes += fileSize;
-          }
-        }
-      }
-
-      completed += 1;
-
-      const elapsedSeconds = (Date.now() - startedAt) / 1000;
-      const photosPerSecond = elapsedSeconds > 0 ? completed / elapsedSeconds : 0;
-      const etaSeconds =
-        photosPerSecond > 0 ? Math.round((total - completed) / photosPerSecond) : null;
-
-      emitJobEvent(jobId, {
-        type: "progress",
-        job_id: jobId,
-        total,
-        completed,
-        current_file: file.name,
-        photos_per_second: Math.round(photosPerSecond * 100) / 100,
-        eta_seconds: etaSeconds,
-        faces_found_so_far: facesFoundSoFar,
-        skipped_so_far: skipped,
-      });
-    }
-
-    emitJobEvent(jobId, {
-      type: "done",
-      job_id: jobId,
-      photos_processed: total - skipped.length,
-      faces_found: facesFoundSoFar,
-      skipped,
-    });
-  } catch (err) {
-    console.error(`Drive import job ${jobId} failed:`, err);
-    emitJobEvent(jobId, {
-      type: "error",
-      job_id: jobId,
-      message: err.message || "Unknown error while processing Google Drive import",
-    });
-  }
-}
-
 // Owner or collaborator — same access model as direct photo upload. Lists
 // the folder up front and fails fast (400) on a bad link/unconfigured key/
-// inaccessible folder before ever creating a job; once listing succeeds, the
-// actual downloads+face-detection happen in the background job, mirroring
-// POST /:id/photos.
-router.post("/:id/import/drive", driveImportLimiter, async (req, res, next) => {
+// inaccessible folder before ever creating a job. Requires `confirm: true`
+// in the body — connecting scans and imports every photo currently in the
+// folder, so the frontend shows a warning modal before ever sending this,
+// and the server enforces that same confirmation independently. Once
+// listing succeeds, the folder is saved on the event (auto-sync on by
+// default) and the actual downloads+face-detection happen in a background
+// job, mirroring POST /:id/photos.
+router.post("/:id/drive/connect", driveImportLimiter, async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
 
-    const { folder_url } = req.body || {};
+    const { folder_url, confirm } = req.body || {};
+    if (!confirm) {
+      return res.status(400).json({ error: "Connecting a Drive folder requires confirming the import first." });
+    }
 
     let folderId;
     try {
@@ -494,11 +390,176 @@ router.post("/:id/import/drive", driveImportLimiter, async (req, res, next) => {
       return res.status(400).json({ error: err.message });
     }
 
+    await prisma.event.update({
+      where: { id: event.id },
+      data: { driveFolderId: folderId, driveFolderUrl: folder_url, driveSyncEnabled: true },
+    });
+
     const { id: jobId } = createJob();
     res.status(202).json({ job_id: jobId, files_found: files.length });
 
     processDriveImportJob(jobId, event, files).catch((err) => {
-      console.error(`Unhandled error in drive import job ${jobId}:`, err);
+      console.error(`Unhandled error in drive connect job ${jobId}:`, err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Manual "Sync now" — requires an already-connected folder. Diffs the
+// folder's current contents against what's already imported: new files get
+// downloaded and processed, and photos whose Drive file was deleted get
+// removed. Streams progress over the same SSE route as upload/connect. This
+// is the same sync logic the daily scheduler runs automatically — see
+// lib/driveSync.js's runDueAutoSyncs.
+router.post("/:id/drive/sync", driveImportLimiter, async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.driveFolderId) {
+      return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
+    }
+
+    let files;
+    try {
+      files = await listImageFiles(event.driveFolderId);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    const { id: jobId } = createJob();
+    res.status(202).json({ job_id: jobId });
+
+    processDriveSyncJob(jobId, event, files).catch((err) => {
+      console.error(`Unhandled error in drive sync job ${jobId}:`, err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Toggles the daily automatic sync on/off for an already-connected folder.
+// The folder stays connected either way — this only controls whether
+// lib/driveSync.js's daily scheduler includes this event; the manual "Sync
+// now" button above always works regardless of this flag.
+router.post("/:id/drive/auto-sync", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.driveFolderId) {
+      return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
+    }
+
+    const { enabled } = req.body || {};
+    await prisma.event.update({ where: { id: event.id }, data: { driveSyncEnabled: !!enabled } });
+    res.json({ drive_sync_enabled: !!enabled });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const BEAM_HOST = process.env.FTP_PUBLIC_HOST || "your-server-address";
+const BEAM_PORT = process.env.FTP_PORT || 2121;
+
+function beamCredentialsResponse(event) {
+  return {
+    ftp_host: BEAM_HOST,
+    ftp_port: Number(BEAM_PORT),
+    ftp_username: event.ftpUsername,
+    ftp_password: event.ftpPassword,
+  };
+}
+
+// Owner or collaborator — same access model as photo upload. Returns the
+// event's current Beam (camera-to-cloud FTP) credentials if already set up,
+// or `{ connected: false }` otherwise. Credentials are stored as plaintext
+// (see schema.prisma's Event.ftpPassword note) precisely so they can be
+// read back here whenever the photographer needs to re-enter them into a
+// camera, without a one-time-reveal dance.
+router.get("/:id/beam/credentials", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.ftpUsername) {
+      return res.json({ connected: false });
+    }
+    res.json({ connected: true, ...beamCredentialsResponse(event) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Generates fresh Beam credentials (first setup, or "Regenerate" — the old
+// username/password stop working immediately since they're simply
+// overwritten). A camera's FTP transfer settings would need re-entering
+// after a regenerate.
+router.post("/:id/beam/credentials", beamCredentialLimiter, async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { username, password } = generateBeamCredentials();
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { ftpUsername: username, ftpPassword: password },
+    });
+
+    res.json({ connected: true, ...beamCredentialsResponse(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Revokes Beam access entirely — the camera's stored credentials stop
+// working immediately. Doesn't touch any photos already ingested.
+router.delete("/:id/beam/credentials", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    await prisma.event.update({
+      where: { id: event.id },
+      data: { ftpUsername: null, ftpPassword: null },
+    });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Server-Sent Events stream of "a new photo just arrived via Beam" — lets
+// an open event page update its gallery live during a shoot, instead of the
+// photographer needing to refresh. Owner-or-collaborator gated like every
+// other event route; purely additive (the gallery still loads fine without
+// ever opening this stream).
+router.get("/:id/live/stream", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    const onEvent = (payload) => {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+    const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 15000);
+    const unsubscribe = subscribeLiveEvents(event.id, onEvent);
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
     });
   } catch (err) {
     next(err);

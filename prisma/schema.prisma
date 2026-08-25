@@ -89,6 +89,27 @@ model Event {
   zipDownloads  ZipDownload[]
   collaborators EventCollaborator[]
   invites       EventInvite[]
+
+  /// Google Drive folder connected for this event's photo sync — set once
+  /// the photographer confirms the initial import. See lib/driveSync.js.
+  /// Null until connected.
+  driveFolderId  String?
+  driveFolderUrl String?
+  /// Off by default; set true once connected. When true, the daily
+  /// scheduler (lib/driveSync.js's runDueAutoSyncs) diffs the folder and
+  /// imports new / removes deleted photos automatically, on top of the
+  /// manual "Sync now" button which works regardless of this flag.
+  driveSyncEnabled Boolean   @default(false)
+  lastDriveSyncAt  DateTime?
+
+  /// Per-event FTP credentials for camera-to-cloud live upload ("Beam") —
+  /// null until the photographer generates them from the event page. Stored
+  /// as plaintext (not hashed) because, unlike a login password, the
+  /// photographer needs to read it back to type into their camera's FTP
+  /// menu — it's a scoped upload-only token, not an account credential, and
+  /// can be regenerated any time. See lib/ftpBeam.js.
+  ftpUsername String? @unique
+  ftpPassword String?
 }
 
 /// A second shooter/assistant granted upload+view access to one event without

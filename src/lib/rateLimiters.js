@@ -24,3 +24,4 @@ export const guestDownloadLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limi
 export const guestFeedbackLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 30 }); // guest "not me" feedback
 export const uploadLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 30 }); // photographer bulk photo upload
 export const driveImportLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 30 }); // photographer Google Drive folder import
+export const beamCredentialLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 20 }); // photographer Beam FTP credential generate/rotate
