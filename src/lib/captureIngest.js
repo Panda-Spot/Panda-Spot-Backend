@@ -15,17 +15,25 @@ const MIME_BY_EXT = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "imag
 
 /**
  * Runs one already-on-disk file (from Beam's FTP staging area — see
- * lib/ftpBeam.js) through the exact same pipeline as a direct browser
- * upload: extension + content-sniff validation, storage-cap check,
- * detectFaces, generateThumbnail, then a Photo row (with storagePath set,
- * same as a normal upload — Beam captures aren't Drive-backed, so there's
- * no reason to discard the original). Publishes a `photo_added` live event
- * on success so an open event page can update its gallery immediately, or a
- * `photo_skipped` one otherwise — never throws, since this runs unattended
- * with no request/response to report back to.
+ * lib/ftpBeam.js) through the same pipeline as a direct browser upload:
+ * extension + content-sniff validation, storage-cap check, detectFaces,
+ * generateThumbnail, then a Photo row. When the event has Drive backup on
+ * (advanced/beta — see lib/driveBackupAuth.js), the full-res original is
+ * uploaded to the connected Drive folder instead of being kept on the VPS
+ * (storagePath stays null, driveFileId is set, platformDriveBackup: true —
+ * same shape as a Drive import, but see lib/driveBackupRetention.js for why
+ * these rows get reclaimed/purged on a 2/7-day clock instead of kept
+ * forever). A Drive upload failure falls back to keeping the original
+ * locally rather than losing the capture. Publishes a `photo_added` live
+ * event on success, `photo_skipped` otherwise — never throws, since this
+ * runs unattended with no request/response to report back to.
  */
 export async function ingestCapturedFile(event, originalFilename, buffer) {
   const ext = path.extname(originalFilename).toLowerCase();
+
+  prisma.event
+    .update({ where: { id: event.id }, data: { lastBeamCaptureAt: new Date() } })
+    .catch((err) => console.error(`Failed to stamp lastBeamCaptureAt for event ${event.id}:`, err));
 
   if (!ALLOWED_EXTENSIONS.has(ext)) {
     return skip(event.id, originalFilename, "unsupported file type");
@@ -47,10 +55,30 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   }
 
   const photoId = randomUUID();
-  const storedFilename = `${photoId}${ext}`;
-  const storagePath = await saveEventPhoto(event.id, storedFilename, buffer);
   const thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
   const faces = detection.faces || [];
+
+  let storagePath = null;
+  let driveFileId = null;
+  let platformDriveBackup = false;
+
+  if (event.driveBackupEnabled && event.driveFolderId) {
+    try {
+      const driveFile = await uploadToDriveFolder({
+        folderId: event.driveFolderId,
+        filename: originalFilename,
+        mimeType: MIME_BY_EXT[ext] || "application/octet-stream",
+        buffer,
+      });
+      driveFileId = driveFile.id;
+      platformDriveBackup = true;
+    } catch (err) {
+      console.error(`Drive backup upload failed for event ${event.id}, falling back to local storage:`, err.message);
+    }
+  }
+  if (!driveFileId) {
+    storagePath = await saveEventPhoto(event.id, `${photoId}${ext}`, buffer);
+  }
 
   const photo = await prisma.photo.create({
     data: {
@@ -59,6 +87,8 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       filename: originalFilename,
       storagePath,
       thumbnailPath,
+      driveFileId,
+      platformDriveBackup,
       faceCount: faces.length,
       fileSize: buffer.length,
     },
@@ -88,29 +118,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
     console.error(`Guest alert check failed for Beam photo ${photo.id}:`, err)
   );
 
-  // Advanced/beta: mirror this capture back into the connected Drive folder
-  // so Drive stays the complete archive — see lib/driveBackup.js. Never
-  // allowed to affect the capture itself; a failure here (expired grant,
-  // Drive quota, network) is logged and nothing more.
-  if (event.driveBackupEnabled && event.driveFolderId) {
-    backUpToDriveIfEnabled(event, originalFilename, ext, buffer).catch((err) =>
-      console.error(`Drive backup failed for Beam photo ${photo.id}:`, err)
-    );
-  }
-
   return { photo };
-}
-
-async function backUpToDriveIfEnabled(event, filename, ext, buffer) {
-  const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
-  if (!owner?.driveBackupRefreshToken) return;
-  await uploadToDriveFolder({
-    refreshToken: owner.driveBackupRefreshToken,
-    folderId: event.driveFolderId,
-    filename,
-    mimeType: MIME_BY_EXT[ext] || "application/octet-stream",
-    buffer,
-  });
 }
 
 function skip(eventId, filename, reason) {

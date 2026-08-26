@@ -1,6 +1,5 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { randomBytes } from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
 import { prisma } from "../lib/prisma.js";
@@ -13,7 +12,6 @@ import {
   isDriveBackupBetaUser,
   getConsentUrl,
   exchangeCodeForRefreshToken,
-  revokeRefreshToken,
 } from "../lib/driveBackupAuth.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
@@ -33,10 +31,11 @@ function publicUser(user) {
     email_verified: !!user.emailVerifiedAt,
     is_admin: isAdminEmail(user.email),
     // Advanced/beta feature — see lib/driveBackupAuth.js. `drive_backup_beta`
-    // lets the frontend hide the whole feature from everyone else while
-    // it's still testing-only.
+    // lets the frontend show the per-event toggle only to allowlisted
+    // photographers; `drive_backup_configured` reflects the platform's own
+    // single Drive account (not per-user — see that file's top comment).
     drive_backup_beta: isDriveBackupBetaUser(user.email),
-    drive_backup_connected: !!user.driveBackupRefreshToken,
+    drive_backup_configured: isDriveBackupConfigured(),
   };
 }
 
@@ -306,67 +305,53 @@ router.post("/google", async (req, res, next) => {
 });
 
 // --- Drive backup (advanced/beta) — see lib/driveBackupAuth.js ---
+//
+// One-time ADMIN setup only, not something every photographer connects —
+// there is exactly one platform-wide Drive account
+// (GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN), used across every event with the
+// per-event toggle on. This flow just gets that one refresh token; it's
+// never persisted to the database (a single global secret belongs in the
+// server's own .env, same as every other credential here) — the callback
+// below renders it once for an admin to copy into .env and restart.
 
-// A full-page browser redirect (not a fetch call), so it can't carry an
-// Authorization header — it relies on requireAuth's existing support for a
-// `?token=` query param instead (same trick the SSE upload-progress stream
-// uses). Gated behind isDriveBackupBetaUser on top of whatever allowlist
-// the Google Cloud OAuth consent screen itself enforces while in Testing
-// status (see server/README.md).
 router.get("/google/drive-backup/connect", requireAuth, async (req, res, next) => {
   try {
-    if (!isDriveBackupConfigured()) {
-      return res.status(503).json({ error: "Drive backup isn't configured yet" });
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      return res.status(503).json({ error: "Drive backup isn't configured yet (missing GOOGLE_CLIENT_ID/SECRET)" });
     }
-    if (!isDriveBackupBetaUser(req.user.email)) {
-      return res.status(403).json({ error: "Drive backup is a beta feature — this account isn't on the beta list yet" });
+    if (!isAdminEmail(req.user.email)) {
+      return res.status(403).json({ error: "Only a platform admin can (re)connect Drive backup" });
     }
-    // Google echoes `state` back to the callback unmodified and it's not
-    // otherwise authenticated — sign the user id into it so the callback
-    // can trust who this grant belongs to without a session/cookie, and so
-    // nobody can forge a different user's id into their own callback hit.
-    const state = jwt.sign({ uid: req.user.id }, process.env.JWT_SECRET, { expiresIn: "10m" });
-    res.redirect(getConsentUrl(state));
+    res.redirect(getConsentUrl());
   } catch (err) {
     next(err);
   }
 });
 
 router.get("/google/drive-backup/callback", async (req, res) => {
-  const redirectBase = `${process.env.PUBLIC_WEB_URL || "http://localhost:5173"}/branding`;
-  const { code, state, error } = req.query;
+  const { code, error } = req.query;
 
   if (error) {
-    return res.redirect(`${redirectBase}?drive_backup_error=${encodeURIComponent(String(error))}`);
-  }
-
-  let uid;
-  try {
-    ({ uid } = jwt.verify(state, process.env.JWT_SECRET));
-  } catch {
-    return res.redirect(`${redirectBase}?drive_backup_error=invalid_or_expired_state`);
+    return res.status(400).send(`Drive backup connection failed: ${escapeHtml(String(error))}`);
   }
 
   try {
     const refreshToken = await exchangeCodeForRefreshToken(code);
-    await prisma.user.update({ where: { id: uid }, data: { driveBackupRefreshToken: refreshToken } });
-    res.redirect(`${redirectBase}?drive_backup=connected`);
+    res.send(
+      `<pre style="font-family: monospace; white-space: pre-wrap; padding: 24px;">` +
+        `Drive backup connected.\n\n` +
+        `Add this to the server's .env, then restart it:\n\n` +
+        `GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN="${escapeHtml(refreshToken)}"\n\n` +
+        `This token is shown once and not stored anywhere by PandaSpot itself — copy it now.` +
+        `</pre>`
+    );
   } catch (err) {
-    res.redirect(`${redirectBase}?drive_backup_error=${encodeURIComponent(err.message)}`);
+    res.status(500).send(`Drive backup connection failed: ${escapeHtml(err.message)}`);
   }
 });
 
-router.post("/google/drive-backup/disconnect", requireAuth, async (req, res, next) => {
-  try {
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (user?.driveBackupRefreshToken) {
-      await revokeRefreshToken(user.driveBackupRefreshToken);
-    }
-    await prisma.user.update({ where: { id: req.user.id }, data: { driveBackupRefreshToken: null } });
-    res.json({ ok: true });
-  } catch (err) {
-    next(err);
-  }
-});
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
 
 export default router;

@@ -36,19 +36,6 @@ model User {
 
   emailVerificationTokens EmailVerificationToken[]
   passwordResetTokens     PasswordResetToken[]
-
-  /// A Google OAuth refresh token with the narrow `drive.file` scope
-  /// (access only to files/folders this app itself created or opened —
-  /// never the user's whole Drive), granted via a separate consent flow
-  /// from Sign-In-with-Google (see lib/driveBackupAuth.js). Powers the
-  /// **advanced, beta-gated** Beam-to-Drive backup feature — null until a
-  /// photographer connects it, and only reachable at all if their email is
-  /// on DRIVE_BACKUP_BETA_EMAILS while the feature is still in testing.
-  /// Stored as plaintext for the same reason as Event.ftpPassword — see that
-  /// column's comment — though this one is a genuinely more sensitive
-  /// secret (it's reusable against Google, not scoped to one FTP folder),
-  /// so encrypting it at rest is the right next step before a wider release.
-  driveBackupRefreshToken String?
 }
 
 /// A single-use, time-limited token emailed to confirm account ownership.
@@ -125,13 +112,26 @@ model Event {
   ftpUsername String? @unique
   ftpPassword String?
 
-  /// Advanced/beta: when true (and the owner has connected Drive backup —
-  /// see User.driveBackupRefreshToken), each Beam capture is also uploaded
-  /// into this event's connected driveFolderId, so Drive stays the complete
-  /// archive instead of only holding what was imported from it. Independent
-  /// of driveSyncEnabled, which controls the opposite direction (Drive ->
-  /// PandaSpot). See lib/driveBackup.js.
+  /// Advanced/beta: when true, each Beam capture is uploaded into this
+  /// event's connected driveFolderId using the platform's own single Drive
+  /// account (see lib/driveBackupAuth.js — GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN,
+  /// not a per-photographer grant), instead of also keeping the full-res
+  /// original on the VPS. Independent of driveSyncEnabled, which controls
+  /// the opposite direction (Drive -> PandaSpot). See lib/driveBackup.js and
+  /// lib/driveBackupRetention.js for the reclaim/purge lifecycle this
+  /// implies — the platform's own Drive storage is a temporary relay, not a
+  /// permanent archive, so photos backed up this way are deleted (from both
+  /// Drive and the VPS) 7 days after capture unless the studio owner has
+  /// made their own copy in Drive by then.
   driveBackupEnabled Boolean @default(false)
+  /// Stamped on every Beam capture (regardless of driveBackupEnabled) —
+  /// used to infer "this shoot looks finished" (no captures for a while) so
+  /// the reclaim notice email (see lib/driveBackupRetention.js) fires once,
+  /// promptly, instead of only after the unrelated 90-day guest-expiry.
+  lastBeamCaptureAt DateTime?
+  /// Set once the "make your own copy — you have 7 days" notice has been
+  /// sent for this event, so it's never sent twice.
+  driveBackupNoticeSentAt DateTime?
 }
 
 /// A second shooter/assistant granted upload+view access to one event without
@@ -192,6 +192,14 @@ model Photo {
   faceCount   Int      @default(0)
   createdAt   DateTime @default(now())
   faces       Face[]
+
+  /// True only for a Beam capture uploaded to Drive via the platform's own
+  /// account (Event.driveBackupEnabled) — distinguishes it from a Google
+  /// Drive *import* (photographer's own pre-existing Drive content, driveFileId
+  /// also set but never auto-deleted) and from a normal direct upload. Drives
+  /// lib/driveBackupRetention.js's 2-day-reclaim / 7-day-purge sweep, which
+  /// only ever touches rows with this flag true.
+  platformDriveBackup Boolean @default(false)
 }
 
 /// Face rows are inserted/queried via raw SQL because the `embedding` column

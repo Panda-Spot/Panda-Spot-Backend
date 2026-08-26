@@ -19,14 +19,14 @@ function buildMultipartBody(boundary, metadata, mimeType, buffer) {
 }
 
 /**
- * Uploads one file into a Drive folder the connected account has access to,
- * using its stored refresh token. Used by lib/captureIngest.js to mirror
- * each Beam capture into a connected Drive folder — best-effort: callers
- * should catch and log failures, never let a backup failure affect the
- * capture it was triggered by.
+ * Uploads one file into a Drive folder using the platform's single
+ * connected account (see lib/driveBackupAuth.js) — only works because the
+ * target folder is shared as "Anyone with the link — Editor". Used by
+ * lib/captureIngest.js to mirror each Beam capture; best-effort, callers
+ * should catch and log failures rather than let them affect the capture.
  */
-export async function uploadToDriveFolder({ refreshToken, folderId, filename, mimeType, buffer }) {
-  const accessToken = await getFreshAccessToken(refreshToken);
+export async function uploadToDriveFolder({ folderId, filename, mimeType, buffer }) {
+  const accessToken = await getFreshAccessToken();
   const boundary = `pandaspot-${randomUUID()}`;
   const body = buildMultipartBody(boundary, { name: filename, parents: [folderId] }, mimeType, buffer);
 
@@ -44,4 +44,23 @@ export async function uploadToDriveFolder({ refreshToken, folderId, filename, mi
     throw new Error(`Drive backup upload failed (${res.status}): ${detail.slice(0, 200)}`);
   }
   return res.json();
+}
+
+/**
+ * Permanently deletes a file the platform account owns (used once its
+ * lib/driveBackupRetention.js grace period has elapsed, to reclaim the
+ * platform account's own Drive quota). A 404 (already gone — e.g. the
+ * studio owner already made their own copy and removed the original, or a
+ * previous attempt partially succeeded) is treated as success.
+ */
+export async function deleteFileFromDrive(fileId) {
+  const accessToken = await getFreshAccessToken();
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok && res.status !== 404) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`Drive delete failed (${res.status}): ${detail.slice(0, 200)}`);
+  }
 }

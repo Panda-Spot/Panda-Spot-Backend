@@ -12,6 +12,7 @@ import invitesRoutes from "./routes/invites.js";
 import adminRoutes from "./routes/admin.js";
 import { startAutoSyncScheduler } from "./lib/driveSync.js";
 import { startBeamServer } from "./lib/ftpBeam.js";
+import { startDriveBackupRetentionScheduler } from "./lib/driveBackupRetention.js";
 
 const app = express();
 
@@ -53,4 +54,5 @@ app.listen(PORT, () => {
   console.log(`PandaSpot server listening on port ${PORT}`);
   startAutoSyncScheduler();
   startBeamServer();
+  startDriveBackupRetentionScheduler();
 });

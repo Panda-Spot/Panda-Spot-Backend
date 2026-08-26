@@ -101,7 +101,7 @@ meantime, not just cosmetic. See "Plan limits" and "Event expiry" below.
 | `GOOGLE_DRIVE_API_KEY` | Google Drive API key (Cloud Console > APIs & Services > Credentials > API key, with the Drive API enabled) for the "import from a public Google Drive folder" feature — see "Google Drive import" below. This is a **separate** credential from `GOOGLE_CLIENT_ID` above (that one is Sign-In OAuth; this one is a plain read-only Drive API v3 key). Unset by default — `POST /events/:id/import/drive` responds a clean `400` until this is configured. |
 | `FTP_PORT`, `FTP_PASV_MIN`, `FTP_PASV_MAX`, `FTP_PUBLIC_HOST`, `FTP_TLS_CERT_PATH`, `FTP_TLS_KEY_PATH` | Beam (camera-to-cloud live upload) FTP server config — see "Beam" below. `FTP_PUBLIC_HOST` and the passive port range must be reachable through the VPS firewall/NAT for camera uploads to work over the internet. |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM` | WhatsApp delivery (see "WhatsApp delivery" below) — Twilio's WhatsApp Business API, called directly via REST (no SDK). Unset by default — `lib/whatsapp.js` logs instead of sending. |
-| `GOOGLE_CLIENT_SECRET`, `GOOGLE_DRIVE_BACKUP_REDIRECT_URI`, `DRIVE_BACKUP_BETA_EMAILS` | **Advanced/beta** Drive backup — see "Drive backup" below. `GOOGLE_CLIENT_SECRET` is the Client Secret for the *same* OAuth Client as `GOOGLE_CLIENT_ID`, needed for this feature's Authorization Code exchange (Sign-In-with-Google never needs it). `DRIVE_BACKUP_BETA_EMAILS` is an allowlist gate independent of Google's own test-user list. |
+| `GOOGLE_CLIENT_SECRET`, `GOOGLE_DRIVE_BACKUP_REDIRECT_URI`, `GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN`, `DRIVE_BACKUP_BETA_EMAILS` | **Advanced/beta** Drive backup — see "Drive backup" below. One platform-wide Drive account (not per-photographer): `GOOGLE_CLIENT_SECRET` pairs with `GOOGLE_CLIENT_ID` for the one-time admin OAuth setup; `GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN` is that setup's actual result and IS the credential used for every upload; `DRIVE_BACKUP_BETA_EMAILS` gates which photographers can enable the per-event toggle. |
 
 ## API
 
@@ -119,7 +119,9 @@ below). This is purely so the frontend knows whether to show an Admin nav
 link; the real gate is server-side on `/admin/*`.
 
 Every user response also includes `drive_backup_beta: boolean` (true if this
-email is in `DRIVE_BACKUP_BETA_EMAILS`) and `drive_backup_connected: boolean`
+email is in `DRIVE_BACKUP_BETA_EMAILS` — lets this photographer see the
+per-event Drive backup toggle) and `drive_backup_configured: boolean` (true
+once the platform's single Drive backup account is set up — not per-user)
 — see "Drive backup" below. Same UI-nicety-only pattern as `is_admin`; the
 real gates are server-side.
 
@@ -134,9 +136,8 @@ real gates are server-side.
 | POST | `/auth/password-reset/request` | — | 10/15min/IP | `{ email }` → **always** responds `{ ok: true }` regardless of whether the account exists (no user-enumeration); emails a reset link if it does |
 | POST | `/auth/password-reset/:token/confirm` | — | — | `{ password }` (min 8 chars) → sets the new password. `{ ok: true }`; `404` if the token is invalid/expired/already used |
 | POST | `/auth/google` | — | — | `{ id_token }` (a Google Identity Services credential) → verifies it server-side, creates the account on first sign-in or links `googleId` to a matching existing email, response includes `token`. `503` if `GOOGLE_CLIENT_ID` isn't configured; `401` if the token doesn't verify |
-| GET | `/auth/google/drive-backup/connect` | required | — | **Advanced/beta** — see "Drive backup" below. A full-page redirect (not a fetch) to Google's consent screen for the separate Drive backup grant. `403` if this account isn't on `DRIVE_BACKUP_BETA_EMAILS`; `503` if unconfigured. |
-| GET | `/auth/google/drive-backup/callback` | — | — | Google's redirect target — exchanges the code for a refresh token, stores it, then redirects to the frontend's `/branding?drive_backup=connected` (or `?drive_backup_error=...`). |
-| POST | `/auth/google/drive-backup/disconnect` | required | — | Revokes the stored grant with Google and clears it. `{ ok: true }` |
+| GET | `/auth/google/drive-backup/connect` | required (admin) | — | **Advanced/beta, one-time setup** — see "Drive backup" below. A full-page redirect (not a fetch) to Google's consent screen for the platform's single Drive backup account. `403` if this account isn't in `ADMIN_EMAILS`; `503` if `GOOGLE_CLIENT_ID`/`SECRET` aren't set. |
+| GET | `/auth/google/drive-backup/callback` | — | — | Google's redirect target — exchanges the code for a refresh token and renders it once as plain text for the admin to copy into `.env` as `GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN` (never stored in the database). |
 
 ### Events (photographer)
 
@@ -167,7 +168,8 @@ Routes marked "owner or collaborator" below accept either; routes marked
 | POST | `/events/:id/beam/credentials` | owner or collaborator · 20/hour/IP | Generates fresh Beam credentials (first setup, or a "Regenerate" — this simply overwrites the previous ones, which stop working immediately). Same response shape as the `GET` above. |
 | DELETE | `/events/:id/beam/credentials` | owner or collaborator | Revokes Beam access — the camera's saved FTP settings stop authenticating. Doesn't touch photos already ingested. `204` on success. |
 | GET | `/events/:id/live/stream` | owner or collaborator | Server-Sent Events stream of `photo_added`/`photo_skipped` events as Beam ingests camera captures — lets an open event page update its gallery live during a shoot. Purely additive; the gallery still loads fine without ever opening this stream. |
-| POST | `/events/:id/drive-backup/toggle` | owner or collaborator | **Advanced/beta** — see "Drive backup" below. `{ enabled }` → turns on/off mirroring Beam captures into this event's connected Drive folder. `400` if no Drive folder is connected yet, or if the event's owner hasn't connected Drive backup for their account. |
+| POST | `/events/:id/drive-backup/toggle` | owner or collaborator | **Advanced/beta** — see "Drive backup" below. `{ enabled }` → turns on/off mirroring Beam captures into this event's connected Drive folder using the platform's single Drive account. `400` if no Drive folder is connected yet or that platform account isn't configured; `403` if the event's owner isn't on `DRIVE_BACKUP_BETA_EMAILS`. |
+| POST | `/events/:id/drive-backup/reclaim-now` | owner or collaborator | **Advanced/beta** — "I've made my copies, free up space." Immediately reclaims (Drive→VPS, then deletes the Drive copy) every eligible photo in this event, regardless of the automatic 2-day timer. `{ reclaimed_count }` |
 
 ### Guest (public)
 
@@ -461,67 +463,77 @@ for a real event.
 ## Drive backup (advanced, beta)
 
 The other direction from Drive import/sync: mirroring photos PandaSpot
-*produces* — specifically, Beam camera captures — back into an event's
-connected Drive folder, so Drive stays the one complete archive instead of
-only holding what was imported from it. Kept deliberately behind a
-feature-flag-style beta gate rather than shipped to everyone, both because
-it needs a second, more invasive Google OAuth grant than Sign-In (see
-below) and because it hasn't been tested against a real Google account yet.
+*produces* — specifically, Beam camera captures — into an event's connected
+Drive folder. Deliberately gated behind `DRIVE_BACKUP_BETA_EMAILS` (same
+allowlist pattern as `ADMIN_EMAILS`) — it hasn't been tested against a real
+Google account yet, and its storage model (below) is a real, disclosed
+tradeoff rather than a permanent archive.
 
-**Two independent gates, both required:**
+**One platform-wide Drive account, not per-photographer OAuth.** This
+deliberately does *not* ask each photographer to connect their own Google
+account. Instead, a single Google account — the operator's own — is
+connected once (`GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN`), and every event's Beam
+captures upload through that one account. This works because Drive's
+"Anyone with the link — Editor" folder permission grants write access to
+*any* authenticated Google account holding the link, not just explicitly
+named collaborators — so the platform account's uploads succeed in a
+photographer's folder the same way a person opening the link and dragging a
+file in would, with no per-photographer consent flow needed at all.
 
-1. **Google Cloud Console.** The OAuth Client (same one as `GOOGLE_CLIENT_ID`)
-   needs its consent screen kept in **Testing** publishing status with a
-   list of test-user Google accounts — while in Testing, *only* those exact
-   accounts can complete the consent flow at all; anyone else sees Google's
-   own "app hasn't completed verification" block. This is the honest,
-   supported way to limit a Google OAuth feature to a handful of people
-   without going through Google's full verification review (required once
-   you want it open to everyone). Console steps: APIs & Services > OAuth
-   consent screen > Audience > add test users by their Google account
-   email. Moving to full production later means submitting for Google's
-   verification review, since `drive.file` is a sensitive (not just basic)
-   scope.
-2. **`DRIVE_BACKUP_BETA_EMAILS`** (app-level, this codebase's own
-   allowlist, same pattern as `ADMIN_EMAILS`) — lets specific photographers
-   see the feature in the UI at all, independent of Google's test-user
-   list, so you can turn it on/off per person without touching the Google
-   Cloud project.
+**Setup (one-time, admin-only):** an `ADMIN_EMAILS` account visits
+`GET /auth/google/drive-backup/connect` in a browser (a full-page redirect
+to Google's consent screen, requesting only the narrow `drive.file` scope —
+access limited to files/folders this account creates, never its whole
+Drive), then `GET /auth/google/drive-backup/callback` renders the resulting
+refresh token once for the admin to copy into the server's `.env` as
+`GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN` and restart — the token is never stored
+in the database, matching every other credential in this file. Per event,
+`POST /events/:id/drive-backup/toggle` (photographer, beta-gated) turns
+mirroring on/off — 400s if no Drive folder is connected yet or the platform
+account itself isn't configured. When on, each Beam capture
+(`lib/captureIngest.js`) skips saving the full-res original locally at all
+and instead calls `lib/driveBackup.js`'s `uploadToDriveFolder` (falling
+back to normal local storage if the Drive upload fails, so a capture is
+never lost) — the `Photo` row gets `driveFileId` set and
+`platformDriveBackup: true`, the same shape as a Drive *import* but flagged
+distinctly, since these rows are NOT kept forever.
 
-**Why a separate OAuth flow from Sign-In-with-Google:** `routes/auth.js`'s
-existing `/auth/google` only ever verifies a client-side ID token — it
-never has an offline/background credential to act with later. Drive
-uploads happen from Beam's ingestion pipeline, unattended, well after the
-photographer's browser tab is gone, so this needs a genuine Authorization
-Code flow with `access_type: "offline"` to get a **refresh token** (see
-`lib/driveBackupAuth.js`), requesting only the narrow
-`drive.file` scope — access limited to files/folders this app itself
-creates, never the photographer's whole Drive.
+**Why not forever — the reclaim/purge lifecycle (`lib/driveBackupRetention.js`):**
+because every uploaded file is owned by the one platform account, its bytes
+count against *that one account's* Drive quota — shared across every event
+using the feature, not scoped per photographer. So the platform's Drive
+storage is treated as a temporary relay, not a permanent archive, on a fixed
+clock from each photo's capture time:
 
-**Flow:** `GET /auth/google/drive-backup/connect` (a full-page redirect,
-not a fetch — it hands off to Google's consent screen) → Google redirects
-back to `GET /auth/google/drive-backup/callback` with a `code` and a
-`state` the server itself signed (a short-lived JWT carrying the user id —
-necessary since this callback has no session/cookie to authenticate with,
-and a bare user id in `state` would let anyone plant a grant onto someone
-else's account) → the code is exchanged for a refresh token, stored on
-`User.driveBackupRefreshToken`. `POST /auth/google/drive-backup/disconnect`
-revokes it with Google and clears the column.
+- **Day 0** — captured, uploaded to the photographer's Drive folder.
+- **~6 hours after the last capture** (inferred "this shoot looks
+  finished" from `Event.lastBeamCaptureAt` going quiet) — a one-time email
+  to the studio owner (`sendDriveBackupReclaimNoticeEmail`): open the Drive
+  folder, select all, **Make a copy** — Drive's own native action, which
+  creates copies owned by *them*, in *their* storage, fully independent of
+  the platform account's copy. No API work needed for the copy itself.
+- **Day 2** — any photo not yet copied gets its Drive file deleted (to
+  reclaim the platform account's quota) but first downloaded back to the
+  VPS as a last-resort safety net — still recoverable via a normal PandaSpot
+  download, just no longer sitting in Drive.
+- **Day 7** — deleted everywhere, for good: the VPS copy, its thumbnail, its
+  `Face` rows, the `Photo` row itself. This also removes it from guest
+  search, not just full-res access — a photographer who hasn't saved their
+  own copy by day 7 has genuinely lost it, by design (the platform was
+  never the archive).
 
-Per event, `POST /events/:id/drive-backup/toggle` turns mirroring on/off —
-it 400s with a clear reason if the event has no Drive folder connected yet,
-or if the event's owner hasn't connected Drive backup for their account.
-When on, every Beam capture (`lib/captureIngest.js`) also calls
-`lib/driveBackup.js`'s `uploadToDriveFolder` with the same in-memory buffer
-already used for local processing — a multipart upload to Drive API v3,
-fire-and-forget, logged and swallowed on failure so a Drive hiccup never
-affects the capture landing in PandaSpot itself.
+`POST /events/:id/drive-backup/reclaim-now` lets the studio owner (or a
+collaborator) trigger the day-2 step immediately — "I've already made my
+copies, free up space now" — rather than waiting for the automatic sweep;
+it doesn't skip the day-7 purge, so there's still a window to just download
+directly from PandaSpot if needed. The retention sweep itself
+(`runDriveBackupRetentionSweep`) runs hourly via
+`startDriveBackupRetentionScheduler`.
 
 **Not yet verified against a real Google account** — the OAuth
-exchange/refresh/upload code was written against Google's documented APIs
-but needs a real `GOOGLE_CLIENT_SECRET`, a Drive-enabled test-user account,
-and a real Beam capture to confirm end-to-end before trusting it for a
-real event.
+exchange/refresh/upload/delete code was written against Google's documented
+APIs but needs a real `GOOGLE_CLIENT_SECRET` + refresh token and a real Beam
+capture to confirm end-to-end before trusting it for a real event.
 
 ## What this deliberately does NOT do yet
 

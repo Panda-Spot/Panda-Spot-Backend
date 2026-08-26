@@ -22,6 +22,9 @@ import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, countOwnedEvents, eventStor
 import { computeExpiresAt } from "../lib/expiry.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { checkAndNotifyForNewPhotos } from "../lib/guestAlerts.js";
+import { isDriveBackupConfigured, isDriveBackupBetaUser } from "../lib/driveBackupAuth.js";
+import { reclaimEventDriveBackups } from "../lib/driveBackupRetention.js";
+import { deleteFileFromDrive } from "../lib/driveBackup.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -115,7 +118,6 @@ router.get("/:id", async (req, res, next) => {
 
     const photoCount = await prisma.photo.count({ where: { eventId: event.id } });
     const storageUsedBytes = await eventStorageUsedBytes(prisma, event.id);
-    const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
 
     res.json({
       id: event.id,
@@ -132,12 +134,13 @@ router.get("/:id", async (req, res, next) => {
       drive_sync_enabled: event.driveSyncEnabled,
       last_drive_sync_at: event.lastDriveSyncAt,
       beam_connected: !!event.ftpUsername,
-      // Advanced/beta: mirroring Beam captures back into the connected Drive
-      // folder — see lib/driveBackup.js. Only actually usable once a Drive
-      // folder is connected AND the owner has connected their Drive backup
-      // account (see /auth/google/drive-backup/connect).
+      // Advanced/beta: mirroring Beam captures into the connected Drive
+      // folder via the platform's single Drive account — see
+      // lib/driveBackup.js. drive_backup_available reflects whether that
+      // platform-wide account is configured at all (isDriveBackupConfigured()),
+      // not anything per-photographer.
       drive_backup_enabled: event.driveBackupEnabled,
-      drive_backup_available: !!owner?.driveBackupRefreshToken,
+      drive_backup_available: isDriveBackupConfigured(),
     });
   } catch (err) {
     next(err);
@@ -166,6 +169,19 @@ router.delete("/:id", async (req, res, next) => {
     if (!event) return;
 
     const zipDownloads = await prisma.zipDownload.findMany({ where: { eventId: event.id } });
+
+    // Best-effort: reclaim any of this event's photos still occupying the
+    // platform's own Drive quota before the rows themselves are deleted —
+    // otherwise they'd linger there forever with nothing left to point at
+    // them (see lib/driveBackupRetention.js).
+    const platformDrivePhotos = await prisma.photo.findMany({
+      where: { eventId: event.id, platformDriveBackup: true, driveFileId: { not: null } },
+    });
+    for (const photo of platformDrivePhotos) {
+      await deleteFileFromDrive(photo.driveFileId).catch((err) =>
+        console.error(`Failed to delete Drive backup file for photo ${photo.id} during event deletion:`, err.message)
+      );
+    }
 
     await prisma.matchFeedback.deleteMany({
       where: { search: { eventId: event.id } },
@@ -596,14 +612,38 @@ router.post("/:id/drive-backup/toggle", async (req, res, next) => {
     if (!event.driveFolderId) {
       return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
     }
+    if (!isDriveBackupConfigured()) {
+      return res.status(400).json({ error: "Drive backup isn't set up on this PandaSpot instance yet." });
+    }
     const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
-    if (!owner?.driveBackupRefreshToken) {
-      return res.status(400).json({ error: "Connect Drive backup for your account first (Branding page)." });
+    if (!isDriveBackupBetaUser(owner?.email)) {
+      return res.status(403).json({ error: "Drive backup is a beta feature — this account isn't on the beta list yet." });
     }
 
     const { enabled } = req.body || {};
     await prisma.event.update({ where: { id: event.id }, data: { driveBackupEnabled: !!enabled } });
     res.json({ drive_backup_enabled: !!enabled });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Manual "I've made my copies — free up space" — an explicit owner
+// confirmation is a stronger signal than a timer, so this reclaims every
+// eligible photo in the event right now (pulls the Drive copy back to the
+// VPS as a safety net, then deletes it from Drive), regardless of the
+// automatic 2-day sweep's age check (see lib/driveBackupRetention.js). The
+// photo itself isn't fully purged by this — the normal 7-day-from-capture
+// purge still applies afterward, so there's still a window to just
+// download it directly from PandaSpot if needed.
+router.post("/:id/drive-backup/reclaim-now", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const result = await reclaimEventDriveBackups(event.id);
+    res.json(result);
   } catch (err) {
     next(err);
   }
