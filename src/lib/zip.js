@@ -11,6 +11,24 @@ export function zipFilenameForEvent(event) {
 }
 
 /**
+ * `Photo.filename` is attacker-controllable (a browser upload's original
+ * filename, a Google Drive file's name, or a camera's own filename via
+ * Shoots) and was never restricted beyond its extension — used verbatim as
+ * a zip entry name, a crafted value like `../../../etc/whatever` would be a
+ * classic zip-slip path-traversal on extraction. Strips any directory
+ * components before it becomes an entry name.
+ */
+function safeZipEntryName(filename) {
+  // Explicitly path.posix (not the host-OS-dependent path.basename) after
+  // normalizing backslashes to forward slashes first — this needs to strip
+  // both separator styles regardless of which OS this process runs on,
+  // since the zip can be extracted on any OS.
+  const normalized = String(filename || "photo").replace(/\\/g, "/");
+  const base = path.posix.basename(normalized);
+  return !base || base === "." || base === ".." ? "photo" : base;
+}
+
+/**
  * Streams a zip of the given photos straight to an HTTP response (used by
  * the instant-download route). Caller must have already set
  * Content-Type/Content-Disposition headers.
@@ -24,12 +42,13 @@ export async function streamPhotosZip(photos, res) {
   archive.pipe(res);
 
   for (const photo of photos) {
+    const entryName = safeZipEntryName(photo.filename);
     if (photo.storagePath && fs.existsSync(photo.storagePath)) {
-      archive.file(photo.storagePath, { name: photo.filename });
+      archive.file(photo.storagePath, { name: entryName });
     } else if (photo.driveFileId) {
       try {
         const buffer = await downloadFile(photo.driveFileId);
-        archive.append(buffer, { name: photo.filename });
+        archive.append(buffer, { name: entryName });
       } catch (err) {
         console.error(`Skipping photo ${photo.id} in zip — Drive download failed:`, err.message);
       }
@@ -83,10 +102,11 @@ export async function buildPhotosZipToDisk(photos, zipDownloadId) {
     archive.pipe(output);
 
     for (const photo of photos) {
+      const entryName = safeZipEntryName(photo.filename);
       if (photo.storagePath && fs.existsSync(photo.storagePath)) {
-        archive.file(photo.storagePath, { name: photo.filename });
+        archive.file(photo.storagePath, { name: entryName });
       } else if (driveBuffers.has(photo.id)) {
-        archive.append(driveBuffers.get(photo.id), { name: photo.filename });
+        archive.append(driveBuffers.get(photo.id), { name: entryName });
       }
     }
 
