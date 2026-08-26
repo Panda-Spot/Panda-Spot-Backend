@@ -17,7 +17,7 @@ const FTP_PASV_MAX = parseInt(process.env.FTP_PASV_MAX, 10) || 30110;
 const FTP_PUBLIC_HOST = process.env.FTP_PUBLIC_HOST;
 
 function stagingRoot() {
-  return path.join(storageRoot(), "beam-incoming");
+  return path.join(storageRoot(), "shoots-incoming");
 }
 
 function stagingDirFor(eventId) {

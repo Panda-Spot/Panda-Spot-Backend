@@ -32,8 +32,8 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   const ext = path.extname(originalFilename).toLowerCase();
 
   prisma.event
-    .update({ where: { id: event.id }, data: { lastBeamCaptureAt: new Date() } })
-    .catch((err) => console.error(`Failed to stamp lastBeamCaptureAt for event ${event.id}:`, err));
+    .update({ where: { id: event.id }, data: { lastShootsCaptureAt: new Date() } })
+    .catch((err) => console.error(`Failed to stamp lastShootsCaptureAt for event ${event.id}:`, err));
 
   if (!ALLOWED_EXTENSIONS.has(ext)) {
     return skip(event.id, originalFilename, "unsupported file type");
@@ -77,7 +77,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
     }
   }
   if (!driveFileId) {
-    // Drive backup off, or its upload failed — kept in a dedicated beam/
+    // Drive backup off, or its upload failed — kept in a dedicated shoots/
     // subfolder rather than mixed in with directly-uploaded photos.
     storagePath = await saveEventShootsPhoto(event.id, `${photoId}${ext}`, buffer);
   }

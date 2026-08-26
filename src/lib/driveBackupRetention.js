@@ -98,7 +98,7 @@ export async function runDriveBackupRetentionSweep() {
     where: {
       driveBackupEnabled: true,
       driveBackupNoticeSentAt: null,
-      lastBeamCaptureAt: { lt: new Date(Date.now() - NOTICE_AFTER_INACTIVITY_MS) },
+      lastShootsCaptureAt: { lt: new Date(Date.now() - NOTICE_AFTER_INACTIVITY_MS) },
     },
     include: { owner: true },
   });

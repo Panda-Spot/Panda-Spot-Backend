@@ -103,16 +103,16 @@ model Event {
   driveSyncEnabled Boolean   @default(false)
   lastDriveSyncAt  DateTime?
 
-  /// Per-event FTP credentials for camera-to-cloud live upload ("Beam") —
-  /// null until the photographer generates them from the event page. Stored
-  /// as plaintext (not hashed) because, unlike a login password, the
+  /// Per-event FTP credentials for camera-to-cloud live upload ("PandaShoots")
+  /// — null until the photographer generates them from the event page.
+  /// Stored as plaintext (not hashed) because, unlike a login password, the
   /// photographer needs to read it back to type into their camera's FTP
   /// menu — it's a scoped upload-only token, not an account credential, and
-  /// can be regenerated any time. See lib/ftpBeam.js.
+  /// can be regenerated any time. See lib/ftpShoots.js.
   ftpUsername String? @unique
   ftpPassword String?
 
-  /// Advanced/beta: when true, each Beam capture is uploaded into this
+  /// Advanced/beta: when true, each PandaShoots capture is uploaded into this
   /// event's connected driveFolderId using the platform's own single Drive
   /// account (see lib/driveBackupAuth.js — GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN,
   /// not a per-photographer grant), instead of also keeping the full-res
@@ -124,11 +124,11 @@ model Event {
   /// Drive and the VPS) 7 days after capture unless the studio owner has
   /// made their own copy in Drive by then.
   driveBackupEnabled Boolean @default(false)
-  /// Stamped on every Beam capture (regardless of driveBackupEnabled) —
-  /// used to infer "this shoot looks finished" (no captures for a while) so
-  /// the reclaim notice email (see lib/driveBackupRetention.js) fires once,
-  /// promptly, instead of only after the unrelated 90-day guest-expiry.
-  lastBeamCaptureAt DateTime?
+  /// Stamped on every PandaShoots capture (regardless of driveBackupEnabled)
+  /// — used to infer "this shoot looks finished" (no captures for a while)
+  /// so the reclaim notice email (see lib/driveBackupRetention.js) fires
+  /// once, promptly, instead of only after the unrelated 90-day guest-expiry.
+  lastShootsCaptureAt DateTime?
   /// Set once the "make your own copy — you have 7 days" notice has been
   /// sent for this event, so it's never sent twice.
   driveBackupNoticeSentAt DateTime?
@@ -193,7 +193,7 @@ model Photo {
   createdAt   DateTime @default(now())
   faces       Face[]
 
-  /// True only for a Beam capture uploaded to Drive via the platform's own
+  /// True only for a PandaShoots capture uploaded to Drive via the platform's own
   /// account (Event.driveBackupEnabled) — distinguishes it from a Google
   /// Drive *import* (photographer's own pre-existing Drive content, driveFileId
   /// also set but never auto-deleted) and from a normal direct upload. Drives
@@ -257,7 +257,7 @@ model MatchFeedback {
 /// download link instead of blocking their browser tab on a large selection.
 /// A guest opting in to be notified (email or WhatsApp) if more photos of
 /// them show up later in the same event — the natural follow-up once photos
-/// can keep arriving live via Beam after their first search. One row per
+/// can keep arriving live via PandaShoots after their first search. One row per
 /// (event, guestClientId): a guest who searches again just updates their
 /// existing subscription rather than creating a second one. See
 /// lib/guestAlerts.js for the matching/notify job.

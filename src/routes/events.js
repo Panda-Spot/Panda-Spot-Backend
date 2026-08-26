@@ -133,7 +133,7 @@ router.get("/:id", async (req, res, next) => {
       drive_folder_url: event.driveFolderUrl,
       drive_sync_enabled: event.driveSyncEnabled,
       last_drive_sync_at: event.lastDriveSyncAt,
-      beam_connected: !!event.ftpUsername,
+      shoots_connected: !!event.ftpUsername,
       // Advanced/beta: mirroring Shoots captures into the connected Drive
       // folder via the platform's single Drive account — see
       // lib/driveBackup.js. drive_backup_available reflects whether that

@@ -41,10 +41,10 @@ export async function saveEventPhoto(eventId, filename, buffer) {
  * photos so the two sources are easy to tell apart on disk. Used only when
  * Drive backup is off or its upload failed (see lib/captureIngest.js). */
 export function eventShootsDir(eventId) {
-  return path.join(eventDir(eventId), "beam");
+  return path.join(eventDir(eventId), "shoots");
 }
 
-/** Writes a Shoots-captured buffer to disk under the event's dedicated beam/
+/** Writes a Shoots-captured buffer to disk under the event's dedicated shoots/
  * subfolder, returns the absolute path. */
 export async function saveEventShootsPhoto(eventId, filename, buffer) {
   const dir = eventShootsDir(eventId);
