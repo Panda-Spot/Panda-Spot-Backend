@@ -4,7 +4,7 @@ import { prisma } from "./prisma.js";
 import { detectFaces } from "./faceEngine.js";
 import { insertFace } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
-import { ALLOWED_EXTENSIONS, saveEventBeamPhoto } from "./storage.js";
+import { ALLOWED_EXTENSIONS, saveEventShootsPhoto } from "./storage.js";
 import { contentMatchesExtension } from "./fileValidation.js";
 import { FREE_EVENT_STORAGE_BYTES, eventStorageUsedBytes } from "./planLimits.js";
 import { publishLiveEvent } from "./liveEvents.js";
@@ -14,8 +14,8 @@ import { uploadToDriveFolder } from "./driveBackup.js";
 const MIME_BY_EXT = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
 
 /**
- * Runs one already-on-disk file (from Beam's FTP staging area — see
- * lib/ftpBeam.js) through the same pipeline as a direct browser upload:
+ * Runs one already-on-disk file (from Shoots' FTP staging area — see
+ * lib/ftpShoots.js) through the same pipeline as a direct browser upload:
  * extension + content-sniff validation, storage-cap check, detectFaces,
  * generateThumbnail, then a Photo row. When the event has Drive backup on
  * (advanced/beta — see lib/driveBackupAuth.js), the full-res original is
@@ -79,7 +79,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   if (!driveFileId) {
     // Drive backup off, or its upload failed — kept in a dedicated beam/
     // subfolder rather than mixed in with directly-uploaded photos.
-    storagePath = await saveEventBeamPhoto(event.id, `${photoId}${ext}`, buffer);
+    storagePath = await saveEventShootsPhoto(event.id, `${photoId}${ext}`, buffer);
   }
 
   const photo = await prisma.photo.create({
@@ -117,14 +117,14 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   });
 
   checkAndNotifyForNewPhotos(event, [photo.id]).catch((err) =>
-    console.error(`Guest alert check failed for Beam photo ${photo.id}:`, err)
+    console.error(`Guest alert check failed for Shoots photo ${photo.id}:`, err)
   );
 
   return { photo };
 }
 
 function skip(eventId, filename, reason) {
-  console.warn(`Beam capture skipped for event ${eventId}: ${filename} (${reason})`);
+  console.warn(`Shoots capture skipped for event ${eventId}: ${filename} (${reason})`);
   publishLiveEvent(eventId, { type: "photo_skipped", filename, reason });
   return { skipped: reason };
 }

@@ -22,7 +22,7 @@ function buildMultipartBody(boundary, metadata, mimeType, buffer) {
  * Uploads one file into a Drive folder using the platform's single
  * connected account (see lib/driveBackupAuth.js) — only works because the
  * target folder is shared as "Anyone with the link — Editor". Used by
- * lib/captureIngest.js to mirror each Beam capture; best-effort, callers
+ * lib/captureIngest.js to mirror each Shoots capture; best-effort, callers
  * should catch and log failures rather than let them affect the capture.
  */
 export async function uploadToDriveFolder({ folderId, filename, mimeType, buffer }) {

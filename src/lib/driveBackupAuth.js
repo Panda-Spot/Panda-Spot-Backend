@@ -1,7 +1,7 @@
 import { OAuth2Client } from "google-auth-library";
 
 // A single, platform-wide Google account (the operator's own), not a
-// per-photographer grant. Beam-captured photos get uploaded into a
+// per-photographer grant. Shoots-captured photos get uploaded into a
 // photographer's Drive folder using THIS one account, which only works
 // because the folder is shared as "Anyone with the link — Editor": Drive's
 // link-sharing permission grants write access to any authenticated Google

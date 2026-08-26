@@ -99,7 +99,7 @@ meantime, not just cosmetic. See "Plan limits" and "Event expiry" below.
 | `GOOGLE_CLIENT_ID` | Google OAuth Client ID for "Sign in with Google" (Google Cloud Console > APIs & Services > Credentials). Unset by default — `POST /auth/google` responds `503` cleanly until this is configured. |
 | `ADMIN_EMAILS` | Comma-separated allowlist of email addresses allowed to hit `/admin/*` (the platform-operator overview — not a general role system). e.g. `"you@example.com,teammate@example.com"`. Unset = nobody can access `/admin/*`. |
 | `GOOGLE_DRIVE_API_KEY` | Google Drive API key (Cloud Console > APIs & Services > Credentials > API key, with the Drive API enabled) for the "import from a public Google Drive folder" feature — see "Google Drive import" below. This is a **separate** credential from `GOOGLE_CLIENT_ID` above (that one is Sign-In OAuth; this one is a plain read-only Drive API v3 key). Unset by default — `POST /events/:id/import/drive` responds a clean `400` until this is configured. |
-| `FTP_PORT`, `FTP_PASV_MIN`, `FTP_PASV_MAX`, `FTP_PUBLIC_HOST`, `FTP_TLS_CERT_PATH`, `FTP_TLS_KEY_PATH` | Beam (camera-to-cloud live upload) FTP server config — see "Beam" below. `FTP_PUBLIC_HOST` and the passive port range must be reachable through the VPS firewall/NAT for camera uploads to work over the internet. |
+| `FTP_PORT`, `FTP_PASV_MIN`, `FTP_PASV_MAX`, `FTP_PUBLIC_HOST`, `FTP_TLS_CERT_PATH`, `FTP_TLS_KEY_PATH` | Shoots (camera-to-cloud live upload) FTP server config — see "Shoots" below. `FTP_PUBLIC_HOST` and the passive port range must be reachable through the VPS firewall/NAT for camera uploads to work over the internet. |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM` | WhatsApp delivery (see "WhatsApp delivery" below) — Twilio's WhatsApp Business API, called directly via REST (no SDK). Unset by default — `lib/whatsapp.js` logs instead of sending. |
 | `GOOGLE_CLIENT_SECRET`, `GOOGLE_DRIVE_BACKUP_REDIRECT_URI`, `GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN`, `DRIVE_BACKUP_BETA_EMAILS` | **Advanced/beta** Drive backup — see "Drive backup" below. One platform-wide Drive account (not per-photographer): `GOOGLE_CLIENT_SECRET` pairs with `GOOGLE_CLIENT_ID` for the one-time admin OAuth setup; `GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN` is that setup's actual result and IS the credential used for every upload; `DRIVE_BACKUP_BETA_EMAILS` gates which photographers can enable the per-event toggle. |
 
@@ -152,7 +152,7 @@ Routes marked "owner or collaborator" below accept either; routes marked
 |---|---|---|---|
 | POST | `/events` | required | `{ name }` → creates an event with a unique `guestSlug` and `expiresAt` stamped 90 days out (see "Event expiry" below). `403 { error }` if you already own `FREE_EVENT_LIMIT` (15) events — see "Plan limits" below. |
 | GET | `/events` | required | List events you own AND events you collaborate on, each tagged with `role: "owner" \| "collaborator"`, with photo counts and `expires_at`. (No per-event storage numbers here — that would be an N+1 aggregation; the frontend can compute "X/15 events used" from this list's own length.) |
-| GET | `/events/:id` | owner or collaborator | One event: `{ id, name, guestSlug, guestLink, createdAt, expires_at, photo_count, storage_used_bytes, storage_limit_bytes, role, drive_folder_url, drive_sync_enabled, last_drive_sync_at, beam_connected, drive_backup_enabled, drive_backup_available }` |
+| GET | `/events/:id` | owner or collaborator | One event: `{ id, name, guestSlug, guestLink, createdAt, expires_at, photo_count, storage_used_bytes, storage_limit_bytes, role, drive_folder_url, drive_sync_enabled, last_drive_sync_at, beam_connected (Shoots camera-to-cloud connection status), drive_backup_enabled, drive_backup_available }` |
 | DELETE | `/events/:id` | owner-only | Permanently deletes the event and everything under it (photos, faces, guest searches/feedback, zip downloads, collaborators, invites) plus the event's entire photo/thumbnail directory on disk. `204` on success |
 | POST | `/events/:id/photos` | owner or collaborator | 30/hour/IP · **Breaking change:** multipart `files` (multiple) → now responds immediately with `202 { job_id }` instead of the old synchronous body; processing happens in-process, sequentially, in the background. Follow up with the SSE stream below to get progress and the final `photos_processed`/`faces_found`/`skipped` result (delivered as the terminal `done` event, same field names as the old response body). Each file is also checked against the event's 10GB free-plan storage cap (see "Plan limits" below) — a file that would push the event over the cap is skipped (added to `skipped`, reason `"... (event storage limit reached — 10GB free plan cap)"`) rather than blocking the rest of the batch. |
 | GET | `/events/:id/uploads/:jobId/stream` | owner or collaborator | Server-Sent Events stream of `progress` events (`total`, `completed`, `current_file`, `photos_per_second`, `eta_seconds`, `faces_found_so_far`, `skipped_so_far`) for an upload job started above, ending in a terminal `done` or `error` event. If the job already finished before you connect, sends that last event immediately and closes. Also used for Drive import jobs (see below) — identical event shape. |
@@ -164,11 +164,11 @@ Routes marked "owner or collaborator" below accept either; routes marked
 | GET | `/events/:id/collaborators` | owner-only | `{ collaborators: [{ user_id, email, name }], pending_invites: [{ invite_id, email, invited_at }] }` |
 | DELETE | `/events/:id/collaborators/:userId` | owner-only | Removes that collaborator. `204` on success, `404` if not a collaborator |
 | DELETE | `/events/:id/invites/:inviteId` | owner-only | Cancels that pending invite. `204` on success, `404` if missing or already accepted (use the collaborator-removal route above for someone who already accepted) |
-| GET | `/events/:id/beam/credentials` | owner or collaborator | `{ connected: false }`, or `{ connected: true, ftp_host, ftp_port, ftp_username, ftp_password }` if Beam (camera-to-cloud live upload) is already set up — see "Beam" below. |
-| POST | `/events/:id/beam/credentials` | owner or collaborator · 20/hour/IP | Generates fresh Beam credentials (first setup, or a "Regenerate" — this simply overwrites the previous ones, which stop working immediately). Same response shape as the `GET` above. |
-| DELETE | `/events/:id/beam/credentials` | owner or collaborator | Revokes Beam access — the camera's saved FTP settings stop authenticating. Doesn't touch photos already ingested. `204` on success. |
-| GET | `/events/:id/live/stream` | owner or collaborator | Server-Sent Events stream of `photo_added`/`photo_skipped` events as Beam ingests camera captures — lets an open event page update its gallery live during a shoot. Purely additive; the gallery still loads fine without ever opening this stream. |
-| POST | `/events/:id/drive-backup/toggle` | owner or collaborator | **Advanced/beta** — see "Drive backup" below. `{ enabled }` → turns on/off mirroring Beam captures into this event's connected Drive folder using the platform's single Drive account. `400` if no Drive folder is connected yet or that platform account isn't configured; `403` if the event's owner isn't on `DRIVE_BACKUP_BETA_EMAILS`. |
+| GET | `/events/:id/shoots/credentials` | owner or collaborator | `{ connected: false }`, or `{ connected: true, ftp_host, ftp_port, ftp_username, ftp_password }` if Shoots (camera-to-cloud live upload) is already set up — see "Shoots" below. |
+| POST | `/events/:id/shoots/credentials` | owner or collaborator · 20/hour/IP | Generates fresh Shoots credentials (first setup, or a "Regenerate" — this simply overwrites the previous ones, which stop working immediately). Same response shape as the `GET` above. |
+| DELETE | `/events/:id/shoots/credentials` | owner or collaborator | Revokes Shoots access — the camera's saved FTP settings stop authenticating. Doesn't touch photos already ingested. `204` on success. |
+| GET | `/events/:id/live/stream` | owner or collaborator | Server-Sent Events stream of `photo_added`/`photo_skipped` events as Shoots ingests camera captures — lets an open event page update its gallery live during a shoot. Purely additive; the gallery still loads fine without ever opening this stream. |
+| POST | `/events/:id/drive-backup/toggle` | owner or collaborator | **Advanced/beta** — see "Drive backup" below. `{ enabled }` → turns on/off mirroring Shoots captures into this event's connected Drive folder using the platform's single Drive account. `400` if no Drive folder is connected yet or that platform account isn't configured; `403` if the event's owner isn't on `DRIVE_BACKUP_BETA_EMAILS`. |
 | POST | `/events/:id/drive-backup/reclaim-now` | owner or collaborator | **Advanced/beta** — "I've made my copies, free up space." Immediately reclaims (Drive→VPS, then deletes the Drive copy) every eligible photo in this event, regardless of the automatic 2-day timer. `{ reclaimed_count }` |
 
 ### Guest (public)
@@ -351,7 +351,7 @@ Drive API v3 docs but need a real end-to-end test — a real API key and a
 real public folder with a mix of file types/sizes — before this feature ships
 to real users.
 
-## Beam (camera-to-cloud live upload)
+## Shoots (camera-to-cloud live upload)
 
 A third way photos get into an event, alongside browser upload and Drive
 import: the photographer's own camera uploads directly, over FTP, the
@@ -365,7 +365,7 @@ bodies can add it via an aftermarket WiFi transmitter grip.
 **How it works:**
 
 1. The photographer generates event-scoped credentials
-   (`POST /events/:id/beam/credentials`, see the table above) — a random
+   (`POST /events/:id/shoots/credentials`, see the table above) — a random
    `evt_...` username and password, stored as **plaintext** in
    `Event.ftpUsername`/`ftpPassword` (see `schema.prisma`'s comment on those
    columns for why — unlike a login password, the photographer needs to read
@@ -373,7 +373,7 @@ bodies can add it via an aftermarket WiFi transmitter grip.
    not an account credential).
 2. Those go into the camera's FTP transfer settings (host = `FTP_PUBLIC_HOST`,
    port = `FTP_PORT`, plus the username/password).
-3. `src/lib/ftpBeam.js` runs an in-process FTP server (`ftp-srv`). On login,
+3. `src/lib/ftpShoots.js` runs an in-process FTP server (`ftp-srv`). On login,
    it looks up the event by username/password and roots that connection's
    entire filesystem view at a staging directory unique to that event
    (`storage/beam-incoming/<eventId>/`) — a camera can only ever write into
@@ -409,7 +409,7 @@ root isolation, file upload via `curl`, the chokidar pickup +
 `captureIngest.js` pipeline invocation, and staging-file cleanup — all
 confirmed working end-to-end (the only failure seen was `detectFaces`
 correctly erroring because no local face-engine instance was running,
-which is unrelated to Beam itself). **Not yet verified against a real
+which is unrelated to Shoots itself). **Not yet verified against a real
 camera** or over a real network with `FTP_PUBLIC_HOST`/passive ports
 configured — do that once deployed.
 
@@ -418,7 +418,7 @@ configured — do that once deployed.
 After a guest's first search, they can opt in (`POST /e/:slug/alerts/subscribe`
 — see the table above) to be notified if more photos of them show up later
 in the same event, instead of needing to remember to come back and re-search
-manually. This is the natural follow-up to Beam: photos can now keep landing
+manually. This is the natural follow-up to Shoots: photos can now keep landing
 live during a shoot, but until this feature nothing outside the
 photographer's own screen knew that happened.
 
@@ -427,14 +427,14 @@ per `(eventId, guestClientId)` pair (upserted, so re-subscribing just updates
 it), and `checkAndNotifyForNewPhotos(event, newPhotoIds)` — called after
 every photo-ingestion path finishes a batch (`processUploadJob` in
 `routes/events.js`, `processDriveImportJob`/`processDriveSyncJob` in
-`lib/driveSync.js`) and after each single Beam capture
+`lib/driveSync.js`) and after each single Shoots capture
 (`lib/captureIngest.js`). For every active subscription, it re-checks that
 guest's most recent search embedding against only the newly-added photos'
 faces (a single pgvector query — the embedding itself never leaves
 Postgres, same reasoning as `lib/faces.js`'s `searchSimilarPhotos`), and
 sends an email or WhatsApp message if any of them clear the event's match
 threshold. A guest is never notified more than once every 15 minutes, so a
-burst of Beam captures during a shoot produces one ping, not a flood.
+burst of Shoots captures during a shoot produces one ping, not a flood.
 
 Notification failures (unconfigured SMTP/Twilio, a bad phone number, a
 transient send error) are logged and swallowed — never allowed to affect the
@@ -463,7 +463,7 @@ for a real event.
 ## Drive backup (advanced, beta)
 
 The other direction from Drive import/sync: mirroring photos PandaSpot
-*produces* — specifically, Beam camera captures — into an event's connected
+*produces* — specifically, Shoots camera captures — into an event's connected
 Drive folder. Deliberately gated behind `DRIVE_BACKUP_BETA_EMAILS` (same
 allowlist pattern as `ADMIN_EMAILS`) — it hasn't been tested against a real
 Google account yet, and its storage model (below) is a real, disclosed
@@ -472,7 +472,7 @@ tradeoff rather than a permanent archive.
 **One platform-wide Drive account, not per-photographer OAuth.** This
 deliberately does *not* ask each photographer to connect their own Google
 account. Instead, a single Google account — the operator's own — is
-connected once (`GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN`), and every event's Beam
+connected once (`GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN`), and every event's Shoots
 captures upload through that one account. This works because Drive's
 "Anyone with the link — Editor" folder permission grants write access to
 *any* authenticated Google account holding the link, not just explicitly
@@ -490,7 +490,7 @@ refresh token once for the admin to copy into the server's `.env` as
 in the database, matching every other credential in this file. Per event,
 `POST /events/:id/drive-backup/toggle` (photographer, beta-gated) turns
 mirroring on/off — 400s if no Drive folder is connected yet or the platform
-account itself isn't configured. When on, each Beam capture
+account itself isn't configured. When on, each Shoots capture
 (`lib/captureIngest.js`) skips saving the full-res original locally at all
 and instead calls `lib/driveBackup.js`'s `uploadToDriveFolder` (falling
 back to normal local storage if the Drive upload fails, so a capture is
@@ -507,7 +507,7 @@ clock from each photo's capture time:
 
 - **Day 0** — captured, uploaded to the photographer's Drive folder.
 - **~6 hours after the last capture** (inferred "this shoot looks
-  finished" from `Event.lastBeamCaptureAt` going quiet) — a one-time email
+  finished" from `Event.lastBeamCaptureAt` (DB column, unchanged) going quiet) — a one-time email
   to the studio owner (`sendDriveBackupReclaimNoticeEmail`): open the Drive
   folder, select all, **Make a copy** — Drive's own native action, which
   creates copies owned by *them*, in *their* storage, fully independent of
@@ -532,7 +532,7 @@ directly from PandaSpot if needed. The retention sweep itself
 
 **Not yet verified against a real Google account** — the OAuth
 exchange/refresh/upload/delete code was written against Google's documented
-APIs but needs a real `GOOGLE_CLIENT_SECRET` + refresh token and a real Beam
+APIs but needs a real `GOOGLE_CLIENT_SECRET` + refresh token and a real Shoots
 capture to confirm end-to-end before trusting it for a real event.
 
 ## What this deliberately does NOT do yet

@@ -6,7 +6,7 @@ import { sendWhatsAppMessage } from "./whatsapp.js";
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 
 // A guest doesn't get pinged more than once this often, even if several
-// batches of new photos land close together (Beam adds photos one at a
+// batches of new photos land close together (Shoots adds photos one at a
 // time during a live shoot) — keeps notifications a manageable trickle.
 const MIN_NOTIFY_INTERVAL_MS = 15 * 60 * 1000;
 
@@ -59,7 +59,7 @@ async function matchedPhotosForGuest({ eventId, guestClientId, photoIds, thresho
  * Checks every active guest alert subscription on `event` against a batch of
  * newly-added photo ids, and notifies (email or WhatsApp) any guest whose
  * earlier selfie now matches one or more of them. Called after a batch of
- * uploads/Drive-imports finishes, and after each Beam capture — never
+ * uploads/Drive-imports finishes, and after each Shoots capture — never
  * throws, since it runs as a side effect of photo ingestion and a
  * notification failure shouldn't affect the ingestion result.
  */

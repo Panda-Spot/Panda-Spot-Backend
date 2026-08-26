@@ -12,8 +12,8 @@ import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { loadAccessibleEvent } from "../lib/access.js";
 import { sendCollaboratorInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
-import { uploadLimiter, driveImportLimiter, beamCredentialLimiter } from "../lib/rateLimiters.js";
-import { generateBeamCredentials } from "../lib/ftpBeam.js";
+import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter } from "../lib/rateLimiters.js";
+import { generateShootsCredentials } from "../lib/ftpShoots.js";
 import { subscribeLiveEvents } from "../lib/liveEvents.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { extractFolderId, listImageFiles } from "../lib/googleDrive.js";
@@ -134,7 +134,7 @@ router.get("/:id", async (req, res, next) => {
       drive_sync_enabled: event.driveSyncEnabled,
       last_drive_sync_at: event.lastDriveSyncAt,
       beam_connected: !!event.ftpUsername,
-      // Advanced/beta: mirroring Beam captures into the connected Drive
+      // Advanced/beta: mirroring Shoots captures into the connected Drive
       // folder via the platform's single Drive account — see
       // lib/driveBackup.js. drive_backup_available reflects whether that
       // platform-wide account is configured at all (isDriveBackupConfigured()),
@@ -493,25 +493,25 @@ router.post("/:id/drive/auto-sync", async (req, res, next) => {
   }
 });
 
-const BEAM_HOST = process.env.FTP_PUBLIC_HOST || "your-server-address";
-const BEAM_PORT = process.env.FTP_PORT || 2121;
+const SHOOTS_HOST = process.env.FTP_PUBLIC_HOST || "your-server-address";
+const SHOOTS_PORT = process.env.FTP_PORT || 2121;
 
-function beamCredentialsResponse(event) {
+function shootsCredentialsResponse(event) {
   return {
-    ftp_host: BEAM_HOST,
-    ftp_port: Number(BEAM_PORT),
+    ftp_host: SHOOTS_HOST,
+    ftp_port: Number(SHOOTS_PORT),
     ftp_username: event.ftpUsername,
     ftp_password: event.ftpPassword,
   };
 }
 
 // Owner or collaborator — same access model as photo upload. Returns the
-// event's current Beam (camera-to-cloud FTP) credentials if already set up,
+// event's current Shoots (camera-to-cloud FTP) credentials if already set up,
 // or `{ connected: false }` otherwise. Credentials are stored as plaintext
 // (see schema.prisma's Event.ftpPassword note) precisely so they can be
 // read back here whenever the photographer needs to re-enter them into a
 // camera, without a one-time-reveal dance.
-router.get("/:id/beam/credentials", async (req, res, next) => {
+router.get("/:id/shoots/credentials", async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
@@ -520,37 +520,37 @@ router.get("/:id/beam/credentials", async (req, res, next) => {
     if (!event.ftpUsername) {
       return res.json({ connected: false });
     }
-    res.json({ connected: true, ...beamCredentialsResponse(event) });
+    res.json({ connected: true, ...shootsCredentialsResponse(event) });
   } catch (err) {
     next(err);
   }
 });
 
-// Generates fresh Beam credentials (first setup, or "Regenerate" — the old
+// Generates fresh Shoots credentials (first setup, or "Regenerate" — the old
 // username/password stop working immediately since they're simply
 // overwritten). A camera's FTP transfer settings would need re-entering
 // after a regenerate.
-router.post("/:id/beam/credentials", beamCredentialLimiter, async (req, res, next) => {
+router.post("/:id/shoots/credentials", shootsCredentialLimiter, async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
 
-    const { username, password } = generateBeamCredentials();
+    const { username, password } = generateShootsCredentials();
     const updated = await prisma.event.update({
       where: { id: event.id },
       data: { ftpUsername: username, ftpPassword: password },
     });
 
-    res.json({ connected: true, ...beamCredentialsResponse(updated) });
+    res.json({ connected: true, ...shootsCredentialsResponse(updated) });
   } catch (err) {
     next(err);
   }
 });
 
-// Revokes Beam access entirely — the camera's stored credentials stop
+// Revokes Shoots access entirely — the camera's stored credentials stop
 // working immediately. Doesn't touch any photos already ingested.
-router.delete("/:id/beam/credentials", async (req, res, next) => {
+router.delete("/:id/shoots/credentials", async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
@@ -566,7 +566,7 @@ router.delete("/:id/beam/credentials", async (req, res, next) => {
   }
 });
 
-// Server-Sent Events stream of "a new photo just arrived via Beam" — lets
+// Server-Sent Events stream of "a new photo just arrived via Shoots" — lets
 // an open event page update its gallery live during a shoot, instead of the
 // photographer needing to refresh. Owner-or-collaborator gated like every
 // other event route; purely additive (the gallery still loads fine without
@@ -597,7 +597,7 @@ router.get("/:id/live/stream", async (req, res, next) => {
   }
 });
 
-// Advanced/beta — toggles mirroring Beam captures into this event's
+// Advanced/beta — toggles mirroring Shoots captures into this event's
 // connected Drive folder. Requires both a connected Drive folder
 // (driveFolderId) and the owner having connected Drive backup for their
 // account (see /auth/google/drive-backup/connect) — 400s with a clear

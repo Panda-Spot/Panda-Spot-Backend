@@ -24,9 +24,9 @@ function stagingDirFor(eventId) {
   return path.join(stagingRoot(), eventId);
 }
 
-/** Generates a fresh, unique username + random password for Beam. Called
+/** Generates a fresh, unique username + random password for Shoots. Called
  * once per event (on first setup) or again on demand (regenerate). */
-export function generateBeamCredentials() {
+export function generateShootsCredentials() {
   return {
     username: `evt_${randomBytes(6).toString("hex")}`,
     password: randomBytes(9).toString("base64url"),
@@ -36,7 +36,7 @@ export function generateBeamCredentials() {
 let started = false;
 
 /**
- * Starts the Beam FTP server (once) plus a chokidar watcher over its
+ * Starts the Shoots FTP server (once) plus a chokidar watcher over its
  * staging directory. Each authenticated camera session is rooted at its own
  * event's staging folder — ftp-srv serves that folder as the connection's
  * whole filesystem, so a camera can only ever write into (and see) its own
@@ -46,7 +46,7 @@ let started = false;
  * pipeline as a browser upload (see lib/captureIngest.js), then deleted from
  * staging — the processed copy lives under the normal photo storage path.
  */
-export function startBeamServer() {
+export function startShootsServer() {
   if (started) return;
   started = true;
 
@@ -61,7 +61,7 @@ export function startBeamServer() {
 
   if (!tls) {
     console.warn(
-      "Beam FTP server starting WITHOUT TLS (FTP_TLS_CERT_PATH/FTP_TLS_KEY_PATH not set) — " +
+      "Shoots FTP server starting WITHOUT TLS (FTP_TLS_CERT_PATH/FTP_TLS_KEY_PATH not set) — " +
         "credentials travel in plaintext. Acceptable short-term since each event's credentials " +
         "are scoped to write-only access to just that event's own folder, but set up FTPS before " +
         "relying on this for real events."
@@ -81,7 +81,7 @@ export function startBeamServer() {
     try {
       const event = await prisma.event.findUnique({ where: { ftpUsername: username } });
       if (!event || !event.ftpPassword || event.ftpPassword !== password) {
-        return reject(new Error("Invalid Beam credentials"));
+        return reject(new Error("Invalid Shoots credentials"));
       }
       const root = stagingDirFor(event.id);
       await fsp.mkdir(root, { recursive: true });
@@ -92,13 +92,13 @@ export function startBeamServer() {
   });
 
   ftpServer.on("client-error", ({ context, error }) => {
-    console.error("Beam FTP client error:", context, error?.message);
+    console.error("Shoots FTP client error:", context, error?.message);
   });
 
   ftpServer
     .listen()
-    .then(() => console.log(`Beam FTP server listening on port ${FTP_PORT}${tls ? " (TLS)" : ""}`))
-    .catch((err) => console.error("Beam FTP server failed to start:", err));
+    .then(() => console.log(`Shoots FTP server listening on port ${FTP_PORT}${tls ? " (TLS)" : ""}`))
+    .catch((err) => console.error("Shoots FTP server failed to start:", err));
 
   const watcher = chokidar.watch(stagingRoot(), {
     ignoreInitial: true,
@@ -118,11 +118,11 @@ export function startBeamServer() {
       const buffer = await fsp.readFile(filePath);
       await ingestCapturedFile(event, filename, buffer);
     } catch (err) {
-      console.error(`Beam ingestion failed for ${filePath}:`, err);
+      console.error(`Shoots ingestion failed for ${filePath}:`, err);
     } finally {
       await fsp.unlink(filePath).catch(() => {});
     }
   });
 
-  watcher.on("error", (err) => console.error("Beam file watcher error:", err));
+  watcher.on("error", (err) => console.error("Shoots file watcher error:", err));
 }

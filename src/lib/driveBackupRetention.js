@@ -2,7 +2,7 @@ import path from "node:path";
 import { prisma } from "./prisma.js";
 import { downloadFile } from "./googleDrive.js";
 import { deleteFileFromDrive } from "./driveBackup.js";
-import { saveEventBeamPhoto, deleteFileIfExists } from "./storage.js";
+import { saveEventShootsPhoto, deleteFileIfExists } from "./storage.js";
 import { sendDriveBackupReclaimNoticeEmail } from "./mailer.js";
 
 // The platform's own Drive account (see lib/driveBackupAuth.js) is a
@@ -13,7 +13,7 @@ import { sendDriveBackupReclaimNoticeEmail } from "./mailer.js";
 // their own copy (via Drive's own "Make a copy" — see the notice email).
 const RECLAIM_AFTER_MS = 2 * 24 * 60 * 60 * 1000; // day 2: pull back to the VPS, delete from Drive
 const PURGE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // day 7: gone everywhere, for good
-const NOTICE_AFTER_INACTIVITY_MS = 6 * 60 * 60 * 1000; // no Beam captures for 6h -> "this shoot looks finished"
+const NOTICE_AFTER_INACTIVITY_MS = 6 * 60 * 60 * 1000; // no Shoots captures for 6h -> "this shoot looks finished"
 
 /**
  * Downloads each given photo's Drive-backed original to the VPS (a public
@@ -32,7 +32,7 @@ async function reclaimPhotos(photos, { force = false } = {}) {
     try {
       const buffer = await downloadFile(photo.driveFileId);
       const ext = path.extname(photo.filename) || ".jpg";
-      const storagePath = await saveEventBeamPhoto(photo.eventId, `${photo.id}${ext}`, buffer);
+      const storagePath = await saveEventShootsPhoto(photo.eventId, `${photo.id}${ext}`, buffer);
       await deleteFileFromDrive(photo.driveFileId).catch((err) =>
         console.error(`Drive delete failed for photo ${photo.id} (will retry next sweep):`, err.message)
       );
@@ -71,7 +71,7 @@ async function purgePhoto(photo) {
  * Runs periodically (see startDriveBackupRetentionScheduler): reclaims any
  * due (2+ day old) photos still sitting on Drive, purges any 7+ day old
  * ones outright, and sends each event's one-time "make your copy" notice
- * once its Beam captures look finished (no new ones for a while).
+ * once its Shoots captures look finished (no new ones for a while).
  */
 export async function runDriveBackupRetentionSweep() {
   const dueForReclaim = await prisma.photo.findMany({

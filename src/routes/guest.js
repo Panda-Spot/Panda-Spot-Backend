@@ -144,7 +144,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
 
 // Opts a guest in to being notified (email or WhatsApp) if more photos of
 // them show up later in this event — the natural follow-up to a search once
-// photos can keep arriving live via Beam. `guest_client_id` is the same
+// photos can keep arriving live via Shoots. `guest_client_id` is the same
 // anonymous id already used for search/feedback (src/guestId.js on the
 // frontend) — like the rest of this API's guest identity model, it's an
 // unguessable id acting as its own bearer token, not paired with any login.
