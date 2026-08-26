@@ -129,6 +129,10 @@ router.post("/login", authLimiter, async (req, res, next) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
+    if (user.suspendedAt) {
+      return res.status(403).json({ error: "This account has been suspended" });
+    }
+
     const token = signToken(user);
     setAuthCookie(res, token);
     res.json({ ...publicUser(user), token });
@@ -294,6 +298,10 @@ router.post("/google", async (req, res, next) => {
           },
         });
       }
+    }
+
+    if (user.suspendedAt) {
+      return res.status(403).json({ error: "This account has been suspended" });
     }
 
     const token = signToken(user);

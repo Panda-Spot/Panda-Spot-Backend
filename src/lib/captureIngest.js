@@ -6,7 +6,7 @@ import { insertFace } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
 import { ALLOWED_EXTENSIONS, saveEventShootsPhoto } from "./storage.js";
 import { contentMatchesExtension } from "./fileValidation.js";
-import { FREE_EVENT_STORAGE_BYTES, eventStorageUsedBytes } from "./planLimits.js";
+import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.js";
 import { publishLiveEvent } from "./liveEvents.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 import { uploadToDriveFolder } from "./driveBackup.js";
@@ -43,8 +43,9 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   }
 
   const usedBytes = await eventStorageUsedBytes(prisma, event.id);
-  if (usedBytes + buffer.length > FREE_EVENT_STORAGE_BYTES) {
-    return skip(event.id, originalFilename, "event storage limit reached — 10GB free plan cap");
+  const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+  if (usedBytes + buffer.length > effectiveStorageLimitBytes(owner)) {
+    return skip(event.id, originalFilename, "event storage limit reached");
   }
 
   let detection;

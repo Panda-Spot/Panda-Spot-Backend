@@ -6,7 +6,7 @@ import { generateThumbnail } from "./thumbnails.js";
 import { deleteFileIfExists } from "./storage.js";
 import { downloadFile, guessExtension, listImageFiles } from "./googleDrive.js";
 import { contentMatchesExtension } from "./fileValidation.js";
-import { FREE_EVENT_STORAGE_BYTES, eventStorageUsedBytes } from "./planLimits.js";
+import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.js";
 import { emitJobEvent } from "./jobQueue.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 
@@ -18,13 +18,13 @@ const AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
  * — never writes the original to local disk (see schema.prisma's Photo
  * notes). Returns `{ skipped: reason }` or `{ fileSize, facesFound }`.
  */
-async function importOneDriveFile(event, file, usedBytesRef) {
+async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes) {
   const fileSize = parseInt(file.size, 10) || 0;
   const ext = guessExtension(file.mimeType, file.name);
 
   if (!ext) return { skipped: `${file.name} (unsupported file type)` };
-  if (usedBytesRef.value + fileSize > FREE_EVENT_STORAGE_BYTES) {
-    return { skipped: `${file.name} (event storage limit reached — 10GB free plan cap)` };
+  if (usedBytesRef.value + fileSize > storageLimitBytes) {
+    return { skipped: `${file.name} (event storage limit reached)` };
   }
 
   let buffer;
@@ -113,11 +113,13 @@ export async function processDriveImportJob(jobId, event, files) {
   let facesFoundSoFar = 0;
   const startedAt = Date.now();
   const usedBytesRef = { value: await eventStorageUsedBytes(prisma, event.id) };
+  const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+  const storageLimitBytes = effectiveStorageLimitBytes(owner);
   const newPhotoIds = [];
 
   try {
     for (const file of files) {
-      const result = await importOneDriveFile(event, file, usedBytesRef);
+      const result = await importOneDriveFile(event, file, usedBytesRef, storageLimitBytes);
       if (result.skipped) skipped.push(result.skipped);
       else {
         facesFoundSoFar += result.facesFound;
@@ -177,10 +179,12 @@ export async function processDriveSyncJob(jobId, event, currentFiles) {
     const total = newFiles.length + removedPhotos.length;
     let completed = 0;
     const usedBytesRef = { value: await eventStorageUsedBytes(prisma, event.id) };
+    const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+    const storageLimitBytes = effectiveStorageLimitBytes(owner);
     const newPhotoIds = [];
 
     for (const file of newFiles) {
-      const result = await importOneDriveFile(event, file, usedBytesRef);
+      const result = await importOneDriveFile(event, file, usedBytesRef, storageLimitBytes);
       if (result.skipped) skipped.push(result.skipped);
       else {
         facesFoundSoFar += result.facesFound;

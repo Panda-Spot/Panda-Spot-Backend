@@ -36,6 +36,19 @@ model User {
 
   emailVerificationTokens EmailVerificationToken[]
   passwordResetTokens     PasswordResetToken[]
+
+  /// Set by a platform admin (see routes/admin.js) to lock an account out —
+  /// checked by both requireAuth (every authenticated request, not just at
+  /// login) and /auth/login|/auth/google, so it takes effect immediately
+  /// rather than only on the account's next fresh login.
+  suspendedAt DateTime?
+
+  /// Per-client admin overrides of the global free-tier defaults
+  /// (lib/planLimits.js's FREE_EVENT_LIMIT/FREE_EVENT_STORAGE_BYTES) — null
+  /// means "use the default". customStorageLimitBytes is BigInt (not Int):
+  /// a generous override (e.g. 100GB) overflows Postgres's 32-bit integer.
+  customEventLimit        Int?
+  customStorageLimitBytes BigInt?
 }
 
 /// A single-use, time-limited token emailed to confirm account ownership.

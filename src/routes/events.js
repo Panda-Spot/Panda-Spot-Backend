@@ -4,8 +4,7 @@ import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
-import { ALLOWED_EXTENSIONS, saveEventPhoto, deleteFileIfExists, removeEventDir } from "../lib/storage.js";
-import { zipDownloadPath } from "../lib/zip.js";
+import { ALLOWED_EXTENSIONS, saveEventPhoto, deleteFileIfExists } from "../lib/storage.js";
 import { detectFaces } from "../lib/faceEngine.js";
 import { insertFace } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
@@ -18,13 +17,13 @@ import { subscribeLiveEvents } from "../lib/liveEvents.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { extractFolderId, listImageFiles } from "../lib/googleDrive.js";
 import { processDriveImportJob, processDriveSyncJob } from "../lib/driveSync.js";
-import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, countOwnedEvents, eventStorageUsedBytes } from "../lib/planLimits.js";
+import { countOwnedEvents, eventStorageUsedBytes, effectiveEventLimit, effectiveStorageLimitBytes } from "../lib/planLimits.js";
 import { computeExpiresAt } from "../lib/expiry.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { checkAndNotifyForNewPhotos } from "../lib/guestAlerts.js";
 import { isDriveBackupConfigured, isDriveBackupBetaUser } from "../lib/driveBackupAuth.js";
 import { reclaimEventDriveBackups } from "../lib/driveBackupRetention.js";
-import { deleteFileFromDrive } from "../lib/driveBackup.js";
+import { deleteEventCascade } from "../lib/eventLifecycle.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -56,10 +55,12 @@ router.post("/", async (req, res, next) => {
       return res.status(400).json({ error: "name is required" });
     }
 
+    const owner = await prisma.user.findUnique({ where: { id: req.user.id } });
     const ownedCount = await countOwnedEvents(prisma, req.user.id);
-    if (ownedCount >= FREE_EVENT_LIMIT) {
+    const eventLimit = effectiveEventLimit(owner);
+    if (ownedCount >= eventLimit) {
       return res.status(403).json({
-        error: "You've reached the free plan limit of 15 events. Upgrade coming soon.",
+        error: `You've reached your plan's limit of ${eventLimit} events. Upgrade coming soon.`,
       });
     }
 
@@ -118,6 +119,7 @@ router.get("/:id", async (req, res, next) => {
 
     const photoCount = await prisma.photo.count({ where: { eventId: event.id } });
     const storageUsedBytes = await eventStorageUsedBytes(prisma, event.id);
+    const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
 
     res.json({
       id: event.id,
@@ -128,7 +130,7 @@ router.get("/:id", async (req, res, next) => {
       expires_at: event.expiresAt,
       photo_count: photoCount,
       storage_used_bytes: storageUsedBytes,
-      storage_limit_bytes: FREE_EVENT_STORAGE_BYTES,
+      storage_limit_bytes: effectiveStorageLimitBytes(owner),
       role,
       drive_folder_url: event.driveFolderUrl,
       drive_sync_enabled: event.driveSyncEnabled,
@@ -168,37 +170,7 @@ router.delete("/:id", async (req, res, next) => {
     const event = await loadOwnedEvent(req, res);
     if (!event) return;
 
-    const zipDownloads = await prisma.zipDownload.findMany({ where: { eventId: event.id } });
-
-    // Best-effort: reclaim any of this event's photos still occupying the
-    // platform's own Drive quota before the rows themselves are deleted —
-    // otherwise they'd linger there forever with nothing left to point at
-    // them (see lib/driveBackupRetention.js).
-    const platformDrivePhotos = await prisma.photo.findMany({
-      where: { eventId: event.id, platformDriveBackup: true, driveFileId: { not: null } },
-    });
-    for (const photo of platformDrivePhotos) {
-      await deleteFileFromDrive(photo.driveFileId).catch((err) =>
-        console.error(`Failed to delete Drive backup file for photo ${photo.id} during event deletion:`, err.message)
-      );
-    }
-
-    await prisma.matchFeedback.deleteMany({
-      where: { search: { eventId: event.id } },
-    });
-    await prisma.guestSearch.deleteMany({ where: { eventId: event.id } });
-    await prisma.face.deleteMany({ where: { eventId: event.id } });
-    await prisma.photo.deleteMany({ where: { eventId: event.id } });
-    await prisma.zipDownload.deleteMany({ where: { eventId: event.id } });
-    await prisma.guestAlertSubscription.deleteMany({ where: { eventId: event.id } });
-    await prisma.eventCollaborator.deleteMany({ where: { eventId: event.id } });
-    await prisma.eventInvite.deleteMany({ where: { eventId: event.id } });
-    await prisma.event.delete({ where: { id: event.id } });
-
-    await removeEventDir(event.id);
-    for (const z of zipDownloads) {
-      await deleteFileIfExists(z.filePath || zipDownloadPath(z.id));
-    }
+    await deleteEventCascade(event);
 
     res.status(204).end();
   } catch (err) {
@@ -218,6 +190,8 @@ async function processUploadJob(jobId, event, files) {
   let facesFoundSoFar = 0;
   const startedAt = Date.now();
   let usedBytes = await eventStorageUsedBytes(prisma, event.id);
+  const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+  const storageLimitBytes = effectiveStorageLimitBytes(owner);
   const newPhotoIds = [];
 
   try {
@@ -228,8 +202,8 @@ async function processUploadJob(jobId, event, files) {
         skipped.push(`${file.originalname} (unsupported file type)`);
       } else if (!contentMatchesExtension(file.buffer, ext)) {
         skipped.push(`${file.originalname} (file content doesn't match its extension)`);
-      } else if (usedBytes + file.buffer.length > FREE_EVENT_STORAGE_BYTES) {
-        skipped.push(`${file.originalname} (event storage limit reached — 10GB free plan cap)`);
+      } else if (usedBytes + file.buffer.length > storageLimitBytes) {
+        skipped.push(`${file.originalname} (event storage limit reached)`);
       } else {
         let detection;
         try {

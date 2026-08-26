@@ -1,4 +1,5 @@
 import jwt from "jsonwebtoken";
+import { prisma } from "../lib/prisma.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const COOKIE_NAME = "pandaspot_token";
@@ -51,19 +52,45 @@ function extractToken(req) {
   return req.cookies?.[COOKIE_NAME];
 }
 
-/** Reads and verifies the auth token (header, query param, or cookie, in that order), attaches { id, email } to req.user, or 401s. */
-export function requireAuth(req, res, next) {
+/**
+ * Reads and verifies the auth token (header, query param, or cookie, in
+ * that order), attaches { id, email } to req.user, or 401s.
+ *
+ * Also checks User.suspendedAt on every call — a deliberate departure from
+ * this being otherwise-stateless JWT verification (the token itself proves
+ * nothing about current suspension status, and a token is valid for up to
+ * 30 days). Only touches photographer-facing routes, never guest traffic,
+ * so the extra query per request is an acceptable cost for a suspension to
+ * actually take effect immediately instead of only at the account's next
+ * fresh login. See routes/admin.js for how suspendedAt gets set.
+ */
+export async function requireAuth(req, res, next) {
   const token = extractToken(req);
   if (!token) {
     return res.status(401).json({ error: "Not authenticated" });
   }
+  let payload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = { id: payload.sub, email: payload.email };
-    next();
+    payload = jwt.verify(token, JWT_SECRET);
   } catch {
     return res.status(401).json({ error: "Invalid or expired session" });
   }
+  try {
+    const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { suspendedAt: true } });
+    if (!user) {
+      // Deleted by an admin (see routes/admin.js) — the token is otherwise
+      // still cryptographically valid for up to 30 days, so this needs an
+      // explicit check rather than relying on the JWT alone.
+      return res.status(401).json({ error: "Invalid or expired session" });
+    }
+    if (user.suspendedAt) {
+      return res.status(403).json({ error: "This account has been suspended" });
+    }
+  } catch (err) {
+    return next(err);
+  }
+  req.user = { id: payload.sub, email: payload.email };
+  next();
 }
 
 /** Non-throwing variant: attaches req.user if a valid token is present, otherwise leaves it undefined. */
