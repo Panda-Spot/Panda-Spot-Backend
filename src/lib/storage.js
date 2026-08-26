@@ -36,6 +36,24 @@ export async function saveEventPhoto(eventId, filename, buffer) {
   return fullPath;
 }
 
+/** Absolute directory for a given event's Beam (camera-to-cloud) captures
+ * that ended up stored locally — kept separate from directly-uploaded
+ * photos so the two sources are easy to tell apart on disk. Used only when
+ * Drive backup is off or its upload failed (see lib/captureIngest.js). */
+export function eventBeamDir(eventId) {
+  return path.join(eventDir(eventId), "beam");
+}
+
+/** Writes a Beam-captured buffer to disk under the event's dedicated beam/
+ * subfolder, returns the absolute path. */
+export async function saveEventBeamPhoto(eventId, filename, buffer) {
+  const dir = eventBeamDir(eventId);
+  await fsp.mkdir(dir, { recursive: true });
+  const fullPath = path.join(dir, filename);
+  await fsp.writeFile(fullPath, buffer);
+  return fullPath;
+}
+
 /** True if a path exists on disk (sync, used for quick 404 checks before streaming). */
 export function existsSync(filePath) {
   return fs.existsSync(filePath);

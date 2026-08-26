@@ -2,7 +2,7 @@ import path from "node:path";
 import { prisma } from "./prisma.js";
 import { downloadFile } from "./googleDrive.js";
 import { deleteFileFromDrive } from "./driveBackup.js";
-import { saveEventPhoto, deleteFileIfExists } from "./storage.js";
+import { saveEventBeamPhoto, deleteFileIfExists } from "./storage.js";
 import { sendDriveBackupReclaimNoticeEmail } from "./mailer.js";
 
 // The platform's own Drive account (see lib/driveBackupAuth.js) is a
@@ -32,7 +32,7 @@ async function reclaimPhotos(photos, { force = false } = {}) {
     try {
       const buffer = await downloadFile(photo.driveFileId);
       const ext = path.extname(photo.filename) || ".jpg";
-      const storagePath = await saveEventPhoto(photo.eventId, `${photo.id}${ext}`, buffer);
+      const storagePath = await saveEventBeamPhoto(photo.eventId, `${photo.id}${ext}`, buffer);
       await deleteFileFromDrive(photo.driveFileId).catch((err) =>
         console.error(`Drive delete failed for photo ${photo.id} (will retry next sweep):`, err.message)
       );
