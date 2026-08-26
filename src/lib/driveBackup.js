@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { getFreshAccessToken } from "./driveBackupAuth.js";
+import { getFreshAccessToken, isDriveBackupConfigured } from "./driveBackupAuth.js";
 
 /**
  * Builds a `multipart/related` request body per Drive API v3's upload spec:
@@ -62,5 +62,41 @@ export async function deleteFileFromDrive(fileId) {
   if (!res.ok && res.status !== 404) {
     const detail = await res.text().catch(() => "");
     throw new Error(`Drive delete failed (${res.status}): ${detail.slice(0, 200)}`);
+  }
+}
+
+/**
+ * How full the platform's single Drive backup account's own storage is —
+ * the thing that quietly caps the whole Drive-backup feature, since every
+ * upload is owned by this one account (see lib/driveBackupAuth.js). Used by
+ * the admin metrics page. Never throws — `configured: false` if the
+ * account isn't set up yet, `error` set if the Drive API call itself fails,
+ * so a Drive hiccup never breaks the rest of the metrics page.
+ */
+export async function getDriveAccountQuota() {
+  if (!isDriveBackupConfigured()) {
+    return { configured: false, used_bytes: null, total_bytes: null, error: null };
+  }
+  try {
+    const accessToken = await getFreshAccessToken();
+    const res = await fetch("https://www.googleapis.com/drive/v3/about?fields=storageQuota", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return { configured: true, used_bytes: null, total_bytes: null, error: `Drive API error (${res.status}): ${detail.slice(0, 200)}` };
+    }
+    const data = await res.json();
+    const quota = data.storageQuota || {};
+    return {
+      configured: true,
+      // Google's `limit` field is entirely absent for unlimited-storage
+      // (Workspace) accounts — surfaced as null, not a fake number.
+      used_bytes: quota.usage != null ? Number(quota.usage) : null,
+      total_bytes: quota.limit != null ? Number(quota.limit) : null,
+      error: null,
+    };
+  } catch (err) {
+    return { configured: true, used_bytes: null, total_bytes: null, error: err.message };
   }
 }

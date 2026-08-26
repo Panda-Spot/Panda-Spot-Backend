@@ -1,10 +1,15 @@
 import { Router } from "express";
+import { randomBytes } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/admin.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES } from "../lib/planLimits.js";
+import { sendEmailVerificationEmail } from "../lib/mailer.js";
+import { getDriveAccountQuota } from "../lib/driveBackup.js";
+
+const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 
 const router = Router();
 router.use(requireAuth, requireAdmin);
@@ -228,6 +233,41 @@ router.post("/users/:id/limits", async (req, res, next) => {
   }
 });
 
+// Support action: sends a fresh verification email on the client's behalf
+// (they may have missed/lost the original) — mirrors routes/auth.js's own
+// /auth/email-verification/request, just triggerable by an admin.
+router.post("/users/:id/resend-verification", async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!user) return res.status(404).json({ error: "Client not found" });
+    if (user.emailVerifiedAt) {
+      return res.json({ ok: true, already_verified: true });
+    }
+
+    const token = randomBytes(24).toString("base64url");
+    await prisma.emailVerificationToken.create({
+      data: { userId: user.id, token, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) },
+    });
+    await sendEmailVerificationEmail(user.email, `${PUBLIC_WEB_URL}/verify-email/${token}`);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Support action: marks the account verified directly, no email round trip
+// — for a client who insists they can't receive the verification email.
+router.post("/users/:id/verify", async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!user) return res.status(404).json({ error: "Client not found" });
+    await prisma.user.update({ where: { id: user.id }, data: { emailVerifiedAt: new Date() } });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Permanently deletes a client account: every event they own (via the same
 // cascade the owner-facing DELETE /events/:id route uses), their
 // collaborator memberships/sent invites/tokens elsewhere, then the User row
@@ -298,6 +338,156 @@ router.get("/events", async (req, res, next) => {
         created_at: e.createdAt,
         expires_at: e.expiresAt,
       })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full detail for any event, regardless of ownership — deliberately bypasses
+// loadAccessibleEvent's owner-or-collaborator check, since an admin needs to
+// be able to look at (and act on) any event on the platform.
+router.get("/events/:id", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({
+      where: { id: req.params.id },
+      include: {
+        owner: true,
+        collaborators: { include: { user: true } },
+        _count: { select: { photos: true } },
+      },
+    });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+
+    const storageAgg = await prisma.photo.aggregate({ where: { eventId: event.id }, _sum: { fileSize: true } });
+
+    res.json({
+      id: event.id,
+      name: event.name,
+      guest_slug: event.guestSlug,
+      owner: { id: event.owner.id, name: event.owner.name, email: event.owner.email },
+      photo_count: event._count.photos,
+      storage_used_bytes: storageAgg._sum.fileSize || 0,
+      created_at: event.createdAt,
+      expires_at: event.expiresAt,
+      drive_folder_url: event.driveFolderUrl,
+      drive_sync_enabled: event.driveSyncEnabled,
+      shoots_connected: !!event.ftpUsername,
+      drive_backup_enabled: event.driveBackupEnabled,
+      collaborators: event.collaborators.map((c) => ({ id: c.user.id, name: c.user.name, email: c.user.email })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/events/:id", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+    await deleteEventCascade(event);
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/events/:id/expiry", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+
+    const expiresAt = new Date(req.body?.expires_at);
+    if (Number.isNaN(expiresAt.getTime())) {
+      return res.status(400).json({ error: "expires_at must be a valid date" });
+    }
+
+    await prisma.event.update({ where: { id: event.id }, data: { expiresAt } });
+    res.json({ ok: true, expires_at: expiresAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Kill switch, independent of suspending the whole client account — same
+// effect as the owner's own "Turn off camera upload" in routes/events.js.
+router.post("/events/:id/disable-shoots", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+    await prisma.event.update({ where: { id: event.id }, data: { ftpUsername: null, ftpPassword: null } });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/events/:id/disable-drive-backup", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+    await prisma.event.update({ where: { id: event.id }, data: { driveBackupEnabled: false } });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// One consolidated payload for the full platform metrics page — guest
+// engagement, feature adoption, a top-clients leaderboard, and the
+// platform's own Drive-backup account quota health.
+router.get("/metrics", async (req, res, next) => {
+  try {
+    const [totalSearches, searchesWithMatches, totalFeedback, matchCountAgg, totalGuestClientIds] = await Promise.all([
+      prisma.guestSearch.count(),
+      prisma.guestSearch.count({ where: { matchCount: { gt: 0 } } }),
+      prisma.matchFeedback.count(),
+      prisma.guestSearch.aggregate({ _sum: { matchCount: true } }),
+      prisma.guestSearch.findMany({ where: { guestClientId: { not: null } }, distinct: ["guestClientId"], select: { guestClientId: true } }),
+    ]);
+    const totalMatchesShown = matchCountAgg._sum.matchCount || 0;
+
+    const [driveImportCount, driveSyncOnCount, shootsConnectedCount, driveBackupOnCount, activeAlertSubs] = await Promise.all([
+      prisma.event.count({ where: { driveFolderId: { not: null } } }),
+      prisma.event.count({ where: { driveSyncEnabled: true } }),
+      prisma.event.count({ where: { ftpUsername: { not: null } } }),
+      prisma.event.count({ where: { driveBackupEnabled: true } }),
+      prisma.guestAlertSubscription.count({ where: { active: true } }),
+    ]);
+
+    const sort = ["storage", "events", "photos"].includes(req.query.sort) ? req.query.sort : "storage";
+    const allUsers = await prisma.user.findMany({
+      include: { events: { include: { photos: { select: { fileSize: true } } } } },
+    });
+    const rankedUsers = allUsers
+      .map(serializeUserRow)
+      .sort((a, b) => {
+        if (sort === "events") return b.event_count - a.event_count;
+        if (sort === "photos") return b.photo_count - a.photo_count;
+        return b.storage_used_bytes - a.storage_used_bytes;
+      })
+      .slice(0, 10);
+
+    const driveQuota = await getDriveAccountQuota();
+
+    res.json({
+      guest_engagement: {
+        total_searches: totalSearches,
+        unique_guests: totalGuestClientIds.length,
+        searches_with_matches: searchesWithMatches,
+        match_rate: totalSearches > 0 ? searchesWithMatches / totalSearches : 0,
+        total_feedback: totalFeedback,
+        feedback_rate: totalMatchesShown > 0 ? totalFeedback / totalMatchesShown : 0,
+      },
+      feature_adoption: {
+        drive_import_connected: driveImportCount,
+        drive_sync_enabled: driveSyncOnCount,
+        shoots_connected: shootsConnectedCount,
+        drive_backup_enabled: driveBackupOnCount,
+        active_guest_alert_subscriptions: activeAlertSubs,
+      },
+      top_clients: { sort, users: rankedUsers },
+      drive_backup_quota: driveQuota,
     });
   } catch (err) {
     next(err);
