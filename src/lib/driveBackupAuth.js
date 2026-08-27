@@ -41,12 +41,15 @@ export function isDriveBackupConfigured() {
 }
 
 /** True if this photographer's account is allowed to turn the per-event
- * toggle on — independent of whether the platform account itself is set up. */
+ * toggle on — independent of whether the platform account itself is set up.
+ * DRIVE_BACKUP_BETA_EMAILS="*" opts every client in at once (still gated on
+ * the platform account being configured — see isDriveBackupConfigured). */
 export function isDriveBackupBetaUser(email) {
   const allow = (process.env.DRIVE_BACKUP_BETA_EMAILS || "")
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
+  if (allow.includes("*")) return true;
   return allow.includes((email || "").toLowerCase());
 }
 
