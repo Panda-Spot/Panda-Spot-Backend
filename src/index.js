@@ -27,6 +27,12 @@ app.use(
   cors({
     origin: process.env.CORS_ORIGIN || "http://localhost:5173",
     credentials: true,
+    // Without this, the `cors` package never sets Access-Control-Max-Age,
+    // so browsers cache nothing and re-run a full OPTIONS preflight for
+    // every single cross-site request — visible in devtools as a wall of
+    // slow "preflight" rows. 24h (browsers clamp to their own real max —
+    // Chromium caps at 2h, Firefox at 24h — so this just asks for the max).
+    maxAge: 86400,
   })
 );
 app.use(cookieParser());
