@@ -16,28 +16,48 @@ const PURGE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // day 7: gone everywhere, for g
 const NOTICE_AFTER_INACTIVITY_MS = 6 * 60 * 60 * 1000; // no Shoots captures for 6h -> "this shoot looks finished"
 
 /**
- * Downloads each given photo's Drive-backed original to the VPS (a public
- * read via the API key — works because the folder is link-shared, no OAuth
- * needed) and deletes the platform account's Drive copy to reclaim its
- * quota. `force` skips the day-2 age check — used by the manual
- * "reclaim now" route, since an explicit owner confirmation is a stronger
- * signal than an arbitrary timer.
+ * Reclaims the platform account's Drive quota for one photo. If it doesn't
+ * already have a local copy (a PandaShoots capture that went straight to
+ * Drive), downloads it back first (a public read via the API key — works
+ * because the folder is link-shared, no OAuth needed) before deleting the
+ * Drive copy. If it already has a local copy (backed up via
+ * POST .../backup-existing, or already reclaimed once before), there's
+ * nothing to pull back — just delete the redundant Drive copy. `force`
+ * skips the day-2 age check — used by the manual "reclaim now" route,
+ * since an explicit owner confirmation is a stronger signal than a timer.
  */
 async function reclaimPhotos(photos, { force = false } = {}) {
   let reclaimed = 0;
   const cutoff = Date.now() - RECLAIM_AFTER_MS;
   for (const photo of photos) {
     if (!photo.driveFileId) continue;
-    if (!force && photo.createdAt.getTime() > cutoff) continue;
+    const startedAt = photo.driveBackupStartedAt || photo.createdAt;
+    if (!force && startedAt.getTime() > cutoff) continue;
     try {
-      const buffer = await downloadFile(photo.driveFileId);
-      const ext = path.extname(photo.filename) || ".jpg";
-      const storagePath = await saveEventShootsPhoto(photo.eventId, `${photo.id}${ext}`, buffer);
-      await deleteFileFromDrive(photo.driveFileId).catch((err) =>
-        console.error(`Drive delete failed for photo ${photo.id} (will retry next sweep):`, err.message)
-      );
-      await prisma.photo.update({ where: { id: photo.id }, data: { storagePath, driveFileId: null } });
-      reclaimed += 1;
+      let storagePath = photo.storagePath;
+      if (!storagePath) {
+        const buffer = await downloadFile(photo.driveFileId);
+        const ext = path.extname(photo.filename) || ".jpg";
+        storagePath = await saveEventShootsPhoto(photo.eventId, `${photo.id}${ext}`, buffer);
+      }
+      // Only clear driveFileId once the Drive copy is actually confirmed
+      // gone — clearing it regardless of outcome would let a failed delete
+      // silently leak Drive quota forever with no record left to retry
+      // against on the next sweep. `reclaimed` only counts full successes,
+      // since a failed delete hasn't actually freed any Drive quota yet.
+      try {
+        await deleteFileFromDrive(photo.driveFileId);
+        await prisma.photo.update({ where: { id: photo.id }, data: { storagePath, driveFileId: null } });
+        reclaimed += 1;
+      } catch (err) {
+        console.error(`Drive delete failed for photo ${photo.id} (will retry next sweep):`, err.message);
+        if (photo.storagePath == null) {
+          // The download-and-save above still succeeded even though the
+          // Drive-side delete didn't — persist the new local copy now so a
+          // retry next sweep doesn't re-download it from scratch.
+          await prisma.photo.update({ where: { id: photo.id }, data: { storagePath } });
+        }
+      }
     } catch (err) {
       console.error(`Reclaim failed for photo ${photo.id}:`, err.message);
     }
@@ -78,13 +98,13 @@ export async function runDriveBackupRetentionSweep() {
     where: {
       platformDriveBackup: true,
       driveFileId: { not: null },
-      createdAt: { lt: new Date(Date.now() - RECLAIM_AFTER_MS) },
+      driveBackupStartedAt: { lt: new Date(Date.now() - RECLAIM_AFTER_MS) },
     },
   });
   await reclaimPhotos(dueForReclaim, { force: true });
 
   const dueForPurge = await prisma.photo.findMany({
-    where: { platformDriveBackup: true, createdAt: { lt: new Date(Date.now() - PURGE_AFTER_MS) } },
+    where: { platformDriveBackup: true, driveBackupStartedAt: { lt: new Date(Date.now() - PURGE_AFTER_MS) } },
   });
   for (const photo of dueForPurge) {
     try {

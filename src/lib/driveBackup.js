@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { getFreshAccessToken, isDriveBackupConfigured } from "./driveBackupAuth.js";
 
+export const MIME_BY_EXT = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
+
 /**
  * Builds a `multipart/related` request body per Drive API v3's upload spec:
  * one JSON metadata part, one raw-bytes part, separated by a boundary.

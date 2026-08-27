@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { randomUUID, randomBytes } from "node:crypto";
 import path from "node:path";
+import fsp from "node:fs/promises";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
@@ -24,6 +25,7 @@ import { checkAndNotifyForNewPhotos } from "../lib/guestAlerts.js";
 import { isDriveBackupConfigured, isDriveBackupBetaUser } from "../lib/driveBackupAuth.js";
 import { reclaimEventDriveBackups } from "../lib/driveBackupRetention.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
+import { uploadToDriveFolder, MIME_BY_EXT } from "../lib/driveBackup.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -622,6 +624,106 @@ router.post("/:id/drive-backup/reclaim-now", async (req, res, next) => {
     next(err);
   }
 });
+
+// Uploads every already-local photo not yet backed up (direct uploads, or
+// PandaShoots captures from before backup was turned on) to the connected
+// Drive folder — the "catch up" action for photos that predate flipping
+// the toggle on. Drive-imported photos (storagePath null — nothing local
+// to upload, already in that same Drive folder) are never touched here, so
+// there's no risk of re-uploading a duplicate. Same SSE progress shape as
+// every other job on this page (see lib/jobQueue.js). Once backed up, each
+// photo follows the exact same 2-day-reclaim/7-day-purge clock as a
+// PandaShoots-to-Drive capture (lib/driveBackupRetention.js) — the local
+// original is NOT deleted immediately, but it is no longer permanent.
+router.post("/:id/drive-backup/backup-existing", driveImportLimiter, async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.driveFolderId) {
+      return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
+    }
+    if (!isDriveBackupConfigured()) {
+      return res.status(400).json({ error: "Drive backup isn't set up on this PandaSpot instance yet." });
+    }
+    const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+    if (!isDriveBackupBetaUser(owner?.email)) {
+      return res.status(403).json({ error: "Drive backup is a beta feature — this account isn't on the beta list yet." });
+    }
+
+    const photos = await prisma.photo.findMany({
+      where: { eventId: event.id, storagePath: { not: null }, platformDriveBackup: false },
+    });
+
+    const { id: jobId } = createJob();
+    res.status(202).json({ job_id: jobId, files_found: photos.length });
+
+    processBackupExistingJob(jobId, event, photos).catch((err) => {
+      console.error(`Unhandled error in backup-existing job ${jobId}:`, err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function processBackupExistingJob(jobId, event, photos) {
+  const total = photos.length;
+  const skipped = [];
+  let completed = 0;
+  const startedAt = Date.now();
+
+  try {
+    for (const photo of photos) {
+      try {
+        const buffer = await fsp.readFile(photo.storagePath);
+        const ext = path.extname(photo.storagePath).toLowerCase();
+        const driveFile = await uploadToDriveFolder({
+          folderId: event.driveFolderId,
+          filename: photo.filename,
+          mimeType: MIME_BY_EXT[ext] || "application/octet-stream",
+          buffer,
+        });
+        await prisma.photo.update({
+          where: { id: photo.id },
+          data: { driveFileId: driveFile.id, platformDriveBackup: true, driveBackupStartedAt: new Date() },
+        });
+      } catch (err) {
+        skipped.push(`${photo.filename} (${err.message})`);
+      }
+
+      completed += 1;
+      const elapsedSeconds = (Date.now() - startedAt) / 1000;
+      const photosPerSecond = elapsedSeconds > 0 ? completed / elapsedSeconds : 0;
+      emitJobEvent(jobId, {
+        type: "progress",
+        job_id: jobId,
+        total,
+        completed,
+        current_file: photo.filename,
+        photos_per_second: Math.round(photosPerSecond * 100) / 100,
+        eta_seconds: photosPerSecond > 0 ? Math.round((total - completed) / photosPerSecond) : null,
+        faces_found_so_far: 0,
+        skipped_so_far: skipped,
+      });
+    }
+
+    emitJobEvent(jobId, {
+      type: "done",
+      job_id: jobId,
+      photos_processed: total - skipped.length,
+      faces_found: 0,
+      skipped,
+    });
+  } catch (err) {
+    console.error(`Backup-existing job ${jobId} failed:`, err);
+    emitJobEvent(jobId, {
+      type: "error",
+      job_id: jobId,
+      message: err.message || "Unknown error while backing up existing photos",
+    });
+  }
+}
 
 router.get("/:id/photos", async (req, res, next) => {
   try {

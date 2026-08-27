@@ -9,9 +9,7 @@ import { contentMatchesExtension } from "./fileValidation.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.js";
 import { publishLiveEvent } from "./liveEvents.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
-import { uploadToDriveFolder } from "./driveBackup.js";
-
-const MIME_BY_EXT = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
+import { uploadToDriveFolder, MIME_BY_EXT } from "./driveBackup.js";
 
 /**
  * Runs one already-on-disk file (from Shoots' FTP staging area — see
@@ -92,6 +90,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       thumbnailPath,
       driveFileId,
       platformDriveBackup,
+      driveBackupStartedAt: platformDriveBackup ? new Date() : null,
       faceCount: faces.length,
       fileSize: buffer.length,
     },

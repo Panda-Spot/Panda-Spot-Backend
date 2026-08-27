@@ -206,13 +206,26 @@ model Photo {
   createdAt   DateTime @default(now())
   faces       Face[]
 
-  /// True only for a PandaShoots capture uploaded to Drive via the platform's own
-  /// account (Event.driveBackupEnabled) — distinguishes it from a Google
-  /// Drive *import* (photographer's own pre-existing Drive content, driveFileId
-  /// also set but never auto-deleted) and from a normal direct upload. Drives
+  /// True for any photo backed up to Drive via the platform's own account
+  /// (Event.driveBackupEnabled) — either a PandaShoots capture that went
+  /// straight there, or an already-local photo (direct upload, or a
+  /// PandaShoots capture from before backup was turned on) added via
+  /// POST /events/:id/drive-backup/backup-existing. Distinguishes both from
+  /// a Google Drive *import* (photographer's own pre-existing Drive
+  /// content, driveFileId also set but never auto-deleted). Drives
   /// lib/driveBackupRetention.js's 2-day-reclaim / 7-day-purge sweep, which
-  /// only ever touches rows with this flag true.
+  /// only ever touches rows with this flag true — deliberately including
+  /// photos that already had a durable local copy before backup started
+  /// (see that column's own comment on why storagePath alone isn't enough
+  /// to know whether reclaim needs to actually download anything).
   platformDriveBackup Boolean @default(false)
+  /// When this photo's platform-Drive-backup lifecycle actually began —
+  /// the retention sweep's clock anchor, NOT createdAt (a direct upload can
+  /// be backed up long after it was created; anchoring on createdAt would
+  /// make it look instantly overdue). Set at capture time for a PandaShoots
+  /// capture that goes straight to Drive, or at backup-existing run time
+  /// otherwise. Null until platformDriveBackup is first set true.
+  driveBackupStartedAt DateTime?
 }
 
 /// Face rows are inserted/queried via raw SQL because the `embedding` column
