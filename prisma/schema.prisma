@@ -164,6 +164,25 @@ model Event {
   /// Photo.approvalStatus: "pending" and only become searchable/live once
   /// the owner approves them — see routes/guest.js's upload endpoint.
   guestUploadEnabled Boolean @default(false)
+  /// Stamped whenever guestUploadEnabled is turned on — the anchor for
+  /// guestUploadWindowDays below (not createdAt, since uploads might be
+  /// turned on well after the event was created).
+  guestUploadEnabledAt DateTime?
+  /// Owner-set, per-event override for how many days guests can keep
+  /// uploading after guestUploadEnabledAt — independent of the main
+  /// 90-day guest-access window (expiresAt) that governs search/download.
+  /// Null falls back to expiresAt, same as everyone else.
+  guestUploadWindowDays Int?
+
+  /// Self-relation for nested sub-galleries (e.g. "Ceremony"/"Reception"
+  /// under one wedding) — a sub-gallery is a fully real Event of its own
+  /// (own guestSlug, own photos, own everything), just not advertised with
+  /// its own QR: guests reach it by picking it from the parent's guest
+  /// page. Null for a top-level event or a sub-gallery's own children
+  /// (one level of nesting only — enforced in routes/events.js, not here).
+  parentEventId String?
+  parent        Event?  @relation("EventSubGalleries", fields: [parentEventId], references: [id])
+  subGalleries  Event[] @relation("EventSubGalleries")
 }
 
 /// A second shooter/assistant granted upload+view access to one event without
@@ -274,20 +293,31 @@ model Photo {
   /// just lets a future "your uploads" guest view exist without a schema
   /// change.
   uploadedByGuestClientId String?
+  /// Best-effort auto-flag for a guest upload that might be inappropriate
+  /// — a free, self-hosted heuristic (skin-exposure ratio via OpenCV in
+  /// face-engine, not a trained ML classifier), so it's a "look at this
+  /// one first" signal in the moderation queue, never an auto-reject.
+  /// Always false for every non-guest source.
+  moderationFlagged Boolean @default(false)
 
   likes    PhotoLike[]
   comments PhotoComment[]
 }
 
-/// A guest's "heart" on a photo — one per (photo, guest), toggled on/off.
-/// Public like counts are an explicit product decision (not everyone wants
-/// this exposed): see lib routes/guest.js's like endpoint.
+/// A guest's reaction on a photo — one per (photo, guest); tapping a
+/// different reaction type switches it, tapping the same one again
+/// removes it. reactionType is one of REACTION_TYPES (see lib/reactions.js)
+/// — stored as a plain string rather than a DB enum so adding a new
+/// reaction type later never needs a migration. Public reaction counts are
+/// an explicit product decision (not everyone wants this exposed): see
+/// routes/guest.js's react endpoint.
 model PhotoLike {
   id            String   @id @default(uuid())
   photoId       String
   photo         Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
   eventId       String
   guestClientId String
+  reactionType  String   @default("heart")
   createdAt     DateTime @default(now())
 
   @@unique([photoId, guestClientId])

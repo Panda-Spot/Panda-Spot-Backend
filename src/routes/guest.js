@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { upload } from "../middleware/upload.js";
-import { detectFaces, pickLargestFace } from "../lib/faceEngine.js";
+import { checkModeration, detectFaces, pickLargestFace } from "../lib/faceEngine.js";
 import { insertFace, searchSimilarPhotos } from "../lib/faces.js";
 import { averageAndNormalize, insertGuestSearch, similarityForPhoto } from "../lib/guestSearches.js";
 import { getEffectiveThreshold, adjustThresholdOnFeedback } from "../lib/threshold.js";
@@ -28,33 +28,60 @@ import { subscribeGuestAlert, unsubscribeGuestAlert, isValidEmail } from "../lib
 import { sendWhatsAppMessage, isValidE164 } from "../lib/whatsapp.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetentionDays } from "../lib/planLimits.js";
 import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
+import { REACTION_TYPES, isValidReactionType } from "../lib/reactions.js";
 
 const router = Router();
 
 const PUBLIC_SERVER_URL = process.env.PUBLIC_SERVER_URL || "http://localhost:4000";
 
-/** Returns { likeCounts: Map<photoId, count>, likedByMe: Set<photoId> } for
- * a set of photo ids — likedByMe is empty if guestClientId is falsy. */
-async function getLikeInfo(photoIds, guestClientId) {
-  if (photoIds.length === 0) return { likeCounts: new Map(), likedByMe: new Set() };
+/** Returns { reactionsByPhoto: Map<photoId, {heart: 2, ...}>, myReactionByPhoto: Map<photoId, reactionType> }
+ * for a set of photo ids — myReactionByPhoto is empty if guestClientId is falsy. */
+async function getReactionInfo(photoIds, guestClientId) {
+  if (photoIds.length === 0) return { reactionsByPhoto: new Map(), myReactionByPhoto: new Map() };
 
   const grouped = await prisma.photoLike.groupBy({
-    by: ["photoId"],
+    by: ["photoId", "reactionType"],
     where: { photoId: { in: photoIds } },
     _count: true,
   });
-  const likeCounts = new Map(grouped.map((g) => [g.photoId, g._count]));
+  const reactionsByPhoto = new Map();
+  for (const row of grouped) {
+    const counts = reactionsByPhoto.get(row.photoId) || {};
+    counts[row.reactionType] = row._count;
+    reactionsByPhoto.set(row.photoId, counts);
+  }
 
-  let likedByMe = new Set();
+  let myReactionByPhoto = new Map();
   if (guestClientId) {
     const mine = await prisma.photoLike.findMany({
       where: { photoId: { in: photoIds }, guestClientId },
-      select: { photoId: true },
+      select: { photoId: true, reactionType: true },
     });
-    likedByMe = new Set(mine.map((m) => m.photoId));
+    myReactionByPhoto = new Map(mine.map((m) => [m.photoId, m.reactionType]));
   }
 
-  return { likeCounts, likedByMe };
+  return { reactionsByPhoto, myReactionByPhoto };
+}
+
+function reactionShape(photoId, reactionsByPhoto, myReactionByPhoto) {
+  return {
+    reactions: reactionsByPhoto.get(photoId) || {},
+    my_reaction: myReactionByPhoto.get(photoId) || null,
+  };
+}
+
+/** True once an event's own guest-upload window has closed — independent
+ * of the main 90-day guest-access window (isExpired), since an owner can
+ * set a shorter/longer window specifically for uploads. Falls back to the
+ * main expiresAt when no custom window is set. */
+function guestUploadWindowClosed(event) {
+  if (event.guestUploadWindowDays == null || !event.guestUploadEnabledAt) {
+    return isExpired(event);
+  }
+  const closesAt = new Date(
+    event.guestUploadEnabledAt.getTime() + event.guestUploadWindowDays * 24 * 60 * 60 * 1000
+  );
+  return new Date() > closesAt;
 }
 
 function photoResponseShape(event, photo) {
@@ -71,7 +98,7 @@ router.get("/:slug", async (req, res, next) => {
   try {
     const event = await prisma.event.findUnique({
       where: { guestSlug: req.params.slug },
-      include: { owner: true },
+      include: { owner: true, subGalleries: { orderBy: { createdAt: "asc" } } },
     });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
@@ -84,6 +111,10 @@ router.get("/:slug", async (req, res, next) => {
       brand_color: event.owner?.brandColor ?? null,
       expired: isExpired(event),
       guest_upload_enabled: event.guestUploadEnabled,
+      // When present, the frontend shows a picker instead of the search
+      // form directly — a parent with sub-galleries is a pure menu, not a
+      // searchable gallery of its own (see routes/events.js's create route).
+      sub_galleries: event.subGalleries.map((s) => ({ name: s.name, slug: s.guestSlug })),
     });
   } catch (err) {
     next(err);
@@ -157,7 +188,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       });
       const photoById = new Map(photos.map((p) => [p.id, p]));
 
-      const { likeCounts, likedByMe } = await getLikeInfo(
+      const { reactionsByPhoto, myReactionByPhoto } = await getReactionInfo(
         photos.map((p) => p.id),
         guestClientId
       );
@@ -172,8 +203,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
             similarity: Math.round(Number(r.similarity) * 10000) / 10000,
             url: `/files/events/${event.id}/photos/${photo.id}`,
             thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
-            like_count: likeCounts.get(photo.id) || 0,
-            liked_by_me: likedByMe.has(photo.id),
+            ...reactionShape(photo.id, reactionsByPhoto, myReactionByPhoto),
           };
         })
         .filter(Boolean)
@@ -191,6 +221,104 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
     res.json({
       search_id: searchId,
       faces_detected_in_selfie: facesDetected,
+      matches,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Group search — one selfie PER PERSON (not multiple angles of the same
+// person, see /:slug/search above), so a group of friends/family can find
+// every photo containing ANY of them in one pass instead of each searching
+// separately. Each uploaded selfie is searched independently; results are
+// merged by photo, keeping the best similarity and how many of the group
+// matched that photo.
+router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8), async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+
+    const files = req.files || [];
+    if (files.length < 2) {
+      return res.status(400).json({ error: "Group search needs at least 2 selfies — one per person" });
+    }
+
+    const threshold = getEffectiveThreshold(event);
+
+    // best: Map<photoId, { similarity, peopleMatched }>
+    const best = new Map();
+    let peopleDetected = 0;
+
+    for (const file of files) {
+      const ext = path.extname(file.originalname).toLowerCase();
+      if (!ALLOWED_EXTENSIONS.has(ext) || !contentMatchesExtension(file.buffer, ext)) continue;
+
+      let detection;
+      try {
+        detection = await detectFaces(file.buffer, file.originalname);
+      } catch (err) {
+        return next(err);
+      }
+      const faces = detection.faces || [];
+      if (faces.length === 0) continue;
+
+      peopleDetected += 1;
+      const embedding = pickLargestFace(faces).embedding;
+      const rows = await searchSimilarPhotos({ eventId: event.id, embedding, threshold });
+
+      for (const r of rows) {
+        const existing = best.get(r.photoId);
+        const similarity = Number(r.similarity);
+        if (!existing) {
+          best.set(r.photoId, { similarity, peopleMatched: 1 });
+        } else {
+          best.set(r.photoId, {
+            similarity: Math.max(existing.similarity, similarity),
+            peopleMatched: existing.peopleMatched + 1,
+          });
+        }
+      }
+    }
+
+    if (peopleDetected === 0) {
+      return res.status(422).json({ error: "No face detected in any of the uploaded selfies." });
+    }
+
+    const photoIds = [...best.keys()];
+    const photos = await prisma.photo.findMany({
+      where: { id: { in: photoIds }, approvalStatus: "approved" },
+    });
+    const guestClientId = req.body?.guest_client_id || null;
+    const { reactionsByPhoto, myReactionByPhoto } = await getReactionInfo(
+      photos.map((p) => p.id),
+      guestClientId
+    );
+
+    const matches = photos
+      .map((photo) => {
+        const info = best.get(photo.id);
+        if (!info) return null;
+        return {
+          photo_id: photo.id,
+          filename: photo.filename,
+          similarity: Math.round(info.similarity * 10000) / 10000,
+          people_matched: info.peopleMatched,
+          url: `/files/events/${event.id}/photos/${photo.id}`,
+          thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+          ...reactionShape(photo.id, reactionsByPhoto, myReactionByPhoto),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.people_matched - a.people_matched || b.similarity - a.similarity);
+
+    res.json({
+      people_detected: peopleDetected,
       matches,
     });
   } catch (err) {
@@ -218,6 +346,9 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
     }
     if (!event.guestUploadEnabled) {
       return res.status(403).json({ error: "Guest uploads aren't turned on for this event." });
+    }
+    if (guestUploadWindowClosed(event)) {
+      return res.status(410).json({ error: "The guest upload window for this event has closed." });
     }
 
     const files = req.files || [];
@@ -262,6 +393,9 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
       const storagePath = await saveEventPhoto(event.id, storedFilename, file.buffer);
       const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
       const faces = detection.faces || [];
+      // Best-effort only, guest uploads exclusively — see checkModeration's
+      // own doc comment for exactly what this does and doesn't catch.
+      const moderationFlagged = await checkModeration(file.buffer, file.originalname);
 
       const photo = await prisma.photo.create({
         data: {
@@ -274,6 +408,7 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
           fileSize: file.buffer.length,
           source: "guest",
           approvalStatus: "pending",
+          moderationFlagged,
           uploadedByGuestClientId: guestClientId,
           originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
         },
@@ -365,7 +500,11 @@ router.get("/:slug/live/stream", async (req, res, next) => {
 // calling this twice with the same guest_client_id likes then unlikes.
 // Public like counts are an explicit product decision (not a private
 // per-guest favorites list) — see the Photo model's comment.
-router.post("/:slug/photos/:photoId/like", guestLikeLimiter, async (req, res, next) => {
+// Sets/switches/removes a guest's reaction on a photo: tapping a new
+// reaction type creates or switches to it, tapping the SAME type again
+// removes it. Public reaction counts are an explicit product decision
+// (not a private per-guest favorites list) — see the PhotoLike model.
+router.post("/:slug/photos/:photoId/react", guestLikeLimiter, async (req, res, next) => {
   try {
     const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
     if (!event) {
@@ -375,9 +514,12 @@ router.post("/:slug/photos/:photoId/like", guestLikeLimiter, async (req, res, ne
       return res.status(410).json({ error: "This event's guest access has closed." });
     }
 
-    const { guest_client_id: guestClientId } = req.body || {};
+    const { guest_client_id: guestClientId, reaction } = req.body || {};
     if (!guestClientId) {
       return res.status(400).json({ error: "guest_client_id is required" });
+    }
+    if (!isValidReactionType(reaction)) {
+      return res.status(400).json({ error: `reaction must be one of: ${REACTION_TYPES.join(", ")}` });
     }
 
     const photo = await prisma.photo.findFirst({
@@ -391,19 +533,68 @@ router.post("/:slug/photos/:photoId/like", guestLikeLimiter, async (req, res, ne
       where: { photoId_guestClientId: { photoId: photo.id, guestClientId } },
     });
 
-    let liked;
-    if (existing) {
+    let myReaction;
+    if (existing && existing.reactionType === reaction) {
       await prisma.photoLike.delete({ where: { id: existing.id } });
-      liked = false;
+      myReaction = null;
+    } else if (existing) {
+      await prisma.photoLike.update({ where: { id: existing.id }, data: { reactionType: reaction } });
+      myReaction = reaction;
     } else {
       await prisma.photoLike.create({
-        data: { id: randomUUID(), photoId: photo.id, eventId: event.id, guestClientId },
+        data: { id: randomUUID(), photoId: photo.id, eventId: event.id, guestClientId, reactionType: reaction },
       });
-      liked = true;
+      myReaction = reaction;
     }
 
-    const likeCount = await prisma.photoLike.count({ where: { photoId: photo.id } });
-    res.json({ liked, like_count: likeCount });
+    const grouped = await prisma.photoLike.groupBy({
+      by: ["reactionType"],
+      where: { photoId: photo.id },
+      _count: true,
+    });
+    const reactions = {};
+    for (const row of grouped) reactions[row.reactionType] = row._count;
+
+    res.json({ reactions, my_reaction: myReaction });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// "Everything I reacted to" — a guest's own reaction history within this
+// event, so they can revisit photos they hearted/etc. without re-searching.
+router.get("/:slug/my-reactions", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    const guestClientId = req.query.guest_client_id;
+    if (!guestClientId) {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+
+    const myLikes = await prisma.photoLike.findMany({
+      where: { eventId: event.id, guestClientId },
+      orderBy: { createdAt: "desc" },
+    });
+    if (myLikes.length === 0) return res.json({ photos: [] });
+
+    const photos = await prisma.photo.findMany({
+      where: { id: { in: myLikes.map((l) => l.photoId) }, approvalStatus: "approved" },
+    });
+    const photoById = new Map(photos.map((p) => [p.id, p]));
+
+    const result = myLikes
+      .map((l) => {
+        const photo = photoById.get(l.photoId);
+        if (!photo) return null;
+        return { ...photoResponseShape(event, photo), my_reaction: l.reactionType };
+      })
+      .filter(Boolean);
+
+    res.json({ photos: result });
   } catch (err) {
     next(err);
   }

@@ -42,6 +42,27 @@ export async function detectFaces(imageBuffer, filename) {
 }
 
 /**
+ * Best-effort content-moderation flag for a guest upload — see
+ * face-engine's /moderate (a free, self-hosted heuristic, not a trained ML
+ * classifier). Never throws: a network error or non-2xx response just
+ * resolves to `false` (unflagged) so a moderation-service hiccup can never
+ * block or fail an otherwise-valid guest upload — this is a "flag for
+ * human review" signal, not a security boundary.
+ */
+export async function checkModeration(imageBuffer, filename) {
+  try {
+    const form = new FormData();
+    form.append("image", new Blob([imageBuffer]), filename);
+    const response = await fetch(`${FACE_ENGINE_URL}/moderate`, { method: "POST", body: form });
+    if (!response.ok) return false;
+    const data = await response.json();
+    return !!data.flagged;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Given the `faces` array returned by detectFaces, picks the face with the
  * largest bounding-box area. Returns null if the array is empty.
  */

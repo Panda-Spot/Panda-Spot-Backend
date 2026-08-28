@@ -81,8 +81,12 @@ router.get("/", async (req, res, next) => {
   try {
     // Union of events owned by this user and events they collaborate on,
     // each tagged with their role on that event.
+    // Sub-galleries are real Events but aren't shown as their own top-level
+    // dashboard entries — a guest reaches them via the parent's picker (see
+    // GET /:id's sub_galleries), and the owner manages them from the
+    // parent's detail page too.
     const owned = await prisma.event.findMany({
-      where: { ownerId: req.user.id },
+      where: { ownerId: req.user.id, parentEventId: null },
       include: { _count: { select: { photos: true } } },
     });
     const collabRows = await prisma.eventCollaborator.findMany({
@@ -125,6 +129,11 @@ router.get("/:id", async (req, res, next) => {
     const pendingGuestUploadCount = await prisma.photo.count({
       where: { eventId: event.id, approvalStatus: "pending" },
     });
+    const subGalleries = await prisma.event.findMany({
+      where: { parentEventId: event.id },
+      orderBy: { createdAt: "asc" },
+      include: { _count: { select: { photos: true } } },
+    });
 
     res.json({
       id: event.id,
@@ -150,9 +159,17 @@ router.get("/:id", async (req, res, next) => {
       drive_backup_available: isDriveBackupConfigured(),
       started: !!event.startedAt,
       guest_upload_enabled: event.guestUploadEnabled,
+      guest_upload_window_days: event.guestUploadWindowDays,
       pending_guest_upload_count: pendingGuestUploadCount,
       guest_upload_link: `${PUBLIC_WEB_URL}/e/${event.guestSlug}/upload`,
       slideshow_link: `${PUBLIC_WEB_URL}/e/${event.guestSlug}/slideshow`,
+      is_sub_gallery: !!event.parentEventId,
+      sub_galleries: subGalleries.map((s) => ({
+        id: s.id,
+        name: s.name,
+        guest_slug: s.guestSlug,
+        photo_count: s._count.photos,
+      })),
     });
   } catch (err) {
     next(err);
@@ -188,6 +205,50 @@ router.post("/:id/start", async (req, res, next) => {
   }
 });
 
+// Creates a sub-gallery (e.g. "Ceremony"/"Reception") under this event —
+// a fully real Event of its own, just reached by guests via the parent's
+// picker (see guest.js's GET /:slug) instead of its own advertised QR. One
+// level of nesting only: rejects if this event is itself already a
+// sub-gallery. Auto-started (skips the normal manual "Start Event" step)
+// since creating one here is already an intentional, ready-to-use action —
+// the parent being started already implies the studio is mid-event.
+router.post("/:id/sub-galleries", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (event.parentEventId) {
+      return res.status(400).json({ error: "Sub-galleries can't themselves have sub-galleries." });
+    }
+    const { name } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      return res.status(400).json({ error: "name is required" });
+    }
+
+    const guestSlug = await generateUniqueSlug();
+    const subGallery = await prisma.event.create({
+      data: {
+        name: name.trim(),
+        ownerId: event.ownerId,
+        parentEventId: event.id,
+        guestSlug,
+        expiresAt: event.expiresAt,
+        startedAt: new Date(),
+      },
+    });
+
+    res.status(201).json({
+      id: subGallery.id,
+      name: subGallery.name,
+      guest_slug: subGallery.guestSlug,
+      photo_count: 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Opt-in toggle for guests uploading their own photos back into this event
 // via a dedicated link/QR (distinct from the search link). Owner or
 // collaborator, same access level as every other ingestion toggle on this
@@ -206,9 +267,39 @@ router.post("/:id/guest-uploads/toggle", async (req, res, next) => {
     const { enabled } = req.body || {};
     const updated = await prisma.event.update({
       where: { id: event.id },
-      data: { guestUploadEnabled: !!enabled },
+      data: {
+        guestUploadEnabled: !!enabled,
+        // Stamped the moment it's turned on — the anchor for
+        // guestUploadWindowDays. Left alone on future re-toggles so
+        // turning it off/on doesn't quietly reset an owner-set window.
+        guestUploadEnabledAt: enabled && !event.guestUploadEnabledAt ? new Date() : undefined,
+      },
     });
     res.json({ guest_upload_enabled: updated.guestUploadEnabled });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Owner or collaborator — sets/clears how many days guests can keep
+// uploading, independent of the event's main 90-day guest-access window.
+// Null resets to "same as everyone else" (isExpired/expiresAt).
+router.post("/:id/guest-uploads/window", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { window_days: windowDays } = req.body || {};
+    if (windowDays != null && (!Number.isInteger(windowDays) || windowDays < 1)) {
+      return res.status(400).json({ error: "window_days must be a positive integer, or null to reset" });
+    }
+
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { guestUploadWindowDays: windowDays ?? null },
+    });
+    res.json({ guest_upload_window_days: updated.guestUploadWindowDays });
   } catch (err) {
     next(err);
   }
@@ -868,6 +959,7 @@ router.get("/:id/photos", async (req, res, next) => {
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
         source: p.source,
         approval_status: p.approvalStatus,
+        moderation_flagged: p.moderationFlagged,
       }))
     );
   } catch (err) {
