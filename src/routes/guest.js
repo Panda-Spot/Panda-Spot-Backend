@@ -5,21 +5,67 @@ import { randomUUID } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { upload } from "../middleware/upload.js";
 import { detectFaces, pickLargestFace } from "../lib/faceEngine.js";
-import { searchSimilarPhotos } from "../lib/faces.js";
+import { insertFace, searchSimilarPhotos } from "../lib/faces.js";
 import { averageAndNormalize, insertGuestSearch, similarityForPhoto } from "../lib/guestSearches.js";
 import { getEffectiveThreshold, adjustThresholdOnFeedback } from "../lib/threshold.js";
 import { zipFilenameForEvent, streamPhotosZip, buildPhotosZipToDisk, zipDownloadPath } from "../lib/zip.js";
 import { sendZipReadyEmail } from "../lib/mailer.js";
-import { ALLOWED_EXTENSIONS } from "../lib/storage.js";
+import { ALLOWED_EXTENSIONS, saveEventPhoto } from "../lib/storage.js";
+import { generateThumbnail } from "../lib/thumbnails.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
-import { guestSearchLimiter, guestDownloadLimiter, guestFeedbackLimiter, guestAlertLimiter, guestWhatsAppLinkLimiter } from "../lib/rateLimiters.js";
+import {
+  guestSearchLimiter,
+  guestDownloadLimiter,
+  guestFeedbackLimiter,
+  guestAlertLimiter,
+  guestWhatsAppLinkLimiter,
+  guestUploadLimiter,
+  guestLikeLimiter,
+  guestCommentLimiter,
+} from "../lib/rateLimiters.js";
 import { isExpired } from "../lib/expiry.js";
 import { subscribeGuestAlert, unsubscribeGuestAlert, isValidEmail } from "../lib/guestAlerts.js";
 import { sendWhatsAppMessage, isValidE164 } from "../lib/whatsapp.js";
+import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetentionDays } from "../lib/planLimits.js";
+import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
 
 const router = Router();
 
 const PUBLIC_SERVER_URL = process.env.PUBLIC_SERVER_URL || "http://localhost:4000";
+
+/** Returns { likeCounts: Map<photoId, count>, likedByMe: Set<photoId> } for
+ * a set of photo ids — likedByMe is empty if guestClientId is falsy. */
+async function getLikeInfo(photoIds, guestClientId) {
+  if (photoIds.length === 0) return { likeCounts: new Map(), likedByMe: new Set() };
+
+  const grouped = await prisma.photoLike.groupBy({
+    by: ["photoId"],
+    where: { photoId: { in: photoIds } },
+    _count: true,
+  });
+  const likeCounts = new Map(grouped.map((g) => [g.photoId, g._count]));
+
+  let likedByMe = new Set();
+  if (guestClientId) {
+    const mine = await prisma.photoLike.findMany({
+      where: { photoId: { in: photoIds }, guestClientId },
+      select: { photoId: true },
+    });
+    likedByMe = new Set(mine.map((m) => m.photoId));
+  }
+
+  return { likeCounts, likedByMe };
+}
+
+function photoResponseShape(event, photo) {
+  return {
+    photo_id: photo.id,
+    filename: photo.filename,
+    createdAt: photo.createdAt,
+    url: `/files/events/${event.id}/photos/${photo.id}`,
+    thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+  };
+}
 
 router.get("/:slug", async (req, res, next) => {
   try {
@@ -37,6 +83,7 @@ router.get("/:slug", async (req, res, next) => {
       logo_url: event.owner?.logoPath ? `/files/branding/${event.owner.id}/logo` : null,
       brand_color: event.owner?.brandColor ?? null,
       expired: isExpired(event),
+      guest_upload_enabled: event.guestUploadEnabled,
     });
   } catch (err) {
     next(err);
@@ -104,9 +151,16 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
     let matches = [];
     if (rows.length > 0) {
       const photos = await prisma.photo.findMany({
-        where: { id: { in: rows.map((r) => r.photoId) } },
+        // Pending guest uploads are never searchable — they only become
+        // visible/matchable once the owner approves them.
+        where: { id: { in: rows.map((r) => r.photoId) }, approvalStatus: "approved" },
       });
       const photoById = new Map(photos.map((p) => [p.id, p]));
+
+      const { likeCounts, likedByMe } = await getLikeInfo(
+        photos.map((p) => p.id),
+        guestClientId
+      );
 
       matches = rows
         .map((r) => {
@@ -118,6 +172,8 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
             similarity: Math.round(Number(r.similarity) * 10000) / 10000,
             url: `/files/events/${event.id}/photos/${photo.id}`,
             thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+            like_count: likeCounts.get(photo.id) || 0,
+            liked_by_me: likedByMe.has(photo.id),
           };
         })
         .filter(Boolean)
@@ -136,6 +192,302 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       search_id: searchId,
       faces_detected_in_selfie: facesDetected,
       matches,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Guest-contributed photos — opt-in per event (Event.guestUploadEnabled),
+// reachable via a distinct upload link/QR from the studio, separate from the
+// search link. Runs the same face-detect/thumbnail/storage-cap pipeline as
+// an owner upload, but every photo lands as approvalStatus: "pending" and
+// is invisible to search/live-gallery until the owner approves it — this
+// is a public, unauthenticated write endpoint, so nothing it creates is
+// trusted until a human on the studio side has looked at it. Runs
+// synchronously (no job/SSE plumbing) since guest batches are small — file
+// count is capped below to bound request duration.
+router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+    if (!event.guestUploadEnabled) {
+      return res.status(403).json({ error: "Guest uploads aren't turned on for this event." });
+    }
+
+    const files = req.files || [];
+    if (files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded (expected multipart field 'files')" });
+    }
+
+    const guestClientId = req.body?.guest_client_id || null;
+    const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+    let usedBytes = await eventStorageUsedBytes(prisma, event.id);
+    const storageLimitBytes = effectiveStorageLimitBytes(owner);
+
+    const skipped = [];
+    let uploaded = 0;
+
+    for (const file of files) {
+      const ext = path.extname(file.originalname).toLowerCase();
+
+      if (!ALLOWED_EXTENSIONS.has(ext)) {
+        skipped.push(`${file.originalname} (unsupported file type)`);
+        continue;
+      }
+      if (!contentMatchesExtension(file.buffer, ext)) {
+        skipped.push(`${file.originalname} (file content doesn't match its extension)`);
+        continue;
+      }
+      if (usedBytes + file.buffer.length > storageLimitBytes) {
+        skipped.push(`${file.originalname} (event storage limit reached)`);
+        continue;
+      }
+
+      let detection;
+      try {
+        detection = await detectFaces(file.buffer, file.originalname);
+      } catch (err) {
+        skipped.push(`${file.originalname} (${err.isFaceEngineError ? err.message : "could not process image"})`);
+        continue;
+      }
+
+      const photoId = randomUUID();
+      const storedFilename = `${photoId}${ext}`;
+      const storagePath = await saveEventPhoto(event.id, storedFilename, file.buffer);
+      const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
+      const faces = detection.faces || [];
+
+      const photo = await prisma.photo.create({
+        data: {
+          id: photoId,
+          eventId: event.id,
+          filename: file.originalname,
+          storagePath,
+          thumbnailPath,
+          faceCount: faces.length,
+          fileSize: file.buffer.length,
+          source: "guest",
+          approvalStatus: "pending",
+          uploadedByGuestClientId: guestClientId,
+          originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
+        },
+      });
+
+      for (const face of faces) {
+        await insertFace({
+          photoId: photo.id,
+          eventId: event.id,
+          bbox: face.bbox,
+          embedding: face.embedding,
+          detScore: face.det_score,
+        });
+      }
+
+      usedBytes += file.buffer.length;
+      uploaded += 1;
+      // Deliberately no publishLiveEvent/checkAndNotifyForNewPhotos here —
+      // this photo doesn't exist yet as far as search or the live gallery
+      // are concerned until an owner approves it (see events.js's approve
+      // route).
+    }
+
+    res.json({ ok: true, uploaded, skipped });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public, read-only gallery of this event's approved photos — powers the
+// live slideshow/carousel view (thumbnails only, same as everywhere else
+// guest-facing). Most recent first, capped so a very long-running event
+// doesn't hand back an unbounded response.
+router.get("/:slug/gallery", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+
+    const photos = await prisma.photo.findMany({
+      where: { eventId: event.id, approvalStatus: "approved" },
+      orderBy: { createdAt: "desc" },
+      take: 300,
+    });
+
+    res.json({ photos: photos.map((p) => photoResponseShape(event, p)) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public SSE feed of "a new photo just landed" for this event — same
+// underlying bus as the owner-side stream (events.js's /:id/live/stream),
+// just scoped by guestSlug instead of requiring auth, so the slideshow
+// view can update itself without polling. A guest upload only reaches this
+// once approved (see events.js's approve route), never at upload time.
+router.get("/:slug/live/stream", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    const onEvent = (payload) => {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+    const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 15000);
+    const unsubscribe = subscribeLiveEvents(event.id, onEvent);
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Toggles a guest's like on a photo — one row per (photo, guest), so
+// calling this twice with the same guest_client_id likes then unlikes.
+// Public like counts are an explicit product decision (not a private
+// per-guest favorites list) — see the Photo model's comment.
+router.post("/:slug/photos/:photoId/like", guestLikeLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+
+    const { guest_client_id: guestClientId } = req.body || {};
+    if (!guestClientId) {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved" },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    const existing = await prisma.photoLike.findUnique({
+      where: { photoId_guestClientId: { photoId: photo.id, guestClientId } },
+    });
+
+    let liked;
+    if (existing) {
+      await prisma.photoLike.delete({ where: { id: existing.id } });
+      liked = false;
+    } else {
+      await prisma.photoLike.create({
+        data: { id: randomUUID(), photoId: photo.id, eventId: event.id, guestClientId },
+      });
+      liked = true;
+    }
+
+    const likeCount = await prisma.photoLike.count({ where: { photoId: photo.id } });
+    res.json({ liked, like_count: likeCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public comment thread on a photo — visible to every guest browsing the
+// event (an explicit product decision), moderated by the owner deleting
+// individual comments (see events.js).
+router.get("/:slug/photos/:photoId/comments", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved" },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    const comments = await prisma.photoComment.findMany({
+      where: { photoId: photo.id },
+      orderBy: { createdAt: "asc" },
+    });
+
+    res.json({
+      comments: comments.map((c) => ({
+        id: c.id,
+        guest_name: c.guestName || "Guest",
+        text: c.text,
+        created_at: c.createdAt,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:slug/photos/:photoId/comments", guestCommentLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+
+    const { guest_client_id: guestClientId, guest_name: guestName, text } = req.body || {};
+    if (!guestClientId) {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+    if (!text || typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ error: "A comment can't be empty" });
+    }
+    if (text.length > 500) {
+      return res.status(400).json({ error: "Comments are limited to 500 characters" });
+    }
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved" },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    const comment = await prisma.photoComment.create({
+      data: {
+        id: randomUUID(),
+        photoId: photo.id,
+        eventId: event.id,
+        guestClientId,
+        guestName: guestName && typeof guestName === "string" ? guestName.slice(0, 60) : null,
+        text: text.trim(),
+      },
+    });
+
+    res.status(201).json({
+      id: comment.id,
+      guest_name: comment.guestName || "Guest",
+      text: comment.text,
+      created_at: comment.createdAt,
     });
   } catch (err) {
     next(err);

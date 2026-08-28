@@ -157,6 +157,13 @@ model Event {
   /// Set once the "make your own copy — you have 7 days" notice has been
   /// sent for this event, so it's never sent twice.
   driveBackupNoticeSentAt DateTime?
+
+  /// Opt-in toggle (owner/collaborator) for guests uploading their own
+  /// photos back into this event via a dedicated upload link/QR, distinct
+  /// from the search link. Off by default. Guest uploads always land as
+  /// Photo.approvalStatus: "pending" and only become searchable/live once
+  /// the owner approves them — see routes/guest.js's upload endpoint.
+  guestUploadEnabled Boolean @default(false)
 }
 
 /// A second shooter/assistant granted upload+view access to one event without
@@ -254,6 +261,54 @@ model Photo {
   /// and leaves the thumbnail/Face rows/Photo row alone — search keeps
   /// working forever, only the full-res download goes away.
   originalExpiresAt DateTime?
+
+  /// "approved" (default, for every studio-side source) or "pending" (a
+  /// guest upload awaiting the owner's review — see Event.guestUploadEnabled
+  /// below). Never "rejected": a rejected guest upload is just deleted like
+  /// any other unwanted photo, not kept in a rejected state. Pending photos
+  /// are excluded from guest search and never trigger a live-gallery event
+  /// until approved.
+  approvalStatus String @default("approved")
+  /// The anonymous guest_client_id (see guestId.js) that submitted this
+  /// photo, only set for source: "guest". Not used for access control —
+  /// just lets a future "your uploads" guest view exist without a schema
+  /// change.
+  uploadedByGuestClientId String?
+
+  likes    PhotoLike[]
+  comments PhotoComment[]
+}
+
+/// A guest's "heart" on a photo — one per (photo, guest), toggled on/off.
+/// Public like counts are an explicit product decision (not everyone wants
+/// this exposed): see lib routes/guest.js's like endpoint.
+model PhotoLike {
+  id            String   @id @default(uuid())
+  photoId       String
+  photo         Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  eventId       String
+  guestClientId String
+  createdAt     DateTime @default(now())
+
+  @@unique([photoId, guestClientId])
+  @@index([eventId])
+}
+
+/// A guest comment on a photo — public to every guest browsing the event
+/// (an explicit product decision, not a private feedback channel), so the
+/// owner can delete an individual comment via the moderation UI.
+model PhotoComment {
+  id            String   @id @default(uuid())
+  photoId       String
+  photo         Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  eventId       String
+  guestClientId String
+  guestName     String?
+  text          String
+  createdAt     DateTime @default(now())
+
+  @@index([eventId])
+  @@index([photoId])
 }
 
 /// Face rows are inserted/queried via raw SQL because the `embedding` column

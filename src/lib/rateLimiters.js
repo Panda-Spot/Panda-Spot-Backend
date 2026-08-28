@@ -27,3 +27,6 @@ export const driveImportLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit:
 export const shootsCredentialLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 20 }); // photographer Shoots FTP credential generate/rotate
 export const guestAlertLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 10 }); // guest alert subscribe/unsubscribe
 export const guestWhatsAppLinkLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 5 }); // guest "send my gallery link via WhatsApp"
+export const guestUploadLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 10 }); // guest crowdsourced photo upload
+export const guestLikeLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, limit: 60 }); // guest like/unlike toggle
+export const guestCommentLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 20 }); // guest comment post

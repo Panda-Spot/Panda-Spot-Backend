@@ -9,6 +9,7 @@ import { contentMatchesExtension } from "./fileValidation.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.js";
 import { emitJobEvent } from "./jobQueue.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
+import { publishLiveEvent } from "./liveEvents.js";
 
 // Once per day — see runDueAutoSyncs below.
 const AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -77,20 +78,20 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes) 
   }
 
   usedBytesRef.value += fileSize;
-  return {
-    fileSize,
-    facesFound: faces.length,
-    photoId: photo.id,
-    photo: {
-      photo_id: photo.id,
-      filename: photo.filename,
-      face_count: photo.faceCount,
-      createdAt: photo.createdAt,
-      url: `/files/events/${event.id}/photos/${photo.id}`,
-      thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
-      source: photo.source,
-    },
+  const photoShape = {
+    photo_id: photo.id,
+    filename: photo.filename,
+    face_count: photo.faceCount,
+    createdAt: photo.createdAt,
+    url: `/files/events/${event.id}/photos/${photo.id}`,
+    thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+    source: photo.source,
   };
+  // So the public slideshow (guest.js's /:slug/live/stream) reflects every
+  // source landing during a live event, not just Shoots.
+  publishLiveEvent(event.id, { type: "photo_added", ...photoShape });
+
+  return { fileSize, facesFound: faces.length, photoId: photo.id, photo: photoShape };
 }
 
 /** Removes a Photo whose Drive source file is gone: its Face rows, its

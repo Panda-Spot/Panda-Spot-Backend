@@ -14,7 +14,7 @@ import { sendCollaboratorInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter } from "../lib/rateLimiters.js";
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
-import { subscribeLiveEvents } from "../lib/liveEvents.js";
+import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { extractFolderId, listImageFiles, testFolderAccess } from "../lib/googleDrive.js";
 import { processDriveImportJob, processDriveSyncJob } from "../lib/driveSync.js";
@@ -122,6 +122,9 @@ router.get("/:id", async (req, res, next) => {
     const photoCount = await prisma.photo.count({ where: { eventId: event.id } });
     const storageUsedBytes = await eventStorageUsedBytes(prisma, event.id);
     const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+    const pendingGuestUploadCount = await prisma.photo.count({
+      where: { eventId: event.id, approvalStatus: "pending" },
+    });
 
     res.json({
       id: event.id,
@@ -146,6 +149,10 @@ router.get("/:id", async (req, res, next) => {
       drive_backup_enabled: event.driveBackupEnabled,
       drive_backup_available: isDriveBackupConfigured(),
       started: !!event.startedAt,
+      guest_upload_enabled: event.guestUploadEnabled,
+      pending_guest_upload_count: pendingGuestUploadCount,
+      guest_upload_link: `${PUBLIC_WEB_URL}/e/${event.guestSlug}/upload`,
+      slideshow_link: `${PUBLIC_WEB_URL}/e/${event.guestSlug}/slideshow`,
     });
   } catch (err) {
     next(err);
@@ -176,6 +183,32 @@ router.post("/:id/start", async (req, res, next) => {
     }
     const updated = await prisma.event.update({ where: { id: event.id }, data: { startedAt: new Date() } });
     res.json({ started: true, started_at: updated.startedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Opt-in toggle for guests uploading their own photos back into this event
+// via a dedicated link/QR (distinct from the search link). Owner or
+// collaborator, same access level as every other ingestion toggle on this
+// page. Requires the event to already be started, same as every other
+// photo-ingestion entry point.
+router.post("/:id/guest-uploads/toggle", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.startedAt) {
+      return res.status(400).json({ error: "Start this event before turning on guest uploads." });
+    }
+
+    const { enabled } = req.body || {};
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { guestUploadEnabled: !!enabled },
+    });
+    res.json({ guest_upload_enabled: updated.guestUploadEnabled });
   } catch (err) {
     next(err);
   }
@@ -278,6 +311,9 @@ async function processUploadJob(jobId, event, files) {
             thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
             source: photo.source,
           };
+          // So the public slideshow (guest.js's /:slug/live/stream) reflects
+          // every source landing during a live event, not just Shoots.
+          publishLiveEvent(event.id, { type: "photo_added", ...addedPhoto });
         }
       }
 
@@ -831,8 +867,77 @@ router.get("/:id/photos", async (req, res, next) => {
         url: `/files/events/${event.id}/photos/${p.id}`,
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
         source: p.source,
+        approval_status: p.approvalStatus,
       }))
     );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Approves a pending guest upload — makes it searchable and pushes it live
+// to anyone watching the slideshow, the same as any other photo landing.
+// Rejecting one isn't a separate status: the owner just uses the existing
+// DELETE route below, since a rejected guest photo was never really "in"
+// the gallery to begin with.
+router.post("/:id/photos/:photoId/approve", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+    if (photo.approvalStatus === "approved") {
+      return res.json({ ok: true, already_approved: true });
+    }
+
+    const updated = await prisma.photo.update({
+      where: { id: photo.id },
+      data: { approvalStatus: "approved" },
+    });
+
+    publishLiveEvent(event.id, {
+      type: "photo_added",
+      photo_id: updated.id,
+      filename: updated.filename,
+      face_count: updated.faceCount,
+      createdAt: updated.createdAt,
+      url: `/files/events/${event.id}/photos/${updated.id}`,
+      thumbnail_url: `/files/events/${event.id}/photos/${updated.id}/thumb`,
+    });
+    checkAndNotifyForNewPhotos(event, [updated.id]).catch((err) =>
+      console.error(`Guest alert check failed for approved guest upload ${updated.id}:`, err)
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Owner or collaborator — deletes one comment, e.g. for moderation. No
+// "hide" state — a deleted comment is just gone, same philosophy as photo
+// deletion elsewhere on this page.
+router.delete("/:id/photos/:photoId/comments/:commentId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const comment = await prisma.photoComment.findFirst({
+      where: { id: req.params.commentId, photoId: req.params.photoId, eventId: event.id },
+    });
+    if (!comment) {
+      return res.status(404).json({ error: "Comment not found" });
+    }
+
+    await prisma.photoComment.delete({ where: { id: comment.id } });
+    res.status(204).end();
   } catch (err) {
     next(err);
   }
