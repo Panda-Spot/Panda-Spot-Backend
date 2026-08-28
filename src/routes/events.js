@@ -16,9 +16,9 @@ import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter } from "../l
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
 import { subscribeLiveEvents } from "../lib/liveEvents.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
-import { extractFolderId, listImageFiles } from "../lib/googleDrive.js";
+import { extractFolderId, listImageFiles, testFolderAccess } from "../lib/googleDrive.js";
 import { processDriveImportJob, processDriveSyncJob } from "../lib/driveSync.js";
-import { countOwnedEvents, eventStorageUsedBytes, effectiveEventLimit, effectiveStorageLimitBytes } from "../lib/planLimits.js";
+import { countOwnedEvents, eventStorageUsedBytes, effectiveEventLimit, effectiveStorageLimitBytes, effectivePhotoRetentionDays } from "../lib/planLimits.js";
 import { computeExpiresAt } from "../lib/expiry.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { checkAndNotifyForNewPhotos } from "../lib/guestAlerts.js";
@@ -145,6 +145,7 @@ router.get("/:id", async (req, res, next) => {
       // not anything per-photographer.
       drive_backup_enabled: event.driveBackupEnabled,
       drive_backup_available: isDriveBackupConfigured(),
+      started: !!event.startedAt,
     });
   } catch (err) {
     next(err);
@@ -161,6 +162,24 @@ async function loadOwnedEvent(req, res) {
   }
   return event;
 }
+
+// Owner-only — a freshly-created event has no upload/import/PandaShoots UI
+// at all until this is called, so there's never any ambiguity about when a
+// photo's retention clock (Photo.originalExpiresAt) began. One-way: no
+// "unstart" action exists.
+router.post("/:id/start", async (req, res, next) => {
+  try {
+    const event = await loadOwnedEvent(req, res);
+    if (!event) return;
+    if (event.startedAt) {
+      return res.json({ started: true, started_at: event.startedAt });
+    }
+    const updated = await prisma.event.update({ where: { id: event.id }, data: { startedAt: new Date() } });
+    res.json({ started: true, started_at: updated.startedAt });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // Owner-only — deleting the whole event (guest link, every photo, every
 // collaborator) is a much bigger action than removing one bad photo.
@@ -231,6 +250,8 @@ async function processUploadJob(jobId, event, files) {
               thumbnailPath,
               faceCount: faces.length,
               fileSize: file.buffer.length,
+              source: "upload",
+              originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
             },
           });
 
@@ -296,6 +317,10 @@ router.post("/:id/photos", uploadLimiter, upload.array("files"), async (req, res
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
+
+    if (!event.startedAt) {
+      return res.status(400).json({ error: "Start this event before uploading photos." });
+    }
 
     const files = req.files || [];
     if (files.length === 0) {
@@ -372,11 +397,44 @@ router.get("/:id/uploads/:jobId/stream", async (req, res, next) => {
 // listing succeeds, the folder is saved on the event (auto-sync on by
 // default) and the actual downloads+face-detection happen in a background
 // job, mirroring POST /:id/photos.
+// Read-only pre-check for the "Connect folder" form — resolves the pasted
+// link to a folder, confirms it's actually reachable, and reports the
+// "anyone with the link" access level so the photographer can catch a
+// wrong link or an over/under-shared folder before committing to a full
+// import. Doesn't require the event to be started (nothing is ingested).
+router.post("/:id/drive/test-connection", driveImportLimiter, async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+
+    const { folder_url } = req.body || {};
+    let folderId;
+    try {
+      folderId = extractFolderId(folder_url);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    try {
+      const { folderName, role } = await testFolderAccess(folderId);
+      res.json({ accessible: true, folder_name: folderName, permission: role });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/:id/drive/connect", driveImportLimiter, async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
+
+    if (!event.startedAt) {
+      return res.status(400).json({ error: "Start this event before importing photos." });
+    }
 
     const { folder_url, confirm } = req.body || {};
     if (!confirm) {
@@ -425,6 +483,9 @@ router.post("/:id/drive/sync", driveImportLimiter, async (req, res, next) => {
     if (!accessible) return;
     const { event } = accessible;
 
+    if (!event.startedAt) {
+      return res.status(400).json({ error: "Start this event before syncing photos." });
+    }
     if (!event.driveFolderId) {
       return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
     }
@@ -511,6 +572,10 @@ router.post("/:id/shoots/credentials", shootsCredentialLimiter, async (req, res,
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
+
+    if (!event.startedAt) {
+      return res.status(400).json({ error: "Start this event before setting up camera upload." });
+    }
 
     const { username, password } = generateShootsCredentials();
     const updated = await prisma.event.update({
@@ -744,6 +809,7 @@ router.get("/:id/photos", async (req, res, next) => {
         createdAt: p.createdAt,
         url: `/files/events/${event.id}/photos/${p.id}`,
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
+        source: p.source,
       }))
     );
   } catch (err) {

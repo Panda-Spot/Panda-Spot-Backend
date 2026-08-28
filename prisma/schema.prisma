@@ -49,6 +49,11 @@ model User {
   /// a generous override (e.g. 100GB) overflows Postgres's 32-bit integer.
   customEventLimit        Int?
   customStorageLimitBytes BigInt?
+  /// Admin override of DEFAULT_PHOTO_RETENTION_DAYS (lib/planLimits.js) —
+  /// how many days this client's photo originals stay on the server before
+  /// lib/photoRetention.js deletes just the full-res file (thumbnail +
+  /// search data are never touched by this). Null means "use the default".
+  customPhotoRetentionDays Int?
 }
 
 /// A single-use, time-limited token emailed to confirm account ownership.
@@ -103,6 +108,13 @@ model Event {
   collaborators EventCollaborator[]
   invites       EventInvite[]
   alertSubscriptions GuestAlertSubscription[]
+
+  /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
+  /// — a freshly-created event has no upload/import/PandaShoots UI at all
+  /// until this is set, so there's never any ambiguity about when a
+  /// photo's retention clock (Photo.originalExpiresAt) began. Existing
+  /// events were grandfathered in as already-started at migration time.
+  startedAt DateTime?
 
   /// Google Drive folder connected for this event's photo sync — set once
   /// the photographer confirms the initial import. See lib/driveSync.js.
@@ -226,6 +238,22 @@ model Photo {
   /// capture that goes straight to Drive, or at backup-existing run time
   /// otherwise. Null until platformDriveBackup is first set true.
   driveBackupStartedAt DateTime?
+
+  /// How this photo arrived — "upload" (direct browser upload), "shoots"
+  /// (PandaShoots FTP capture), or "drive_import". Set once at creation and
+  /// never changed — storagePath/driveFileId get mutated by the retention
+  /// sweeps over a photo's life, so they can't reliably answer "how did
+  /// this arrive" later; this can. Powers the gallery's source filter.
+  source String @default("upload")
+  /// The platform-wide default-retention policy's clock (distinct from
+  /// driveBackupStartedAt/platformDriveBackup above, which is Drive
+  /// backup's own separate, stricter lifecycle) — see
+  /// lib/photoRetention.js. Null for a photo with no local original to
+  /// expire (a Drive import, or one already opted into Drive backup).
+  /// Once past, the sweep deletes just the local file (storagePath -> null)
+  /// and leaves the thumbnail/Face rows/Photo row alone — search keeps
+  /// working forever, only the full-res download goes away.
+  originalExpiresAt DateTime?
 }
 
 /// Face rows are inserted/queried via raw SQL because the `embedding` column

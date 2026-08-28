@@ -57,6 +57,53 @@ export async function listImageFiles(folderId) {
   return files;
 }
 
+/**
+ * Verifies a folder link is actually reachable before committing to a full
+ * connect/import — checks it resolves to a folder (not a file), and, best
+ * effort, what access level the "anyone with the link" share grants.
+ * Permission visibility isn't guaranteed for an unauthenticated API-key
+ * request (Drive can decline to return `permissions` for anonymous
+ * callers even though the folder itself is readable), so a missing role
+ * is reported as null rather than treated as a failure.
+ */
+export async function testFolderAccess(folderId) {
+  ensureConfigured();
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${folderId}`);
+  url.searchParams.set("fields", "id,name,mimeType");
+  url.searchParams.set("key", DRIVE_API_KEY);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    if (res.status === 403 || res.status === 404) {
+      throw new Error(
+        "Couldn't access that Google Drive folder — make sure it's shared as \"Anyone with the link can view\"."
+      );
+    }
+    throw new Error(`Google Drive API error (${res.status})`);
+  }
+  const data = await res.json();
+  if (data.mimeType !== "application/vnd.google-apps.folder") {
+    throw new Error("That link points to a file, not a folder — paste the folder's share link instead.");
+  }
+
+  let role = null;
+  try {
+    const permUrl = new URL(`https://www.googleapis.com/drive/v3/files/${folderId}`);
+    permUrl.searchParams.set("fields", "permissions(type,role)");
+    permUrl.searchParams.set("key", DRIVE_API_KEY);
+    const permRes = await fetch(permUrl);
+    if (permRes.ok) {
+      const permData = await permRes.json();
+      const anyonePermission = (permData.permissions || []).find((p) => p.type === "anyone");
+      role = anyonePermission?.role || null;
+    }
+  } catch {
+    // Best-effort only — folder access already confirmed above.
+  }
+
+  return { folderName: data.name, role };
+}
+
 /** Downloads one Drive file's raw bytes as a Buffer. */
 export async function downloadFile(fileId) {
   ensureConfigured();

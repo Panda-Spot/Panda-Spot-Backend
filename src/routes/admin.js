@@ -5,7 +5,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/admin.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
-import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES } from "../lib/planLimits.js";
+import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, DEFAULT_PHOTO_RETENTION_DAYS } from "../lib/planLimits.js";
 import { sendEmailVerificationEmail } from "../lib/mailer.js";
 import { getDriveAccountQuota } from "../lib/driveBackup.js";
 
@@ -82,6 +82,7 @@ function serializeUserRow(user) {
     storage_used_bytes: storageUsed,
     custom_event_limit: user.customEventLimit,
     custom_storage_limit_bytes: user.customStorageLimitBytes != null ? Number(user.customStorageLimitBytes) : null,
+    custom_photo_retention_days: user.customPhotoRetentionDays,
   };
 }
 
@@ -162,8 +163,10 @@ router.get("/users/:id", async (req, res, next) => {
       created_at: user.createdAt,
       custom_event_limit: user.customEventLimit,
       custom_storage_limit_bytes: user.customStorageLimitBytes != null ? Number(user.customStorageLimitBytes) : null,
+      custom_photo_retention_days: user.customPhotoRetentionDays,
       default_event_limit: FREE_EVENT_LIMIT,
       default_storage_limit_bytes: FREE_EVENT_STORAGE_BYTES,
+      default_photo_retention_days: DEFAULT_PHOTO_RETENTION_DAYS,
       events,
       collaborates_on: user.collaboratesOn.map((c) => ({
         event_id: c.event.id,
@@ -207,12 +210,19 @@ router.post("/users/:id/limits", async (req, res, next) => {
     const user = await prisma.user.findUnique({ where: { id: req.params.id } });
     if (!user) return res.status(404).json({ error: "Client not found" });
 
-    const { event_limit: eventLimit, storage_limit_bytes: storageLimitBytes } = req.body || {};
+    const {
+      event_limit: eventLimit,
+      storage_limit_bytes: storageLimitBytes,
+      photo_retention_days: photoRetentionDays,
+    } = req.body || {};
     if (eventLimit != null && (!Number.isInteger(eventLimit) || eventLimit < 1)) {
       return res.status(400).json({ error: "event_limit must be a positive integer, or null to reset to default" });
     }
     if (storageLimitBytes != null && (!Number.isFinite(storageLimitBytes) || storageLimitBytes < 1)) {
       return res.status(400).json({ error: "storage_limit_bytes must be a positive number, or null to reset to default" });
+    }
+    if (photoRetentionDays != null && (!Number.isInteger(photoRetentionDays) || photoRetentionDays < 1)) {
+      return res.status(400).json({ error: "photo_retention_days must be a positive integer, or null to reset to default" });
     }
 
     const updated = await prisma.user.update({
@@ -220,12 +230,14 @@ router.post("/users/:id/limits", async (req, res, next) => {
       data: {
         customEventLimit: eventLimit ?? null,
         customStorageLimitBytes: storageLimitBytes != null ? BigInt(Math.round(storageLimitBytes)) : null,
+        customPhotoRetentionDays: photoRetentionDays ?? null,
       },
     });
 
     res.json({
       ok: true,
       custom_event_limit: updated.customEventLimit,
+      custom_photo_retention_days: updated.customPhotoRetentionDays,
       custom_storage_limit_bytes: updated.customStorageLimitBytes != null ? Number(updated.customStorageLimitBytes) : null,
     });
   } catch (err) {
@@ -360,6 +372,15 @@ router.get("/events/:id", async (req, res, next) => {
     if (!event) return res.status(404).json({ error: "Event not found" });
 
     const storageAgg = await prisma.photo.aggregate({ where: { eventId: event.id }, _sum: { fileSize: true } });
+    const sourceCounts = await prisma.photo.groupBy({
+      by: ["source"],
+      where: { eventId: event.id },
+      _count: true,
+    });
+    const photoSourceCounts = { upload: 0, shoots: 0, drive_import: 0 };
+    for (const row of sourceCounts) {
+      photoSourceCounts[row.source] = row._count;
+    }
 
     res.json({
       id: event.id,
@@ -367,9 +388,11 @@ router.get("/events/:id", async (req, res, next) => {
       guest_slug: event.guestSlug,
       owner: { id: event.owner.id, name: event.owner.name, email: event.owner.email },
       photo_count: event._count.photos,
+      photo_source_counts: photoSourceCounts,
       storage_used_bytes: storageAgg._sum.fileSize || 0,
       created_at: event.createdAt,
       expires_at: event.expiresAt,
+      started: !!event.startedAt,
       drive_folder_url: event.driveFolderUrl,
       drive_sync_enabled: event.driveSyncEnabled,
       shoots_connected: !!event.ftpUsername,

@@ -6,7 +6,7 @@ import { insertFace } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
 import { ALLOWED_EXTENSIONS, saveEventShootsPhoto } from "./storage.js";
 import { contentMatchesExtension } from "./fileValidation.js";
-import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.js";
+import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetentionDays } from "./planLimits.js";
 import { publishLiveEvent } from "./liveEvents.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 import { uploadToDriveFolder, MIME_BY_EXT } from "./driveBackup.js";
@@ -93,6 +93,13 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       driveBackupStartedAt: platformDriveBackup ? new Date() : null,
       faceCount: faces.length,
       fileSize: buffer.length,
+      source: "shoots",
+      // Only the platform's global default-retention clock — Drive-backed
+      // captures are governed by driveBackupStartedAt/platformDriveBackup
+      // above instead (a separate, stricter lifecycle).
+      originalExpiresAt: storagePath
+        ? new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000)
+        : null,
     },
   });
 

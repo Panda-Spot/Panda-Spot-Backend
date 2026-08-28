@@ -42,7 +42,9 @@ router.get("/events/:eventId/photos/:photoId", async (req, res, next) => {
         });
       }
     }
-    return res.status(404).json({ error: "Photo file missing on disk" });
+    return res.status(404).json({
+      error: "This photo's original has expired and is no longer available for download — search still works.",
+    });
   } catch (err) {
     next(err);
   }

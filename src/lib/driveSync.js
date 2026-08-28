@@ -59,6 +59,10 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes) 
       thumbnailPath,
       faceCount: faces.length,
       fileSize,
+      source: "drive_import",
+      // No local original to expire — full-res is always fetched from
+      // Drive live on demand, see lib/googleDrive.js.
+      originalExpiresAt: null,
     },
   });
 

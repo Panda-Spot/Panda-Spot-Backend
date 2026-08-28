@@ -13,6 +13,7 @@ import adminRoutes from "./routes/admin.js";
 import { startAutoSyncScheduler } from "./lib/driveSync.js";
 import { startShootsServer } from "./lib/ftpShoots.js";
 import { startDriveBackupRetentionScheduler } from "./lib/driveBackupRetention.js";
+import { startPhotoRetentionScheduler } from "./lib/photoRetention.js";
 
 const app = express();
 
@@ -61,4 +62,5 @@ app.listen(PORT, () => {
   startAutoSyncScheduler();
   startShootsServer();
   startDriveBackupRetentionScheduler();
+  startPhotoRetentionScheduler();
 });
