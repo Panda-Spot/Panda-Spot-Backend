@@ -717,8 +717,18 @@ router.post("/:id/drive-backup/backup-existing", driveImportLimiter, async (req,
       return res.status(403).json({ error: "Drive backup is a beta feature — this account isn't on the beta list yet." });
     }
 
+    const { source } = req.body || {};
+    if (source != null && source !== "upload" && source !== "shoots") {
+      return res.status(400).json({ error: "source must be 'upload', 'shoots', or omitted for all sources." });
+    }
+
     const photos = await prisma.photo.findMany({
-      where: { eventId: event.id, storagePath: { not: null }, platformDriveBackup: false },
+      where: {
+        eventId: event.id,
+        storagePath: { not: null },
+        platformDriveBackup: false,
+        ...(source ? { source } : {}),
+      },
     });
 
     const { id: jobId } = createJob();
