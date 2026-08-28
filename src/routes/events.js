@@ -218,6 +218,7 @@ async function processUploadJob(jobId, event, files) {
   try {
     for (const file of files) {
       const ext = path.extname(file.originalname).toLowerCase();
+      let addedPhoto = null;
 
       if (!ALLOWED_EXTENSIONS.has(ext)) {
         skipped.push(`${file.originalname} (unsupported file type)`);
@@ -268,6 +269,15 @@ async function processUploadJob(jobId, event, files) {
           facesFoundSoFar += faces.length;
           usedBytes += file.buffer.length;
           newPhotoIds.push(photo.id);
+          addedPhoto = {
+            photo_id: photo.id,
+            filename: photo.filename,
+            face_count: photo.faceCount,
+            createdAt: photo.createdAt,
+            url: `/files/events/${event.id}/photos/${photo.id}`,
+            thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+            source: photo.source,
+          };
         }
       }
 
@@ -288,6 +298,7 @@ async function processUploadJob(jobId, event, files) {
         eta_seconds: etaSeconds,
         faces_found_so_far: facesFoundSoFar,
         skipped_so_far: skipped,
+        photo: addedPhoto,
       });
     }
 

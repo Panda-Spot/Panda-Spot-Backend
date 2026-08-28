@@ -77,7 +77,20 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes) 
   }
 
   usedBytesRef.value += fileSize;
-  return { fileSize, facesFound: faces.length, photoId: photo.id };
+  return {
+    fileSize,
+    facesFound: faces.length,
+    photoId: photo.id,
+    photo: {
+      photo_id: photo.id,
+      filename: photo.filename,
+      face_count: photo.faceCount,
+      createdAt: photo.createdAt,
+      url: `/files/events/${event.id}/photos/${photo.id}`,
+      thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+      source: photo.source,
+    },
+  };
 }
 
 /** Removes a Photo whose Drive source file is gone: its Face rows, its
@@ -88,7 +101,7 @@ async function removePhoto(photo) {
   await deleteFileIfExists(photo.thumbnailPath);
 }
 
-function emitProgress(jobId, { total, completed, currentFile, startedAt, facesFoundSoFar, skipped }) {
+function emitProgress(jobId, { total, completed, currentFile, startedAt, facesFoundSoFar, skipped, photo }) {
   const elapsedSeconds = (Date.now() - startedAt) / 1000;
   const photosPerSecond = elapsedSeconds > 0 ? completed / elapsedSeconds : 0;
   const etaSeconds = photosPerSecond > 0 ? Math.round((total - completed) / photosPerSecond) : null;
@@ -102,6 +115,7 @@ function emitProgress(jobId, { total, completed, currentFile, startedAt, facesFo
     eta_seconds: etaSeconds,
     faces_found_so_far: facesFoundSoFar,
     skipped_so_far: skipped,
+    photo: photo || null,
   });
 }
 
@@ -131,7 +145,7 @@ export async function processDriveImportJob(jobId, event, files) {
       }
 
       completed += 1;
-      emitProgress(jobId, { total, completed, currentFile: file.name, startedAt, facesFoundSoFar, skipped });
+      emitProgress(jobId, { total, completed, currentFile: file.name, startedAt, facesFoundSoFar, skipped, photo: result.photo });
     }
 
     await prisma.event.update({ where: { id: event.id }, data: { lastDriveSyncAt: new Date() } });
@@ -195,7 +209,7 @@ export async function processDriveSyncJob(jobId, event, currentFiles) {
         newPhotoIds.push(result.photoId);
       }
       completed += 1;
-      emitProgress(jobId, { total, completed, currentFile: file.name, startedAt, facesFoundSoFar, skipped });
+      emitProgress(jobId, { total, completed, currentFile: file.name, startedAt, facesFoundSoFar, skipped, photo: result.photo });
     }
 
     for (const photo of removedPhotos) {
