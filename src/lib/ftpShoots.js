@@ -24,12 +24,33 @@ function stagingDirFor(eventId) {
   return path.join(stagingRoot(), eventId);
 }
 
+// Excludes 0/1/i/l/o — the letters/digits people most often mistype when
+// keying a code in one character at a time on a camera's tiny on-screen
+// keyboard, which is exactly how these get entered.
+const SAFE_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
+
+function randomSafeString(length) {
+  const bytes = randomBytes(length);
+  let out = "";
+  for (let i = 0; i < length; i++) {
+    out += SAFE_ALPHABET[bytes[i] % SAFE_ALPHABET.length];
+  }
+  return out;
+}
+
 /** Generates a fresh, unique username + random password for Shoots. Called
- * once per event (on first setup) or again on demand (regenerate). */
+ * once per event (on first setup) or again on demand (regenerate). Short
+ * and restricted to an unambiguous alphabet on purpose — these get typed
+ * by hand into a camera's FTP settings menu, often via a D-pad, so length
+ * and easily-confused characters are real usability costs, not just
+ * cosmetic. 6 chars of username entropy (31^6, ~887M combinations) and 10
+ * of password (31^10, ~8x10^14) is plenty for a short-lived, scoped,
+ * write-only credential — the call site also retries on the rare unique-
+ * constraint collision. */
 export function generateShootsCredentials() {
   return {
-    username: `evt_${randomBytes(6).toString("hex")}`,
-    password: randomBytes(9).toString("base64url"),
+    username: `evt${randomSafeString(6)}`,
+    password: randomSafeString(10),
   };
 }
 

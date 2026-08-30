@@ -2,6 +2,7 @@ import { Router } from "express";
 import { randomUUID, randomBytes } from "node:crypto";
 import path from "node:path";
 import fsp from "node:fs/promises";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
@@ -715,11 +716,24 @@ router.post("/:id/shoots/credentials", shootsCredentialLimiter, async (req, res,
       return res.status(400).json({ error: "Start this event before setting up camera upload." });
     }
 
-    const { username, password } = generateShootsCredentials();
-    const updated = await prisma.event.update({
-      where: { id: event.id },
-      data: { ftpUsername: username, ftpPassword: password },
-    });
+    // The shortened, human-typeable username alphabet (see
+    // generateShootsCredentials) makes a unique-constraint collision far
+    // less astronomically unlikely than a long hex string — still rare,
+    // but worth a few retries instead of surfacing a 500 to the owner.
+    let updated;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { username, password } = generateShootsCredentials();
+      try {
+        updated = await prisma.event.update({
+          where: { id: event.id },
+          data: { ftpUsername: username, ftpPassword: password },
+        });
+        break;
+      } catch (err) {
+        const isUsernameCollision = err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
+        if (!isUsernameCollision || attempt === 4) throw err;
+      }
+    }
 
     res.json({ connected: true, ...shootsCredentialsResponse(updated) });
   } catch (err) {
