@@ -1,12 +1,13 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomInt } from "node:crypto";
 import { FtpSrv } from "ftp-srv";
 import chokidar from "chokidar";
 import { prisma } from "./prisma.js";
 import { storageRoot } from "./storage.js";
 import { ingestCapturedFile } from "./captureIngest.js";
+import { SHOOTS_WORDLIST } from "./wordlist.js";
 
 const FTP_PORT = parseInt(process.env.FTP_PORT, 10) || 2121;
 const FTP_PASV_MIN = parseInt(process.env.FTP_PASV_MIN, 10) || 30100;
@@ -24,33 +25,27 @@ function stagingDirFor(eventId) {
   return path.join(stagingRoot(), eventId);
 }
 
-// Excludes 0/1/i/l/o — the letters/digits people most often mistype when
-// keying a code in one character at a time on a camera's tiny on-screen
-// keyboard, which is exactly how these get entered.
-const SAFE_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
-
-function randomSafeString(length) {
-  const bytes = randomBytes(length);
-  let out = "";
-  for (let i = 0; i < length; i++) {
-    out += SAFE_ALPHABET[bytes[i] % SAFE_ALPHABET.length];
-  }
-  return out;
+function randomWord() {
+  return SHOOTS_WORDLIST[randomInt(SHOOTS_WORDLIST.length)];
 }
 
-/** Generates a fresh, unique username + random password for Shoots. Called
- * once per event (on first setup) or again on demand (regenerate). Short
- * and restricted to an unambiguous alphabet on purpose — these get typed
- * by hand into a camera's FTP settings menu, often via a D-pad, so length
- * and easily-confused characters are real usability costs, not just
- * cosmetic. 6 chars of username entropy (31^6, ~887M combinations) and 10
- * of password (31^10, ~8x10^14) is plenty for a short-lived, scoped,
- * write-only credential — the call site also retries on the rare unique-
- * constraint collision. */
+function threeWordCombo() {
+  return `${randomWord()}-${randomWord()}-${randomWord()}`;
+}
+
+/** Generates a fresh, unique username + random password for Shoots, each a
+ * 3-word combination (e.g. "tiger-lemon-cloud") from a curated,
+ * unambiguous wordlist (see wordlist.js) — actually readable and typeable
+ * on a camera's tiny on-screen keyboard, and easy to read aloud or text to
+ * an assistant, unlike an opaque random string. Called once per event (on
+ * first setup) or again on demand (regenerate). 1296 words gives
+ * 1296^3 ≈ 2.2 billion combinations per field — plenty for a short-lived,
+ * scoped, write-only credential; the call site also retries on the rare
+ * unique-username collision. */
 export function generateShootsCredentials() {
   return {
-    username: `evt${randomSafeString(6)}`,
-    password: randomSafeString(10),
+    username: threeWordCombo(),
+    password: threeWordCombo(),
   };
 }
 
