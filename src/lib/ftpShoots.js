@@ -29,23 +29,22 @@ function randomWord() {
   return SHOOTS_WORDLIST[randomInt(SHOOTS_WORDLIST.length)];
 }
 
-function threeWordCombo() {
-  return `${randomWord()}-${randomWord()}-${randomWord()}`;
+function twoWordCombo() {
+  return `${randomWord()}-${randomWord()}`;
 }
 
 /** Generates a fresh, unique username + random password for Shoots, each a
- * 3-word combination (e.g. "tiger-lemon-cloud") from a curated,
- * unambiguous wordlist (see wordlist.js) — actually readable and typeable
- * on a camera's tiny on-screen keyboard, and easy to read aloud or text to
- * an assistant, unlike an opaque random string. Called once per event (on
+ * 2-word combination (e.g. "tiger-lemon") from a curated, unambiguous
+ * wordlist (see wordlist.js) — actually readable and typeable on a
+ * camera's tiny on-screen keyboard, and easy to read aloud or text to an
+ * assistant, unlike an opaque random string. Called once per event (on
  * first setup) or again on demand (regenerate). 1296 words gives
- * 1296^3 ≈ 2.2 billion combinations per field — plenty for a short-lived,
- * scoped, write-only credential; the call site also retries on the rare
- * unique-username collision. */
+ * 1296^2 ≈ 1.68 million combinations per field — the call site retries on
+ * the (now more plausible, still uncommon) unique-username collision. */
 export function generateShootsCredentials() {
   return {
-    username: threeWordCombo(),
-    password: threeWordCombo(),
+    username: twoWordCombo(),
+    password: twoWordCombo(),
   };
 }
 
