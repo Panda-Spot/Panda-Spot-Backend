@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
 import { computeItemsTotal, computePayable, claimNextNumber } from "../lib/billingAccess.js";
+import { streamBillPdf, streamQuotationPdf, streamReceiptPdf } from "../lib/billingPdf.js";
 
 const router = Router();
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -141,6 +142,20 @@ router.get("/quotations/:id", async (req, res, next) => {
   }
 });
 
+router.get("/quotations/:id/pdf", async (req, res, next) => {
+  try {
+    const quotation = await prisma.quotation.findFirst({
+      where: { id: req.params.id, tenantId: req.user.id },
+      include: { items: { orderBy: { createdAt: "asc" } }, client: true, tenant: true },
+    });
+    if (!quotation) return res.status(404).json({ error: "Quotation not found" });
+    const settings = await prisma.tenantBillingSettings.findUnique({ where: { tenantId: req.user.id } });
+    return streamQuotationPdf(res, { tenant: quotation.tenant, settings, quotation });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.patch("/quotations/:id", async (req, res, next) => {
   try {
     const quotation = await prisma.quotation.findFirst({ where: { id: req.params.id, tenantId: req.user.id } });
@@ -254,6 +269,60 @@ router.get("/bills/:id", async (req, res, next) => {
     });
     if (!bill) return res.status(404).json({ error: "Bill not found" });
     res.json(serializeBill(bill));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/bills/:id/pdf", async (req, res, next) => {
+  try {
+    const bill = await prisma.bill.findFirst({
+      where: { id: req.params.id, tenantId: req.user.id },
+      include: {
+        items: { orderBy: { createdAt: "asc" } },
+        client: true,
+        tenant: true,
+        payments: { orderBy: { receiptNumber: "asc" } },
+      },
+    });
+    if (!bill) return res.status(404).json({ error: "Bill not found" });
+    const settings = await prisma.tenantBillingSettings.findUnique({ where: { tenantId: req.user.id } });
+    return streamBillPdf(res, { tenant: bill.tenant, settings, bill });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/payments/:receiptNumber/pdf", async (req, res, next) => {
+  try {
+    const receiptNumber = Number(req.params.receiptNumber);
+    if (!Number.isInteger(receiptNumber) || receiptNumber < 1) {
+      return res.status(400).json({ error: "Invalid receipt number" });
+    }
+
+    const payment = await prisma.payment.findFirst({
+      where: { tenantId: req.user.id, receiptNumber },
+      include: {
+        tenant: true,
+        bill: {
+          include: {
+            client: true,
+            items: true,
+            payments: { orderBy: { receiptNumber: "asc" } },
+          },
+        },
+      },
+    });
+    if (!payment) return res.status(404).json({ error: "Receipt not found" });
+
+    const payable = computePayable(payment.bill.items || [], payment.bill.discountAmount);
+    const paidThroughThis = payment.bill.payments
+      .filter((p) => p.receiptNumber <= payment.receiptNumber)
+      .reduce((sum, p) => sum + Number(p.amount), 0);
+    const balanceAfter = Math.max(0, payable - paidThroughThis);
+    const settings = await prisma.tenantBillingSettings.findUnique({ where: { tenantId: req.user.id } });
+
+    return streamReceiptPdf(res, { tenant: payment.tenant, settings, payment, bill: payment.bill, balanceAfter });
   } catch (err) {
     next(err);
   }
