@@ -37,6 +37,15 @@ function generateTempPassword() {
   return out;
 }
 
+function normalizeWatermarkIntensity(value) {
+  if (value == null || value === "") return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    throw Object.assign(new Error("watermark_intensity must be between 0 and 1"), { status: 400 });
+  }
+  return n;
+}
+
 function normalizeOptionalFutureDate(value, fieldName) {
   if (value == null || value === "") return null;
   const date = new Date(value);
@@ -402,6 +411,9 @@ router.get("/users/:id", async (req, res, next) => {
       email_verified: !!user.emailVerifiedAt,
       is_suspended: !!user.suspendedAt,
       created_at: user.createdAt,
+      studio_name: user.studioName,
+      brand_color: user.brandColor,
+      watermark_intensity: user.watermarkIntensity ?? 0.75,
       custom_event_limit: user.customEventLimit,
       custom_storage_limit_bytes: user.customStorageLimitBytes != null ? Number(user.customStorageLimitBytes) : null,
       custom_photo_retention_days: user.customPhotoRetentionDays,
@@ -414,6 +426,33 @@ router.get("/users/:id", async (req, res, next) => {
         event_name: c.event.name,
         owner_email: c.event.owner.email,
       })),
+    });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.patch("/users/:id/branding", async (req, res, next) => {
+  try {
+    const user = await requireStudioUser(req.params.id, res);
+    if (!user) return;
+
+    const normalizedWatermarkIntensity = normalizeWatermarkIntensity(req.body?.watermark_intensity);
+    if (normalizedWatermarkIntensity === undefined) {
+      return res.status(400).json({ error: "watermark_intensity is required" });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: { watermarkIntensity: normalizedWatermarkIntensity },
+    });
+
+    res.json({
+      id: updated.id,
+      studio_name: updated.studioName,
+      brand_color: updated.brandColor,
+      watermark_intensity: updated.watermarkIntensity ?? 0.75,
     });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message });
