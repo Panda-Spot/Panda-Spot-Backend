@@ -29,18 +29,31 @@ const app = express();
 // uploads, guest search/download/feedback) in production.
 app.set("trust proxy", 1);
 
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:5173",
-    credentials: true,
-    // Without this, the `cors` package never sets Access-Control-Max-Age,
-    // so browsers cache nothing and re-run a full OPTIONS preflight for
-    // every single cross-site request — visible in devtools as a wall of
-    // slow "preflight" rows. 24h (browsers clamp to their own real max —
-    // Chromium caps at 2h, Firefox at 24h — so this just asks for the max).
-    maxAge: 86400,
-  })
-);
+const configuredOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (configuredOrigins.includes(origin) || configuredOrigins.includes("*")) {
+      return callback(null, true);
+    }
+    // Allow any localhost / 127.0.0.1 port for local development & testing
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      return callback(null, true);
+    }
+    callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  maxAge: 86400,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(cookieParser());
 app.use(express.json());
 

@@ -433,6 +433,67 @@ router.get("/users/:id", async (req, res, next) => {
   }
 });
 
+router.get("/users/:id/photos", async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.params.id },
+      include: {
+        events: { select: { id: true } },
+        collaboratesOn: { select: { eventId: true } },
+        eventAccess: { select: { eventId: true } },
+      },
+    });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const ownedEventIds = user.events.map((e) => e.id);
+    const collabEventIds = user.collaboratesOn.map((c) => c.eventId);
+    const clientEventIds = user.eventAccess.map((m) => m.eventId);
+    const allEventIds = [...new Set([...ownedEventIds, ...collabEventIds, ...clientEventIds])];
+
+    const photos = await prisma.photo.findMany({
+      where: { eventId: { in: allEventIds } },
+      orderBy: { createdAt: "desc" },
+      take: 300,
+      include: {
+        event: { select: { id: true, name: true } },
+        _count: {
+          select: {
+            clientFavourites: true,
+            studioFavourites: true,
+            likes: true,
+            comments: true,
+          },
+        },
+      },
+    });
+
+    res.json(
+      photos.map((p) => ({
+        photo_id: p.id,
+        event_id: p.eventId,
+        event_name: p.event?.name,
+        filename: p.filename,
+        face_count: p.faceCount,
+        created_at: p.createdAt,
+        url: `/files/events/${p.eventId}/photos/${p.id}`,
+        thumbnail_url: `/files/events/${p.eventId}/photos/${p.id}/thumb`,
+        source: p.source || "upload",
+        approval_status: p.approvalStatus,
+        moderation_flagged: p.moderationFlagged,
+        face_search_visible: p.faceSearchVisible,
+        photo_selection_visible: p.photoSelectionVisible,
+        uploaded_by_guest_client_id: p.uploadedByGuestClientId,
+        client_favourites_count: p._count.clientFavourites,
+        studio_favourites_count: p._count.studioFavourites,
+        likes_count: p._count.likes,
+        comments_count: p._count.comments,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.patch("/users/:id/branding", async (req, res, next) => {
   try {
     const user = await requireStudioUser(req.params.id, res);
@@ -825,6 +886,53 @@ router.get("/events/:id", async (req, res, next) => {
       drive_backup_enabled: event.driveBackupEnabled,
       collaborators: event.collaborators.map((c) => ({ id: c.user.id, name: c.user.name, email: c.user.email })),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/events/:id/photos", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+
+    const photos = await prisma.photo.findMany({
+      where: { eventId: event.id },
+      orderBy: { createdAt: "desc" },
+      include: {
+        _count: {
+          select: {
+            clientFavourites: true,
+            studioFavourites: true,
+            likes: true,
+            comments: true,
+          },
+        },
+      },
+    });
+
+    res.json(
+      photos.map((p) => ({
+        photo_id: p.id,
+        event_id: p.eventId,
+        filename: p.filename,
+        face_count: p.faceCount,
+        file_size: p.fileSize,
+        created_at: p.createdAt,
+        url: `/files/events/${event.id}/photos/${p.id}`,
+        thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
+        source: p.source || "upload",
+        approval_status: p.approvalStatus,
+        moderation_flagged: p.moderationFlagged,
+        face_search_visible: p.faceSearchVisible,
+        photo_selection_visible: p.photoSelectionVisible,
+        uploaded_by_guest_client_id: p.uploadedByGuestClientId,
+        client_favourites_count: p._count.clientFavourites,
+        studio_favourites_count: p._count.studioFavourites,
+        likes_count: p._count.likes,
+        comments_count: p._count.comments,
+      }))
+    );
   } catch (err) {
     next(err);
   }

@@ -13,6 +13,9 @@ export async function loadAccessibleEvent(req, res) {
     res.status(404).json({ error: "Event not found" });
     return null;
   }
+  if (req.user?.role === "SUPER_ADMIN") {
+    return { event, role: "owner" };
+  }
   if (event.ownerId === req.user.id) {
     return { event, role: "owner" };
   }
