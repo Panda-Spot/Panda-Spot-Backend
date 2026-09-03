@@ -1,8 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { prisma } from "./prisma.js";
-import { detectFaces } from "./faceEngine.js";
-import { insertFace } from "./faces.js";
+import { detectFacesForPhoto, replacePhotoFaces } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
 import { ALLOWED_EXTENSIONS } from "./storage.js";
 import { getStorageProvider } from "./storageProvider.js";
@@ -11,7 +10,7 @@ import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetent
 import { publishLiveEvent } from "./liveEvents.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 import { uploadToDriveFolder, MIME_BY_EXT } from "./driveBackup.js";
-import { assertQuotaAvailable, consumeQuota } from "./subscriptionAccess.js";
+import { assertQuotaAvailable, consumeAiPhotoCredits, consumeQuota } from "./subscriptionAccess.js";
 
 /**
  * Runs one already-on-disk file (from Shoots' FTP staging area — see
@@ -53,16 +52,17 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
     return skip(event.id, originalFilename, "event storage limit reached");
   }
 
-  let detection;
+  let faces = [];
   try {
-    detection = await detectFaces(buffer, originalFilename);
+    if (event.faceSearchEnabled) {
+      faces = await detectFacesForPhoto(buffer, originalFilename);
+    }
   } catch (err) {
     return skip(event.id, originalFilename, err.isFaceEngineError ? err.message : "could not process image");
   }
 
   const photoId = randomUUID();
   const thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
-  const faces = detection.faces || [];
 
   let storagePath = null;
   let driveFileId = null;
@@ -101,6 +101,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       faceCount: faces.length,
       fileSize: buffer.length,
       source: "shoots",
+      faceSearchVisible: event.faceSearchEnabled,
       // Only the platform's global default-retention clock — Drive-backed
       // captures are governed by driveBackupStartedAt/platformDriveBackup
       // above instead (a separate, stricter lifecycle).
@@ -110,14 +111,9 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
     },
   });
 
-  for (const face of faces) {
-    await insertFace({
-      photoId: photo.id,
-      eventId: event.id,
-      bbox: face.bbox,
-      embedding: face.embedding,
-      detScore: face.det_score,
-    });
+  if (event.faceSearchEnabled) {
+    await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces });
+    await consumeAiPhotoCredits(event.ownerId);
   }
 
   await consumeQuota(event.ownerId);

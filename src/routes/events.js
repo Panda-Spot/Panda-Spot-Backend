@@ -8,8 +8,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
 import { ALLOWED_EXTENSIONS, deleteFileIfExists } from "../lib/storage.js";
 import { getStorageProvider } from "../lib/storageProvider.js";
-import { detectFaces } from "../lib/faceEngine.js";
-import { insertFace } from "../lib/faces.js";
+import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { loadAccessibleEvent } from "../lib/access.js";
 import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
@@ -28,7 +27,7 @@ import { isDriveBackupConfigured, isDriveBackupBetaUser } from "../lib/driveBack
 import { reclaimEventDriveBackups } from "../lib/driveBackupRetention.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
 import { uploadToDriveFolder, MIME_BY_EXT } from "../lib/driveBackup.js";
-import { assertQuotaAvailable, consumeQuota } from "../lib/subscriptionAccess.js";
+import { assertQuotaAvailable, consumeAiPhotoCredits, consumeQuota } from "../lib/subscriptionAccess.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -388,21 +387,22 @@ async function processUploadJob(jobId, event, files) {
       } else if (usedBytes + file.buffer.length > storageLimitBytes) {
         skipped.push(`${file.originalname} (event storage limit reached)`);
       } else {
-        let detection;
+        let faces = [];
         try {
-          detection = await detectFaces(file.buffer, file.originalname);
+          if (event.faceSearchEnabled) {
+            faces = await detectFacesForPhoto(file.buffer, file.originalname);
+          }
         } catch (err) {
           skipped.push(`${file.originalname} (${err.isFaceEngineError ? err.message : "could not process image"})`);
-          detection = null;
+          faces = null;
         }
 
-        if (detection) {
+        if (faces) {
           const photoId = randomUUID();
           const storedFilename = `${photoId}${ext}`;
           const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
           const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
 
-          const faces = detection.faces || [];
           const photo = await prisma.photo.create({
             data: {
               id: photoId,
@@ -413,18 +413,14 @@ async function processUploadJob(jobId, event, files) {
               faceCount: faces.length,
               fileSize: file.buffer.length,
               source: "upload",
+              faceSearchVisible: event.faceSearchEnabled,
               originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
             },
           });
 
-          for (const face of faces) {
-            await insertFace({
-              photoId: photo.id,
-              eventId: event.id,
-              bbox: face.bbox,
-              embedding: face.embedding,
-              detScore: face.det_score,
-            });
+          if (event.faceSearchEnabled) {
+            await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces });
+            await consumeAiPhotoCredits(event.ownerId);
           }
 
           facesFoundSoFar += faces.length;
@@ -1013,6 +1009,7 @@ router.get("/:id/photos", async (req, res, next) => {
         moderation_flagged: p.moderationFlagged,
         face_search_visible: p.faceSearchVisible,
         photo_selection_visible: p.photoSelectionVisible,
+        face_indexed_at: p.faceIndexedAt,
       }))
     );
   } catch (err) {
@@ -1044,6 +1041,16 @@ router.patch("/:id/photos/:photoId/features", async (req, res, next) => {
       return res.status(400).json({ error: "No feature membership change provided." });
     }
 
+    let indexedFaceCount = null;
+    if (data.faceSearchVisible && !photo.faceIndexedAt) {
+      try {
+        indexedFaceCount = await indexExistingPhotoFaces(photo);
+        await consumeAiPhotoCredits(event.ownerId);
+      } catch (err) {
+        return res.status(400).json({ error: err.isFaceEngineError ? err.message : err.message || "Could not index this photo for Face Search." });
+      }
+    }
+
     const updated = await prisma.photo.update({
       where: { id: photo.id },
       data,
@@ -1051,6 +1058,8 @@ router.patch("/:id/photos/:photoId/features", async (req, res, next) => {
 
     res.json({
       photo_id: updated.id,
+      face_count: indexedFaceCount ?? updated.faceCount,
+      face_indexed_at: updated.faceIndexedAt,
       face_search_visible: updated.faceSearchVisible,
       photo_selection_visible: updated.photoSelectionVisible,
     });
@@ -1086,6 +1095,16 @@ router.post("/:id/photos/:photoId/approve", async (req, res, next) => {
       return res.status(403).json({ error: err.message || "Photo quota unavailable" });
     }
 
+    let indexedFaceCount = null;
+    if (event.faceSearchEnabled && photo.faceSearchVisible && !photo.faceIndexedAt) {
+      try {
+        indexedFaceCount = await indexExistingPhotoFaces(photo);
+        await consumeAiPhotoCredits(event.ownerId);
+      } catch (err) {
+        return res.status(400).json({ error: err.isFaceEngineError ? err.message : err.message || "Could not index this photo for Face Search." });
+      }
+    }
+
     const updated = await prisma.photo.update({
       where: { id: photo.id },
       data: { approvalStatus: "approved" },
@@ -1096,7 +1115,7 @@ router.post("/:id/photos/:photoId/approve", async (req, res, next) => {
       type: "photo_added",
       photo_id: updated.id,
       filename: updated.filename,
-      face_count: updated.faceCount,
+      face_count: indexedFaceCount ?? updated.faceCount,
       createdAt: updated.createdAt,
       url: `/files/events/${event.id}/photos/${updated.id}`,
       thumbnail_url: `/files/events/${event.id}/photos/${updated.id}/thumb`,

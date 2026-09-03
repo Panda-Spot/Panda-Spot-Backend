@@ -363,9 +363,18 @@ export async function rechargeWallet(tenantId, planId) {
   });
 }
 
-/** Debits AI-usage credits atomically. Ported for parity but — same as
- * Studio-Verse itself — not called from any real face-matching code path
- * yet; a future integration point once AI-credit-gated search is built. */
+export async function consumeAiPhotoCredits(tenantId, photoCount = 1) {
+  if (!photoCount || photoCount < 1) return;
+  const settings = await getPlatformSettings();
+  if (settings.freeAccessEnabled) return;
+
+  const sub = await getActiveSubscription(tenantId);
+  const costPerPhoto = sub?.subscriptionPlan?.aiCreditCostPerPhoto ?? 0;
+  if (costPerPhoto <= 0) return;
+  await deductAiCredits(tenantId, costPerPhoto * photoCount);
+}
+
+/** Debits AI-usage credits atomically. */
 export async function deductAiCredits(tenantId, credits) {
   return prisma.$transaction(async (tx) => {
     const wallet = await tx.tenantWallet.findUnique({ where: { tenantId } });

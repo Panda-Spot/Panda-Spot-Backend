@@ -1,0 +1,2 @@
+ALTER TABLE "Photo"
+ADD COLUMN "faceIndexedAt" TIMESTAMP(3);

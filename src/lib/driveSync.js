@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { prisma } from "./prisma.js";
-import { detectFaces } from "./faceEngine.js";
-import { insertFace } from "./faces.js";
+import { detectFacesForPhoto, replacePhotoFaces } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
 import { deleteFileIfExists } from "./storage.js";
 import { downloadFile, guessExtension, listImageFiles } from "./googleDrive.js";
@@ -10,7 +9,7 @@ import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.
 import { emitJobEvent } from "./jobQueue.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 import { publishLiveEvent } from "./liveEvents.js";
-import { assertQuotaAvailable, consumeQuota } from "./subscriptionAccess.js";
+import { assertQuotaAvailable, consumeAiPhotoCredits, consumeQuota } from "./subscriptionAccess.js";
 
 // Once per day — see runDueAutoSyncs below.
 const AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -43,16 +42,17 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
     return { skipped: `${file.name} (file content doesn't match its extension)` };
   }
 
-  let detection;
+  let faces = [];
   try {
-    detection = await detectFaces(buffer, file.name);
+    if (event.faceSearchEnabled) {
+      faces = await detectFacesForPhoto(buffer, file.name);
+    }
   } catch (err) {
     return { skipped: `${file.name} (${err.isFaceEngineError ? err.message : "could not process image"})` };
   }
 
   const photoId = randomUUID();
   const thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
-  const faces = detection.faces || [];
 
   const photo = await prisma.photo.create({
     data: {
@@ -65,20 +65,16 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
       faceCount: faces.length,
       fileSize,
       source: "drive_import",
+      faceSearchVisible: event.faceSearchEnabled,
       // No local original to expire — full-res is always fetched from
       // Drive live on demand, see lib/googleDrive.js.
       originalExpiresAt: null,
     },
   });
 
-  for (const face of faces) {
-    await insertFace({
-      photoId: photo.id,
-      eventId: event.id,
-      bbox: face.bbox,
-      embedding: face.embedding,
-      detScore: face.det_score,
-    });
+  if (event.faceSearchEnabled) {
+    await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces });
+    await consumeAiPhotoCredits(event.ownerId);
   }
 
   usedBytesRef.value += fileSize;

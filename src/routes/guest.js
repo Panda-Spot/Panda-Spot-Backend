@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { upload } from "../middleware/upload.js";
 import { checkModeration, detectFaces, pickLargestFace } from "../lib/faceEngine.js";
-import { insertFace, searchSimilarPhotos } from "../lib/faces.js";
+import { searchSimilarPhotos } from "../lib/faces.js";
 import { averageAndNormalize, insertGuestSearch, similarityForPhoto } from "../lib/guestSearches.js";
 import { getEffectiveThreshold, adjustThresholdOnFeedback } from "../lib/threshold.js";
 import { zipFilenameForEvent, streamPhotosZip, buildPhotosZipToDisk, zipDownloadPath } from "../lib/zip.js";
@@ -394,19 +394,10 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
         continue;
       }
 
-      let detection;
-      try {
-        detection = await detectFaces(file.buffer, file.originalname);
-      } catch (err) {
-        skipped.push(`${file.originalname} (${err.isFaceEngineError ? err.message : "could not process image"})`);
-        continue;
-      }
-
       const photoId = randomUUID();
       const storedFilename = `${photoId}${ext}`;
       const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
       const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
-      const faces = detection.faces || [];
       // Best-effort only, guest uploads exclusively — see checkModeration's
       // own doc comment for exactly what this does and doesn't catch.
       const moderationFlagged = await checkModeration(file.buffer, file.originalname);
@@ -418,25 +409,16 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
           filename: file.originalname,
           storagePath,
           thumbnailPath,
-          faceCount: faces.length,
+          faceCount: 0,
           fileSize: file.buffer.length,
           source: "guest",
           approvalStatus: "pending",
+          faceSearchVisible: event.faceSearchEnabled,
           moderationFlagged,
           uploadedByGuestClientId: guestClientId,
           originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
         },
       });
-
-      for (const face of faces) {
-        await insertFace({
-          photoId: photo.id,
-          eventId: event.id,
-          bbox: face.bbox,
-          embedding: face.embedding,
-          detScore: face.det_score,
-        });
-      }
 
       usedBytes += file.buffer.length;
       uploaded += 1;

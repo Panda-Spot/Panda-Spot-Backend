@@ -342,6 +342,10 @@ model Photo {
   /// size for imports even though those bytes are never retained locally.
   fileSize    Int      @default(0)
   faceCount   Int      @default(0)
+  /// Set whenever this photo has been sent through face-engine for Face
+  /// Search indexing, even if zero faces were found. Visibility can change
+  /// later without losing the extraction/cost audit point.
+  faceIndexedAt DateTime?
   createdAt   DateTime @default(now())
   faces       Face[]
 
