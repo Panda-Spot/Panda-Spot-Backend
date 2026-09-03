@@ -1,14 +1,18 @@
 import { Router } from "express";
+import bcrypt from "bcryptjs";
 import { randomBytes } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/admin.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
+import { deleteFileIfExists, removeEventDir } from "../lib/storage.js";
+import { zipDownloadPath } from "../lib/zip.js";
+import { deleteFileFromDrive } from "../lib/driveBackup.js";
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, DEFAULT_PHOTO_RETENTION_DAYS } from "../lib/planLimits.js";
 import { sendEmailVerificationEmail } from "../lib/mailer.js";
 import { getDriveAccountQuota } from "../lib/driveBackup.js";
-import { getPlatformSettings, getActiveSubscription } from "../lib/subscriptionAccess.js";
+import { computePlanExpiry, getPlatformSettings, getActiveSubscription } from "../lib/subscriptionAccess.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 
@@ -16,11 +20,134 @@ const router = Router();
 router.use(requireAuth, requireAdmin);
 
 const PAGE_SIZE_DEFAULT = 25;
+const BCRYPT_ROUNDS = 10;
+const GENERATED_PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 
 function parsePage(req) {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || PAGE_SIZE_DEFAULT));
   return { page, pageSize, skip: (page - 1) * pageSize };
+}
+
+function generateTempPassword() {
+  let out = "";
+  for (let i = 0; i < 12; i += 1) {
+    out += GENERATED_PASSWORD_CHARS[Math.floor(Math.random() * GENERATED_PASSWORD_CHARS.length)];
+  }
+  return out;
+}
+
+function normalizeOptionalFutureDate(value, fieldName) {
+  if (value == null || value === "") return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw Object.assign(new Error(`${fieldName} must be a valid date`), { status: 400 });
+  }
+  if (date <= new Date()) {
+    throw Object.assign(new Error(`${fieldName} must be in the future`), { status: 400 });
+  }
+  return date;
+}
+
+function normalizeOptionalDate(value, fieldName) {
+  if (value == null || value === "") return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw Object.assign(new Error(`${fieldName} must be a valid date`), { status: 400 });
+  }
+  return date;
+}
+
+function serializeSubscription(sub) {
+  if (!sub) return null;
+  return {
+    id: sub.id,
+    plan_id: sub.subscriptionPlanId,
+    plan_name: sub.subscriptionPlan?.planName ?? null,
+    status: sub.status,
+    change_type: sub.changeType,
+    locked_price: sub.lockedPrice != null ? Number(sub.lockedPrice) : null,
+    is_price_locked: sub.isPriceLocked,
+    is_free_grant: sub.isFreeGrant,
+    photo_quota_total: sub.photoQuotaTotal,
+    photo_quota_used: sub.photoQuotaUsed,
+    starts_at: sub.startsAt,
+    expires_at: sub.expiresAt,
+    grace_ends_at: sub.graceEndsAt,
+    is_active: sub.isActive,
+    created_at: sub.createdAt,
+  };
+}
+
+async function requireStudioUser(userId, res) {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    res.status(404).json({ error: "Studio not found" });
+    return null;
+  }
+  if (user.role !== "ADMIN") {
+    res.status(400).json({ error: "Tenant lifecycle actions are only available for ADMIN studio accounts" });
+    return null;
+  }
+  return user;
+}
+
+async function wipeStudioStorage(userId) {
+  const events = await prisma.event.findMany({ where: { ownerId: userId }, select: { id: true } });
+  const eventIds = events.map((e) => e.id);
+  if (eventIds.length === 0) return { deletedCount: 0, eventCount: 0 };
+
+  const [photos, zipDownloads] = await Promise.all([
+    prisma.photo.findMany({ where: { eventId: { in: eventIds } } }),
+    prisma.zipDownload.findMany({ where: { eventId: { in: eventIds } } }),
+  ]);
+
+  for (const photo of photos) {
+    await deleteFileIfExists(photo.storagePath);
+    await deleteFileIfExists(photo.thumbnailPath);
+    if (photo.platformDriveBackup && photo.driveFileId) {
+      await deleteFileFromDrive(photo.driveFileId).catch((err) =>
+        console.error(`Failed to delete Drive backup file for photo ${photo.id} during storage wipe:`, err.message)
+      );
+    }
+  }
+  for (const z of zipDownloads) {
+    await deleteFileIfExists(z.filePath || zipDownloadPath(z.id));
+  }
+
+  await prisma.$transaction([
+    prisma.matchFeedback.deleteMany({ where: { search: { eventId: { in: eventIds } } } }),
+    prisma.guestSearch.deleteMany({ where: { eventId: { in: eventIds } } }),
+    prisma.face.deleteMany({ where: { eventId: { in: eventIds } } }),
+    prisma.photoComment.deleteMany({ where: { eventId: { in: eventIds } } }),
+    prisma.photoLike.deleteMany({ where: { eventId: { in: eventIds } } }),
+    prisma.clientFavourite.deleteMany({ where: { photo: { eventId: { in: eventIds } } } }),
+    prisma.studioFavourite.deleteMany({ where: { photo: { eventId: { in: eventIds } } } }),
+    prisma.photo.deleteMany({ where: { eventId: { in: eventIds } } }),
+    prisma.zipDownload.deleteMany({ where: { eventId: { in: eventIds } } }),
+  ]);
+
+  for (const eventId of eventIds) {
+    await removeEventDir(eventId);
+  }
+  return { deletedCount: photos.length, eventCount: eventIds.length };
+}
+
+async function findAssignableSubscriptionPlan(planId, res) {
+  if (!planId) {
+    res.status(400).json({ error: "plan_id is required" });
+    return null;
+  }
+  const plan = await prisma.subscriptionPlan.findUnique({ where: { id: planId } });
+  if (!plan || !plan.isActive) {
+    res.status(404).json({ error: "Plan not found" });
+    return null;
+  }
+  if (plan.planType !== "SUBSCRIPTION") {
+    res.status(400).json({ error: "Only subscription plans can be assigned or granted" });
+    return null;
+  }
+  return plan;
 }
 
 router.get("/overview", async (req, res, next) => {
@@ -61,6 +188,7 @@ router.get("/overview", async (req, res, next) => {
       })),
     });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });
@@ -76,6 +204,7 @@ function serializeUserRow(user) {
     name: user.name,
     email: user.email,
     email_verified: !!user.emailVerifiedAt,
+    role: user.role,
     is_suspended: !!user.suspendedAt,
     created_at: user.createdAt,
     event_count: user.events.length,
@@ -84,6 +213,7 @@ function serializeUserRow(user) {
     custom_event_limit: user.customEventLimit,
     custom_storage_limit_bytes: user.customStorageLimitBytes != null ? Number(user.customStorageLimitBytes) : null,
     custom_photo_retention_days: user.customPhotoRetentionDays,
+    subscription: serializeSubscription(user.subscriptions?.[0] ?? null),
   };
 }
 
@@ -94,14 +224,18 @@ router.get("/users", async (req, res, next) => {
   try {
     const { page, pageSize, skip } = parsePage(req);
     const search = (req.query.search || "").trim();
-    const where = search
-      ? {
-          OR: [
-            { name: { contains: search, mode: "insensitive" } },
-            { email: { contains: search, mode: "insensitive" } },
-          ],
-        }
-      : {};
+    const role = ["SUPER_ADMIN", "ADMIN", "USER", "INVITED"].includes(req.query.role) ? req.query.role : undefined;
+    const where = {
+      ...(role ? { role } : {}),
+      ...(search
+        ? {
+            OR: [
+              { name: { contains: search, mode: "insensitive" } },
+              { email: { contains: search, mode: "insensitive" } },
+            ],
+          }
+        : {}),
+    };
 
     const [total, users] = await Promise.all([
       prisma.user.count({ where }),
@@ -110,7 +244,15 @@ router.get("/users", async (req, res, next) => {
         orderBy: { createdAt: "desc" },
         skip,
         take: pageSize,
-        include: { events: { include: { photos: { select: { fileSize: true } } } } },
+        include: {
+          events: { include: { photos: { select: { fileSize: true } } } },
+          subscriptions: {
+            where: { isActive: true },
+            include: { subscriptionPlan: true },
+            orderBy: { startsAt: "desc" },
+            take: 1,
+          },
+        },
       }),
     ]);
 
@@ -121,6 +263,79 @@ router.get("/users", async (req, res, next) => {
       users: users.map(serializeUserRow),
     });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.post("/users", async (req, res, next) => {
+  try {
+    const { name, email, password, plan_id: planId, free_access_until: freeAccessUntil } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim()) {
+      return res.status(400).json({ error: "name is required" });
+    }
+    if (!email || typeof email !== "string" || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
+    }
+    if (password != null && (typeof password !== "string" || password.length < 8)) {
+      return res.status(400).json({ error: "password must be at least 8 characters" });
+    }
+
+    const normalizedEmail = email.toLowerCase();
+    const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    if (existing) return res.status(409).json({ error: "An account with that email already exists" });
+
+    let plan = null;
+    let freeUntil = null;
+    if (planId || freeAccessUntil) {
+      plan = await findAssignableSubscriptionPlan(planId, res);
+      if (!plan) return;
+      freeUntil = normalizeOptionalFutureDate(freeAccessUntil, "free_access_until");
+      if (!freeUntil) return res.status(400).json({ error: "free_access_until is required when granting a free plan" });
+    }
+
+    const plainPassword = password || generateTempPassword();
+    const passwordHash = await bcrypt.hash(plainPassword, BCRYPT_ROUNDS);
+    const now = new Date();
+    const user = await prisma.$transaction(async (tx) => {
+      const created = await tx.user.create({
+        data: {
+          name: name.trim(),
+          email: normalizedEmail,
+          passwordHash,
+          role: "ADMIN",
+          emailVerifiedAt: now,
+        },
+      });
+      await tx.tenantBillingSettings.create({ data: { tenantId: created.id } });
+      if (plan && freeUntil) {
+        await tx.tenantSubscription.create({
+          data: {
+            tenantId: created.id,
+            subscriptionPlanId: plan.id,
+            status: "ACTIVE",
+            changeType: "FREE_GRANT",
+            lockedPrice: 0,
+            isPriceLocked: false,
+            isFreeGrant: true,
+            photoQuotaTotal: plan.photoQuota ?? 0,
+            startsAt: now,
+            expiresAt: freeUntil,
+          },
+        });
+      }
+      return created;
+    });
+
+    res.status(201).json({
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      generated_password: password ? null : plainPassword,
+    });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });
@@ -159,21 +374,24 @@ router.get("/users/:id", async (req, res, next) => {
     // tenant's subscription in the same admin client-detail view Studio-
     // Verse had — informational only, see lib/subscriptionAccess.js's own
     // safety note on why this isn't enforced against uploads yet.
-    const subscription = await getActiveSubscription(user.id);
+    const [subscription, subscriptionHistory, wallet] = await Promise.all([
+      getActiveSubscription(user.id),
+      prisma.tenantSubscription.findMany({
+        where: { tenantId: user.id },
+        include: { subscriptionPlan: true },
+        orderBy: { startsAt: "desc" },
+      }),
+      prisma.tenantWallet.findUnique({ where: { tenantId: user.id } }),
+    ]);
 
     res.json({
-      subscription: subscription
-        ? {
-            plan_name: subscription.subscriptionPlan?.planName ?? null,
-            status: subscription.status,
-            photo_quota_total: subscription.photoQuotaTotal,
-            photo_quota_used: subscription.photoQuotaUsed,
-            expires_at: subscription.expiresAt,
-          }
-        : null,
+      subscription: serializeSubscription(subscription),
+      subscription_history: subscriptionHistory.map(serializeSubscription),
+      wallet_balance: wallet?.balanceCredits ?? 0,
       id: user.id,
       name: user.name,
       email: user.email,
+      role: user.role,
       email_verified: !!user.emailVerifiedAt,
       is_suspended: !!user.suspendedAt,
       created_at: user.createdAt,
@@ -190,6 +408,121 @@ router.get("/users/:id", async (req, res, next) => {
         owner_email: c.event.owner.email,
       })),
     });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.post("/users/:id/free-access", async (req, res, next) => {
+  try {
+    const user = await requireStudioUser(req.params.id, res);
+    if (!user) return;
+    const { plan_id: planId, expires_at: expiresAt } = req.body || {};
+    const plan = await findAssignableSubscriptionPlan(planId, res);
+    if (!plan) return;
+    const until = normalizeOptionalFutureDate(expiresAt, "expires_at");
+
+    const now = new Date();
+    const subscription = await prisma.$transaction(async (tx) => {
+      await tx.tenantSubscription.updateMany({
+        where: { tenantId: user.id, isActive: true },
+        data: { isActive: false, status: "CANCELLED" },
+      });
+      return tx.tenantSubscription.create({
+        data: {
+          tenantId: user.id,
+          subscriptionPlanId: plan.id,
+          status: "ACTIVE",
+          changeType: "FREE_GRANT",
+          lockedPrice: 0,
+          isPriceLocked: false,
+          isFreeGrant: true,
+          photoQuotaTotal: plan.photoQuota ?? 0,
+          photoQuotaUsed: 0,
+          startsAt: now,
+          expiresAt: until,
+        },
+        include: { subscriptionPlan: true },
+      });
+    });
+
+    res.json({ ok: true, subscription: serializeSubscription(subscription) });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.delete("/users/:id/free-access", async (req, res, next) => {
+  try {
+    const user = await requireStudioUser(req.params.id, res);
+    if (!user) return;
+    const result = await prisma.tenantSubscription.updateMany({
+      where: { tenantId: user.id, isActive: true, isFreeGrant: true },
+      data: { isActive: false, status: "CANCELLED" },
+    });
+    if (result.count === 0) return res.status(404).json({ error: "No active free access grant found" });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+router.post("/users/:id/plan", async (req, res, next) => {
+  try {
+    const user = await requireStudioUser(req.params.id, res);
+    if (!user) return;
+    const { plan_id: planId } = req.body || {};
+    const plan = await findAssignableSubscriptionPlan(planId, res);
+    if (!plan) return;
+
+    const current = await prisma.tenantSubscription.findFirst({
+      where: { tenantId: user.id, isActive: true },
+      orderBy: { startsAt: "desc" },
+    });
+    const now = new Date();
+    const subscription = await prisma.$transaction(async (tx) => {
+      await tx.tenantSubscription.updateMany({
+        where: { tenantId: user.id, isActive: true },
+        data: { isActive: false, status: "CANCELLED" },
+      });
+      return tx.tenantSubscription.create({
+        data: {
+          tenantId: user.id,
+          subscriptionPlanId: plan.id,
+          status: "ACTIVE",
+          changeType: "ADMIN_SET",
+          lockedPrice: null,
+          isPriceLocked: false,
+          isFreeGrant: false,
+          photoQuotaTotal: plan.photoQuota ?? 0,
+          photoQuotaUsed: current?.photoQuotaUsed ?? 0,
+          startsAt: now,
+          expiresAt: computePlanExpiry(plan, now),
+        },
+        include: { subscriptionPlan: true },
+      });
+    });
+
+    res.json({ ok: true, subscription: serializeSubscription(subscription) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/users/:id/storage", async (req, res, next) => {
+  try {
+    const user = await requireStudioUser(req.params.id, res);
+    if (!user) return;
+    const { confirm_email: confirmEmail } = req.body || {};
+    if ((confirmEmail || "").trim().toLowerCase() !== user.email.toLowerCase()) {
+      return res.status(400).json({ error: "confirm_email must match this studio's exact email address" });
+    }
+
+    const result = await wipeStudioStorage(user.id);
+    res.json({ ok: true, deleted_photo_count: result.deletedCount, event_count: result.eventCount });
   } catch (err) {
     next(err);
   }
@@ -296,30 +629,61 @@ router.post("/users/:id/verify", async (req, res, next) => {
   }
 });
 
-// Permanently deletes a client account: every event they own (via the same
-// cascade the owner-facing DELETE /events/:id route uses), their
-// collaborator memberships/sent invites/tokens elsewhere, then the User row
-// itself. Irreversible — requires the admin to type the client's own email
-// back as confirmation, not just a generic confirm dialog.
+// Permanently deletes a user/studio account: every event they own (via the
+// same cascade the owner-facing DELETE /events/:id route uses), then every
+// user-linked billing/subscription/support row, then the User row itself.
+// Irreversible — requires the admin to type the account email back.
 router.delete("/users/:id", async (req, res, next) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.params.id }, include: { events: true } });
-    if (!user) return res.status(404).json({ error: "Client not found" });
+    if (!user) return res.status(404).json({ error: "Account not found" });
 
     const { confirm_email: confirmEmail } = req.body || {};
     if ((confirmEmail || "").trim().toLowerCase() !== user.email.toLowerCase()) {
-      return res.status(400).json({ error: "confirm_email must match this client's exact email address" });
+      return res.status(400).json({ error: "confirm_email must match this account's exact email address" });
     }
 
     for (const event of user.events) {
       await deleteEventCascade(event);
     }
 
-    await prisma.eventCollaborator.deleteMany({ where: { userId: user.id } });
-    await prisma.eventInvite.deleteMany({ where: { email: { equals: user.email, mode: "insensitive" } } });
-    await prisma.emailVerificationToken.deleteMany({ where: { userId: user.id } });
-    await prisma.passwordResetToken.deleteMany({ where: { userId: user.id } });
-    await prisma.user.delete({ where: { id: user.id } });
+    const supportTickets = await prisma.supportTicket.findMany({
+      where: { OR: [{ tenantId: user.id }, { requesterId: user.id }] },
+      select: { id: true },
+    });
+    const supportTicketIds = supportTickets.map((t) => t.id);
+
+    await prisma.$transaction([
+      prisma.supportTicketReply.deleteMany({
+        where: { OR: [{ authorId: user.id }, { ticketId: { in: supportTicketIds } }] },
+      }),
+      prisma.supportTicket.deleteMany({ where: { id: { in: supportTicketIds } } }),
+      prisma.payment.deleteMany({
+        where: { OR: [{ tenantId: user.id }, { bill: { tenantId: user.id } }, { bill: { clientId: user.id } }] },
+      }),
+      prisma.billItem.deleteMany({
+        where: { bill: { OR: [{ tenantId: user.id }, { clientId: user.id }] } },
+      }),
+      prisma.bill.deleteMany({ where: { OR: [{ tenantId: user.id }, { clientId: user.id }] } }),
+      prisma.quotationItem.deleteMany({
+        where: { quotation: { OR: [{ tenantId: user.id }, { clientId: user.id }] } },
+      }),
+      prisma.quotation.deleteMany({ where: { OR: [{ tenantId: user.id }, { clientId: user.id }] } }),
+      prisma.studioService.deleteMany({ where: { tenantId: user.id } }),
+      prisma.tenantBillingSettings.deleteMany({ where: { tenantId: user.id } }),
+      prisma.walletTransaction.deleteMany({ where: { tenantId: user.id } }),
+      prisma.tenantWallet.deleteMany({ where: { tenantId: user.id } }),
+      prisma.tenantSubscription.deleteMany({ where: { tenantId: user.id } }),
+      prisma.clientFavourite.deleteMany({ where: { userId: user.id } }),
+      prisma.studioFavourite.deleteMany({ where: { userId: user.id } }),
+      prisma.eventUserMapping.deleteMany({ where: { userId: user.id } }),
+      prisma.eventCollaborator.deleteMany({ where: { userId: user.id } }),
+      prisma.eventInvite.deleteMany({ where: { email: { equals: user.email, mode: "insensitive" } } }),
+      prisma.clientInvite.deleteMany({ where: { email: { equals: user.email, mode: "insensitive" } } }),
+      prisma.emailVerificationToken.deleteMany({ where: { userId: user.id } }),
+      prisma.passwordResetToken.deleteMany({ where: { userId: user.id } }),
+      prisma.user.delete({ where: { id: user.id } }),
+    ]);
 
     res.status(204).end();
   } catch (err) {
@@ -559,6 +923,7 @@ router.post("/plans", async (req, res, next) => {
       wallet_tier: walletTier,
       ai_credit_cost_per_photo: aiCreditCostPerPhoto,
       includes_ai_media: includesAiMedia,
+      special_access_cutoff_date: specialAccessCutoffDate,
       display_order: displayOrder,
     } = req.body || {};
     if (!planName || !["SUBSCRIPTION", "WALLET"].includes(planType) || price == null) {
@@ -587,11 +952,13 @@ router.post("/plans", async (req, res, next) => {
         walletTier: walletTier ?? null,
         aiCreditCostPerPhoto: aiCreditCostPerPhoto ?? null,
         includesAiMedia: !!includesAiMedia,
+        specialAccessCutoffDate: normalizeOptionalDate(specialAccessCutoffDate, "special_access_cutoff_date"),
         displayOrder: displayOrder ?? 0,
       },
     });
     res.status(201).json(plan);
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });
@@ -600,17 +967,43 @@ router.patch("/plans/:id", async (req, res, next) => {
   try {
     const plan = await prisma.subscriptionPlan.findUnique({ where: { id: req.params.id } });
     if (!plan) return res.status(404).json({ error: "Plan not found" });
-    const { is_active: isActive, display_order: displayOrder, price } = req.body || {};
+    const {
+      plan_name: planName,
+      duration_value: durationValue,
+      duration_unit: durationUnit,
+      photo_quota: photoQuota,
+      price,
+      wallet_credits: walletCredits,
+      wallet_tier: walletTier,
+      ai_credit_cost_per_photo: aiCreditCostPerPhoto,
+      includes_ai_media: includesAiMedia,
+      special_access_cutoff_date: specialAccessCutoffDate,
+      is_active: isActive,
+      display_order: displayOrder,
+    } = req.body || {};
+    const data = {
+      planName: planName ?? undefined,
+      durationValue: durationValue ?? undefined,
+      durationUnit: durationUnit ?? undefined,
+      photoQuota: photoQuota ?? undefined,
+      price: price ?? undefined,
+      walletCredits: walletCredits ?? undefined,
+      walletTier: walletTier ?? undefined,
+      aiCreditCostPerPhoto: aiCreditCostPerPhoto ?? undefined,
+      includesAiMedia: includesAiMedia ?? undefined,
+      isActive: isActive ?? undefined,
+      displayOrder: displayOrder ?? undefined,
+    };
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "special_access_cutoff_date")) {
+      data.specialAccessCutoffDate = normalizeOptionalDate(specialAccessCutoffDate, "special_access_cutoff_date");
+    }
     const updated = await prisma.subscriptionPlan.update({
       where: { id: plan.id },
-      data: {
-        isActive: isActive ?? undefined,
-        displayOrder: displayOrder ?? undefined,
-        price: price ?? undefined,
-      },
+      data,
     });
     res.json(updated);
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });

@@ -45,6 +45,28 @@ function addDays(date, days) {
   return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
+export function planDurationDays(plan) {
+  if (plan.durationUnit === "YEARS") return plan.durationValue * 365;
+  if (plan.durationUnit === "MONTHS") return plan.durationValue * 30;
+  return plan.durationValue; // DAYS
+}
+
+export function computePlanExpiry(plan, from = new Date()) {
+  if (plan.planType !== "SUBSCRIPTION") return null;
+  return addDays(from, planDurationDays(plan));
+}
+
+function formatDate(date) {
+  return new Date(date).toISOString().slice(0, 10);
+}
+
+export function assertPlanVisibleToTenant(plan, tenant) {
+  if (!plan.specialAccessCutoffDate) return;
+  if (new Date(tenant.createdAt) >= new Date(plan.specialAccessCutoffDate)) {
+    throw new Error(`This plan is only available to studios that joined before ${formatDate(plan.specialAccessCutoffDate)}.`);
+  }
+}
+
 /**
  * Pure function: given a TenantSubscription row (with its plan included)
  * and the current PlatformSettings, returns the Prisma `data` patch to
@@ -176,17 +198,16 @@ export async function activateTrial(tenantId) {
   });
 }
 
-function planDurationDays(plan) {
-  if (plan.durationUnit === "YEARS") return plan.durationValue * 365;
-  if (plan.durationUnit === "MONTHS") return plan.durationValue * 30;
-  return plan.durationValue; // DAYS
-}
-
 /** A full renewal onto a SUBSCRIPTION-type plan — cancels whatever's
  * currently active, starts a brand-new period from now, price-locked. */
 export async function subscribeToPlan(tenantId, planId) {
-  const plan = await prisma.subscriptionPlan.findUnique({ where: { id: planId } });
+  const [plan, tenant] = await Promise.all([
+    prisma.subscriptionPlan.findUnique({ where: { id: planId } }),
+    prisma.user.findUnique({ where: { id: tenantId }, select: { id: true, createdAt: true } }),
+  ]);
   if (!plan || !plan.isActive) throw new Error("Plan not found");
+  if (!tenant) throw new Error("Studio not found");
+  assertPlanVisibleToTenant(plan, tenant);
   if (plan.planType !== "SUBSCRIPTION") throw new Error("This plan isn't a subscription plan — use wallet recharge instead.");
 
   const now = new Date();
@@ -202,7 +223,7 @@ export async function subscribeToPlan(tenantId, planId) {
         isPriceLocked: true,
         photoQuotaTotal: plan.photoQuota ?? 0,
         startsAt: now,
-        expiresAt: addDays(now, planDurationDays(plan)),
+        expiresAt: computePlanExpiry(plan, now),
       },
     });
   });
@@ -288,8 +309,13 @@ export async function downgradePlan(tenantId, targetPlanId) {
  * every one after that must be TOPUP-tier — matching Studio-Verse's
  * exact sequencing rule. Mocked payment (reference: "MOCK_PAID"). */
 export async function rechargeWallet(tenantId, planId) {
-  const plan = await prisma.subscriptionPlan.findUnique({ where: { id: planId } });
+  const [plan, tenant] = await Promise.all([
+    prisma.subscriptionPlan.findUnique({ where: { id: planId } }),
+    prisma.user.findUnique({ where: { id: tenantId }, select: { id: true, createdAt: true } }),
+  ]);
   if (!plan || !plan.isActive || plan.planType !== "WALLET") throw new Error("Wallet plan not found");
+  if (!tenant) throw new Error("Studio not found");
+  assertPlanVisibleToTenant(plan, tenant);
 
   const existingWallet = await prisma.tenantWallet.findUnique({ where: { tenantId } });
   if (!existingWallet && plan.walletTier !== "INITIAL") {

@@ -31,11 +31,19 @@ export async function deleteEventCascade(event) {
   await prisma.matchFeedback.deleteMany({ where: { search: { eventId: event.id } } });
   await prisma.guestSearch.deleteMany({ where: { eventId: event.id } });
   await prisma.face.deleteMany({ where: { eventId: event.id } });
+  await prisma.photoComment.deleteMany({ where: { eventId: event.id } });
+  await prisma.photoLike.deleteMany({ where: { eventId: event.id } });
+  await prisma.clientFavourite.deleteMany({ where: { photo: { eventId: event.id } } });
+  await prisma.studioFavourite.deleteMany({ where: { photo: { eventId: event.id } } });
   await prisma.photo.deleteMany({ where: { eventId: event.id } });
   await prisma.zipDownload.deleteMany({ where: { eventId: event.id } });
   await prisma.guestAlertSubscription.deleteMany({ where: { eventId: event.id } });
+  await prisma.eventUserMapping.deleteMany({ where: { eventId: event.id } });
+  await prisma.clientInvite.deleteMany({ where: { eventId: event.id } });
   await prisma.eventCollaborator.deleteMany({ where: { eventId: event.id } });
   await prisma.eventInvite.deleteMany({ where: { eventId: event.id } });
+  await prisma.supportTicketReply.deleteMany({ where: { ticket: { eventId: event.id } } });
+  await prisma.supportTicket.deleteMany({ where: { eventId: event.id } });
   await prisma.event.delete({ where: { id: event.id } });
 
   await removeEventDir(event.id);
