@@ -2,6 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
+import { signMediaToken } from "../lib/mediaTokens.js";
 
 const router = Router();
 
@@ -90,8 +91,8 @@ router.get("/events/:id/photos", async (req, res, next) => {
         photo_id: p.id,
         filename: p.filename,
         createdAt: p.createdAt,
-        url: `/files/events/${mapping.eventId}/photos/${p.id}`,
-        thumbnail_url: `/files/events/${mapping.eventId}/photos/${p.id}/thumb`,
+        protected_url: `/files/protected/media/${signMediaToken({ eventId: mapping.eventId, photoId: p.id })}`,
+        protected_thumbnail_url: `/files/protected/media/${signMediaToken({ eventId: mapping.eventId, photoId: p.id, variant: "thumb" })}`,
         is_favourite: p.clientFavourites.length > 0,
       }))
     );

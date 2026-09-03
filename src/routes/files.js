@@ -3,6 +3,7 @@ import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { existsSync } from "../lib/storage.js";
 import { downloadFile } from "../lib/googleDrive.js";
+import { verifyMediaToken } from "../lib/mediaTokens.js";
 
 const router = Router();
 
@@ -17,6 +18,59 @@ function guessContentType(filename) {
   const ext = path.extname(filename || "").toLowerCase();
   return EXT_CONTENT_TYPES[ext] || "image/jpeg";
 }
+
+async function sendPhotoFile(res, photo, variant) {
+  if (variant === "thumb" && photo.thumbnailPath && existsSync(photo.thumbnailPath)) {
+    return res.sendFile(photo.thumbnailPath);
+  }
+  if (photo.storagePath && existsSync(photo.storagePath)) {
+    return res.sendFile(photo.storagePath);
+  }
+  if (photo.driveFileId) {
+    const buffer = await downloadFile(photo.driveFileId);
+    res.setHeader("Content-Type", guessContentType(photo.filename));
+    return res.send(buffer);
+  }
+  return res.status(404).json({
+    error: "This photo's original has expired and is no longer available.",
+  });
+}
+
+// Short-lived, signed local-disk media URL. This is the VPS/local equivalent
+// of Studio-Verse's presigned S3 URLs for protected Photo Selection galleries:
+// no bucket, no file copy, just an expiring token plus a fresh DB access check.
+router.get("/protected/media/:token", async (req, res, next) => {
+  try {
+    let payload;
+    try {
+      payload = verifyMediaToken(req.params.token);
+    } catch {
+      return res.status(401).json({ error: "Media link expired or invalid" });
+    }
+
+    if (payload.purpose !== "photo_selection" || !["original", "thumb"].includes(payload.variant)) {
+      return res.status(401).json({ error: "Media link expired or invalid" });
+    }
+
+    const photo = await prisma.photo.findUnique({ where: { id: payload.photoId } });
+    if (
+      !photo ||
+      photo.eventId !== payload.eventId ||
+      photo.approvalStatus !== "approved" ||
+      !photo.photoSelectionVisible
+    ) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    res.setHeader("Cache-Control", "private, no-store");
+    return sendPhotoFile(res, photo, payload.variant);
+  } catch (err) {
+    if (err.message?.includes("Google Drive")) {
+      return res.status(404).json({ error: "This photo's original is no longer accessible." });
+    }
+    next(err);
+  }
+});
 
 // Unauthenticated by design: photo/event IDs are UUIDs (not enumerable), and
 // this mirrors the original spike's trust model — whoever has a photo URL
