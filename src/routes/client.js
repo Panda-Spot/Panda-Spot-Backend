@@ -18,7 +18,7 @@ router.use(requireAuth, requireRole("USER"));
 async function loadClientAccess(req, res) {
   const mapping = await prisma.eventUserMapping.findUnique({
     where: { eventId_userId: { eventId: req.params.id, userId: req.user.id } },
-    include: { event: true },
+    include: { event: { include: { owner: { select: { studioName: true, watermarkIntensity: true } } } } },
   });
   if (!mapping) {
     res.status(404).json({ error: "You don't have access to this event" });
@@ -69,6 +69,8 @@ router.get("/events/:id", async (req, res, next) => {
       favourite_count: favouriteCount,
       submitted_at: mapping.submittedAt,
       allow_download: mapping.event.allowDownload,
+      watermark_text: mapping.event.owner?.studioName || mapping.event.name,
+      watermark_intensity: mapping.event.owner?.watermarkIntensity ?? 0.75,
     });
   } catch (err) {
     next(err);
