@@ -70,8 +70,9 @@ model User {
   billsAsClient      Bill[]                 @relation("BillClient")
 
   /// MERGE (Studio-Verse Support Tickets, Phase 13).
-  supportTickets      SupportTicket[]
-  supportTicketReplies SupportTicketReply[]
+  supportTicketsAsTenant   SupportTicket[]      @relation("SupportTicketTenant")
+  requestedSupportTickets  SupportTicket[]      @relation("SupportTicketRequester")
+  supportTicketReplies     SupportTicketReply[]
 
   /// Google account id (the JWT `sub` claim) once linked via Sign in with
   /// Google — null for accounts that have never used it.
@@ -206,6 +207,7 @@ model Event {
   /// access to this event's gallery to browse/favourite/submit.
   clientAccess  EventUserMapping[]
   clientInvites ClientInvite[]
+  supportTickets SupportTicket[]
 
   /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
   /// — a freshly-created event has no upload/import/PandaShoots UI at all
@@ -901,21 +903,29 @@ enum SupportTicketStatus {
   CLOSED
 }
 
-/// MERGE: raised by a tenant (ADMIN-role User), read/replied to by a
-/// SUPER_ADMIN. See routes/support.js for the auto-bump-to-IN_PROGRESS-
-/// on-admin-reply rule.
+/// MERGE: tenantId is the studio/admin responsible for the ticket. requesterId
+/// is the logged-in user who raised it. ADMIN/INVITED support goes straight to
+/// SUPER_ADMIN only by using requesterId=tenantId; USER/client support is
+/// routed to the owning studio via tenantId and remains visible to both that
+/// studio admin and SUPER_ADMIN.
 model SupportTicket {
-  id        String              @id @default(uuid())
-  tenantId  String
-  tenant    User                @relation(fields: [tenantId], references: [id])
-  subject   String
-  status    SupportTicketStatus @default(OPEN)
-  createdAt DateTime            @default(now())
-  updatedAt DateTime            @updatedAt
+  id          String              @id @default(uuid())
+  tenantId    String
+  tenant      User                @relation("SupportTicketTenant", fields: [tenantId], references: [id])
+  requesterId String
+  requester   User                @relation("SupportTicketRequester", fields: [requesterId], references: [id])
+  eventId     String?
+  event       Event?              @relation(fields: [eventId], references: [id])
+  subject     String
+  status      SupportTicketStatus @default(OPEN)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
 
   replies SupportTicketReply[]
 
   @@index([tenantId])
+  @@index([requesterId])
+  @@index([eventId])
 }
 
 model SupportTicketReply {

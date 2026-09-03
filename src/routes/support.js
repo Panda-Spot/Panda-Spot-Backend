@@ -5,12 +5,11 @@ import { requireRole } from "../middleware/role.js";
 
 const router = Router();
 
-/// MERGE (Studio-Verse Support Tickets, Phase 13): a tenant (ADMIN) raises
-/// and replies on their own tickets; a SUPER_ADMIN sees every tenant's
-/// tickets and replies across all of them. Replying as SUPER_ADMIN
-/// auto-bumps an OPEN ticket to IN_PROGRESS — the one real business rule
-/// from Studio-Verse's own ticket system, ported verbatim.
-router.use(requireAuth, requireRole("ADMIN", "SUPER_ADMIN"));
+/// MERGE (Studio-Verse Support Tickets): support is now routed by requester.
+/// ADMIN/INVITED/collaborator-side tickets go to SUPER_ADMIN. USER/client
+/// tickets are assigned to the owning studio admin for the selected Photo
+/// Selection event, while still remaining visible to SUPER_ADMIN.
+router.use(requireAuth, requireRole("ADMIN", "SUPER_ADMIN", "USER", "INVITED"));
 
 function serializeTicket(t) {
   return {
@@ -18,6 +17,8 @@ function serializeTicket(t) {
     subject: t.subject,
     status: t.status,
     tenant: t.tenant ? { id: t.tenant.id, email: t.tenant.email, name: t.tenant.name } : undefined,
+    requester: t.requester ? { id: t.requester.id, email: t.requester.email, name: t.requester.name, role: t.requester.role } : undefined,
+    event: t.event ? { id: t.event.id, name: t.event.name } : undefined,
     created_at: t.createdAt,
     updated_at: t.updatedAt,
     replies: (t.replies || []).map((r) => ({
@@ -29,12 +30,47 @@ function serializeTicket(t) {
   };
 }
 
+function includeTicketRelations() {
+  return {
+    tenant: true,
+    requester: true,
+    event: true,
+    replies: { include: { author: true }, orderBy: { createdAt: "asc" } },
+  };
+}
+
+async function resolveClientTicketTarget(userId, eventId) {
+  const mappings = eventId
+    ? await prisma.eventUserMapping.findMany({ where: { eventId, userId }, include: { event: true } })
+    : await prisma.eventUserMapping.findMany({ where: { userId }, include: { event: true }, orderBy: { createdAt: "desc" } });
+
+  const activeMappings = mappings.filter((m) => m.event.photoSelectionEnabled);
+  if (activeMappings.length === 0) {
+    const error = new Error(eventId ? "You don't have access to this event." : "Choose an event before raising a client support ticket.");
+    error.status = eventId ? 404 : 400;
+    throw error;
+  }
+  if (!eventId && activeMappings.length > 1) {
+    const error = new Error("event_id is required when your account has access to multiple events.");
+    error.status = 400;
+    throw error;
+  }
+
+  const mapping = activeMappings[0];
+  return { tenantId: mapping.event.ownerId, eventId: mapping.eventId };
+}
+
 router.get("/tickets", async (req, res, next) => {
   try {
     const isSuperAdmin = req.user.role === "SUPER_ADMIN";
+    const isStudioAdmin = req.user.role === "ADMIN";
     const tickets = await prisma.supportTicket.findMany({
-      where: isSuperAdmin ? {} : { tenantId: req.user.id },
-      include: { tenant: true, replies: { include: { author: true }, orderBy: { createdAt: "asc" } } },
+      where: isSuperAdmin
+        ? {}
+        : isStudioAdmin
+          ? { OR: [{ requesterId: req.user.id }, { tenantId: req.user.id, NOT: { requesterId: req.user.id } }] }
+          : { requesterId: req.user.id },
+      include: includeTicketRelations(),
       orderBy: { updatedAt: "desc" },
     });
     res.json(tickets.map(serializeTicket));
@@ -45,17 +81,22 @@ router.get("/tickets", async (req, res, next) => {
 
 router.post("/tickets", async (req, res, next) => {
   try {
-    const { subject, message } = req.body || {};
+    const { subject, message, event_id: eventId } = req.body || {};
     if (!subject || typeof subject !== "string" || !subject.trim()) {
       return res.status(400).json({ error: "subject is required" });
     }
+    const target = req.user.role === "USER"
+      ? await resolveClientTicketTarget(req.user.id, eventId)
+      : { tenantId: req.user.id, eventId: null };
     const ticket = await prisma.supportTicket.create({
       data: {
-        tenantId: req.user.id,
+        tenantId: target.tenantId,
+        requesterId: req.user.id,
+        eventId: target.eventId,
         subject: subject.trim(),
         replies: message ? { create: { authorId: req.user.id, message: String(message).trim() } } : undefined,
       },
-      include: { tenant: true, replies: { include: { author: true } } },
+      include: includeTicketRelations(),
     });
     res.status(201).json(serializeTicket(ticket));
   } catch (err) {
@@ -65,8 +106,13 @@ router.post("/tickets", async (req, res, next) => {
 
 async function loadTicketForRequest(req, res) {
   const isSuperAdmin = req.user.role === "SUPER_ADMIN";
+  const isStudioAdmin = req.user.role === "ADMIN";
   const ticket = await prisma.supportTicket.findFirst({
-    where: isSuperAdmin ? { id: req.params.id } : { id: req.params.id, tenantId: req.user.id },
+    where: isSuperAdmin
+      ? { id: req.params.id }
+      : isStudioAdmin
+        ? { id: req.params.id, OR: [{ requesterId: req.user.id }, { tenantId: req.user.id, NOT: { requesterId: req.user.id } }] }
+        : { id: req.params.id, requesterId: req.user.id },
   });
   if (!ticket) {
     res.status(404).json({ error: "Ticket not found" });
@@ -88,14 +134,14 @@ router.post("/tickets/:id/reply", async (req, res, next) => {
       return res.status(400).json({ error: "message is required" });
     }
 
-    const isSuperAdmin = req.user.role === "SUPER_ADMIN";
+    const isSupportResponder = req.user.role === "SUPER_ADMIN" || (req.user.role === "ADMIN" && ticket.tenantId === req.user.id && ticket.requesterId !== req.user.id);
     const updated = await prisma.$transaction(async (tx) => {
       await tx.supportTicketReply.create({ data: { ticketId: ticket.id, authorId: req.user.id, message: message.trim() } });
       return tx.supportTicket.update({
         where: { id: ticket.id },
-        // MERGE (Studio-Verse): an admin reply auto-bumps OPEN -> IN_PROGRESS.
-        data: isSuperAdmin && ticket.status === "OPEN" ? { status: "IN_PROGRESS" } : {},
-        include: { tenant: true, replies: { include: { author: true }, orderBy: { createdAt: "asc" } } },
+        // MERGE (Studio-Verse): a support-side reply auto-bumps OPEN -> IN_PROGRESS.
+        data: isSupportResponder && ticket.status === "OPEN" ? { status: "IN_PROGRESS" } : {},
+        include: includeTicketRelations(),
       });
     });
     res.status(201).json(serializeTicket(updated));
@@ -111,14 +157,15 @@ router.post("/tickets/:id/status", async (req, res, next) => {
 
     const { status } = req.body || {};
     const isSuperAdmin = req.user.role === "SUPER_ADMIN";
-    // Tenants may only resolve or reopen their own ticket; only a
-    // SUPER_ADMIN can set IN_PROGRESS or CLOSED.
+    const isStudioSupport = req.user.role === "ADMIN" && ticket.tenantId === req.user.id && ticket.requesterId !== req.user.id;
+    // Requesters may only resolve or reopen their own ticket; studio support
+    // and SUPER_ADMIN can move tickets through the full support lifecycle.
     const allowedForTenant = ["OPEN", "RESOLVED"];
     const allStatuses = ["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED"];
     if (!allStatuses.includes(status)) {
       return res.status(400).json({ error: `status must be one of ${allStatuses.join(", ")}` });
     }
-    if (!isSuperAdmin && !allowedForTenant.includes(status)) {
+    if (!isSuperAdmin && !isStudioSupport && !allowedForTenant.includes(status)) {
       return res.status(403).json({ error: "Only support staff can set that status." });
     }
 
