@@ -58,7 +58,7 @@ router.get("/events/:id", async (req, res, next) => {
     if (!mapping) return;
 
     const favouriteCount = await prisma.clientFavourite.count({
-      where: { userId: req.user.id, photo: { eventId: mapping.eventId } },
+      where: { userId: req.user.id, photo: { eventId: mapping.eventId, photoSelectionVisible: true } },
     });
 
     res.json({
@@ -80,7 +80,7 @@ router.get("/events/:id/photos", async (req, res, next) => {
     if (!mapping) return;
 
     const photos = await prisma.photo.findMany({
-      where: { eventId: mapping.eventId, approvalStatus: "approved" },
+      where: { eventId: mapping.eventId, approvalStatus: "approved", photoSelectionVisible: true },
       orderBy: { createdAt: "desc" },
       include: { clientFavourites: { where: { userId: req.user.id } } },
     });
@@ -110,7 +110,9 @@ router.post("/events/:id/photos/:photoId/favourite", async (req, res, next) => {
       return res.status(403).json({ error: "Your selection is already submitted and can't be changed." });
     }
 
-    const photo = await prisma.photo.findFirst({ where: { id: req.params.photoId, eventId: mapping.eventId } });
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: mapping.eventId, photoSelectionVisible: true },
+    });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
     }
@@ -126,7 +128,7 @@ router.post("/events/:id/photos/:photoId/favourite", async (req, res, next) => {
       }
       if (mapping.favouriteCap != null) {
         const count = await prisma.clientFavourite.count({
-          where: { userId: req.user.id, photo: { eventId: mapping.eventId } },
+          where: { userId: req.user.id, photo: { eventId: mapping.eventId, photoSelectionVisible: true } },
         });
         if (count >= mapping.favouriteCap) {
           return res.status(400).json({ error: `You can favourite up to ${mapping.favouriteCap} photos.` });

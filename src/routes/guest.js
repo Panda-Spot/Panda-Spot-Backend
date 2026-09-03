@@ -195,7 +195,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       const photos = await prisma.photo.findMany({
         // Pending guest uploads are never searchable — they only become
         // visible/matchable once the owner approves them.
-        where: { id: { in: rows.map((r) => r.photoId) }, approvalStatus: "approved" },
+        where: { id: { in: rows.map((r) => r.photoId) }, approvalStatus: "approved", faceSearchVisible: true },
       });
       const photoById = new Map(photos.map((p) => [p.id, p]));
 
@@ -306,7 +306,7 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
 
     const photoIds = [...best.keys()];
     const photos = await prisma.photo.findMany({
-      where: { id: { in: photoIds }, approvalStatus: "approved" },
+      where: { id: { in: photoIds }, approvalStatus: "approved", faceSearchVisible: true },
     });
     const guestClientId = req.body?.guest_client_id || null;
     const { reactionsByPhoto, myReactionByPhoto } = await getReactionInfo(
@@ -467,7 +467,7 @@ router.get("/:slug/gallery", async (req, res, next) => {
     }
 
     const photos = await prisma.photo.findMany({
-      where: { eventId: event.id, approvalStatus: "approved" },
+      where: { eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
       orderBy: { createdAt: "desc" },
       take: 300,
     });
@@ -537,7 +537,7 @@ router.post("/:slug/photos/:photoId/react", guestLikeLimiter, async (req, res, n
     }
 
     const photo = await prisma.photo.findFirst({
-      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved" },
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
     });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
@@ -596,7 +596,7 @@ router.get("/:slug/my-reactions", async (req, res, next) => {
     if (myLikes.length === 0) return res.json({ photos: [] });
 
     const photos = await prisma.photo.findMany({
-      where: { id: { in: myLikes.map((l) => l.photoId) }, approvalStatus: "approved" },
+      where: { id: { in: myLikes.map((l) => l.photoId) }, approvalStatus: "approved", faceSearchVisible: true },
     });
     const photoById = new Map(photos.map((p) => [p.id, p]));
 
@@ -625,7 +625,7 @@ router.get("/:slug/photos/:photoId/comments", async (req, res, next) => {
     }
 
     const photo = await prisma.photo.findFirst({
-      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved" },
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
     });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
@@ -671,7 +671,7 @@ router.post("/:slug/photos/:photoId/comments", guestCommentLimiter, async (req, 
     }
 
     const photo = await prisma.photo.findFirst({
-      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved" },
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
     });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
@@ -840,7 +840,7 @@ router.post("/:slug/download", guestDownloadLimiter, async (req, res, next) => {
     // ever have gotten a photo_id from this event's own search results, but
     // we don't trust the client-supplied list further than that.
     const photos = await prisma.photo.findMany({
-      where: { id: { in: photoIds }, eventId: event.id },
+      where: { id: { in: photoIds }, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
     });
     if (photos.length === 0) {
       return res.status(404).json({ error: "None of the requested photos belong to this event" });
@@ -894,7 +894,7 @@ router.post("/:slug/download/email", guestDownloadLimiter, async (req, res, next
     (async () => {
       try {
         const photos = await prisma.photo.findMany({
-          where: { id: { in: photoIds }, eventId: event.id },
+          where: { id: { in: photoIds }, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
         });
         if (photos.length === 0) {
           throw new Error("None of the requested photos belong to this event");

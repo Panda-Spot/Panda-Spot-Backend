@@ -42,6 +42,7 @@ async function matchedPhotosForGuest({ eventId, guestClientId, photoIds, thresho
   const rows = await prisma.$queryRaw`
     SELECT f."photoId" AS "photoId"
     FROM "Face" f
+    JOIN "Photo" p ON p.id = f."photoId"
     JOIN "GuestSearch" gs ON gs.id = (
       SELECT id FROM "GuestSearch"
       WHERE "eventId" = ${eventId} AND "guestClientId" = ${guestClientId}
@@ -49,6 +50,8 @@ async function matchedPhotosForGuest({ eventId, guestClientId, photoIds, thresho
       LIMIT 1
     )
     WHERE f."eventId" = ${eventId} AND f."photoId" = ANY(${photoIds}::text[])
+      AND p."approvalStatus" = 'approved'
+      AND p."faceSearchVisible" = true
     GROUP BY f."photoId"
     HAVING MAX(1 - (f.embedding <=> gs.embedding)) >= ${threshold}
   `;

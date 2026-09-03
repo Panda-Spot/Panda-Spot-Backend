@@ -400,6 +400,13 @@ model Photo {
   /// Always false for every non-guest source.
   moderationFlagged Boolean @default(false)
 
+  /// Zero-copy feature membership for the unified Event model. The physical
+  /// photo/file/Face rows exist once; these booleans decide which enabled
+  /// feature surfaces can use the photo. A studio can include a photo in
+  /// Face Search, Photo Selection, both, or neither without duplicating files.
+  faceSearchVisible     Boolean @default(true)
+  photoSelectionVisible Boolean @default(true)
+
   likes    PhotoLike[]
   comments PhotoComment[]
 

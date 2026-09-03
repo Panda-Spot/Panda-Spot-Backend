@@ -1005,8 +1005,49 @@ router.get("/:id/photos", async (req, res, next) => {
         source: p.source,
         approval_status: p.approvalStatus,
         moderation_flagged: p.moderationFlagged,
+        face_search_visible: p.faceSearchVisible,
+        photo_selection_visible: p.photoSelectionVisible,
       }))
     );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Zero-copy photo membership for the unified Event. The same stored photo can
+// be available to Face Search, Photo Selection, both, or neither; this updates
+// only DB flags and never duplicates/moves the underlying file.
+router.patch("/:id/photos/:photoId/features", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    const { face_search_visible: faceSearchVisible, photo_selection_visible: photoSelectionVisible } = req.body || {};
+    const data = {};
+    if (faceSearchVisible != null) data.faceSearchVisible = !!faceSearchVisible;
+    if (photoSelectionVisible != null) data.photoSelectionVisible = !!photoSelectionVisible;
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "No feature membership change provided." });
+    }
+
+    const updated = await prisma.photo.update({
+      where: { id: photo.id },
+      data,
+    });
+
+    res.json({
+      photo_id: updated.id,
+      face_search_visible: updated.faceSearchVisible,
+      photo_selection_visible: updated.photoSelectionVisible,
+    });
   } catch (err) {
     next(err);
   }
