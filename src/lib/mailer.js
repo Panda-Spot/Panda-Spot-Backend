@@ -44,6 +44,25 @@ export async function sendCollaboratorInviteEmail(to, eventName, inviteUrl) {
   });
 }
 
+/// MERGE (Studio-Verse): invites a client to log in and browse/favourite
+/// this event's gallery (Photo Selection) — distinct from
+/// sendCollaboratorInviteEmail above, which is for staff/second-shooter
+/// access, not client-facing.
+export async function sendClientInviteEmail(to, eventName, inviteUrl) {
+  const t = getTransporter();
+  if (!t) {
+    console.warn(`SMTP not configured — would have emailed ${to} the client invite link: ${inviteUrl}`);
+    return;
+  }
+  await t.sendMail({
+    from: process.env.SMTP_FROM || "PandaSpot <no-reply@pandaspot.example>",
+    to,
+    subject: `Your photos from "${eventName}" are ready to view`,
+    text: `You've been invited to browse and favourite your photos from "${eventName}" on PandaSpot: ${inviteUrl}`,
+    html: `<p>You've been invited to browse and favourite your photos from "${eventName}" on PandaSpot.</p><p><a href="${inviteUrl}">${inviteUrl}</a></p>`,
+  });
+}
+
 export async function sendEmailVerificationEmail(to, verifyUrl) {
   const t = getTransporter();
   if (!t) {

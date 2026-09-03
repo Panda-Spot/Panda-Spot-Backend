@@ -9,6 +9,11 @@ import guestRoutes from "./routes/guest.js";
 import filesRoutes from "./routes/files.js";
 import brandingRoutes from "./routes/branding.js";
 import invitesRoutes from "./routes/invites.js";
+import clientInvitesRoutes from "./routes/clientInvites.js";
+import clientRoutes from "./routes/client.js";
+import subscriptionsRoutes from "./routes/subscriptions.js";
+import billingRoutes from "./routes/billing.js";
+import supportRoutes from "./routes/support.js";
 import adminRoutes from "./routes/admin.js";
 import { startAutoSyncScheduler } from "./lib/driveSync.js";
 import { startShootsServer } from "./lib/ftpShoots.js";
@@ -47,6 +52,11 @@ app.use("/e", guestRoutes);
 app.use("/files", filesRoutes);
 app.use("/branding", brandingRoutes);
 app.use("/invites", invitesRoutes);
+app.use("/client-invites", clientInvitesRoutes);
+app.use("/client", clientRoutes);
+app.use("/subscriptions", subscriptionsRoutes);
+app.use("/billing", billingRoutes);
+app.use("/support", supportRoutes);
 app.use("/admin", adminRoutes);
 
 // Multer file-size/type errors and anything passed to next(err) lands here.

@@ -4,7 +4,8 @@ import { prisma } from "./prisma.js";
 import { detectFaces } from "./faceEngine.js";
 import { insertFace } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
-import { ALLOWED_EXTENSIONS, saveEventShootsPhoto } from "./storage.js";
+import { ALLOWED_EXTENSIONS } from "./storage.js";
+import { getStorageProvider } from "./storageProvider.js";
 import { contentMatchesExtension } from "./fileValidation.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetentionDays } from "./planLimits.js";
 import { publishLiveEvent } from "./liveEvents.js";
@@ -78,7 +79,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   if (!driveFileId) {
     // Drive backup off, or its upload failed — kept in a dedicated shoots/
     // subfolder rather than mixed in with directly-uploaded photos.
-    storagePath = await saveEventShootsPhoto(event.id, `${photoId}${ext}`, buffer);
+    storagePath = await getStorageProvider().writeShootsOriginal(event.id, `${photoId}${ext}`, buffer);
   }
 
   const photo = await prisma.photo.create({

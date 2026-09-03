@@ -1,9 +1,10 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import { randomBytes } from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
 import { prisma } from "../lib/prisma.js";
-import { signToken, setAuthCookie, clearAuthCookie, requireAuth } from "../middleware/auth.js";
+import { signToken, setAuthCookie, clearAuthCookie, requireAuth, blocklistToken } from "../middleware/auth.js";
 import { sendEmailVerificationEmail, sendPasswordResetEmail } from "../lib/mailer.js";
 import { authLimiter, registerLimiter } from "../lib/rateLimiters.js";
 import { isAdminEmail } from "../middleware/admin.js";
@@ -19,6 +20,16 @@ const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 const router = Router();
 const BCRYPT_ROUNDS = 10;
 
+// MERGE (Studio-Verse): account-lockout tuning, same env-driven pattern
+// Studio-Verse used.
+const ACCOUNT_LOCK_MAX_FAILED_ATTEMPTS = parseInt(process.env.ACCOUNT_LOCK_MAX_FAILED_ATTEMPTS || "5", 10);
+const ACCOUNT_LOCK_DURATION_MINUTES = parseInt(process.env.ACCOUNT_LOCK_DURATION_MINUTES || "15", 10);
+// A real bcrypt hash of a value nobody will ever type, compared against on
+// every login for a nonexistent/passwordless account — keeps the response
+// time indistinguishable from a real wrong-password check (Studio-Verse's
+// timing-attack-resistant lookup, see STUDIO_VERSE_HANDOFF.md §3).
+const DUMMY_HASH = "$2a$10$CwTycUXWue0Thq9StjUM0uJ8sgIhbtqE3Yb1xlXwGofYBBnbe1lYq";
+
 // Unset GOOGLE_CLIENT_ID means Google Sign-In is simply not configured yet —
 // the /auth/google route below cleanly 503s in that case rather than crash.
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
@@ -29,7 +40,11 @@ function publicUser(user) {
     email: user.email,
     name: user.name,
     email_verified: !!user.emailVerifiedAt,
-    is_admin: isAdminEmail(user.email),
+    // MERGE (Studio-Verse): the new 4-tier role — kept alongside is_admin
+    // rather than replacing it, since is_admin is still driven by the
+    // ADMIN_EMAILS env fallback too (see middleware/admin.js).
+    role: user.role,
+    is_admin: isAdminEmail(user.email) || user.role === "SUPER_ADMIN",
     // Advanced/beta feature — see lib/driveBackupAuth.js. `drive_backup_beta`
     // lets the frontend show the per-event toggle only to allowlisted
     // photographers; `drive_backup_configured` reflects the platform's own
@@ -117,20 +132,48 @@ router.post("/login", authLimiter, async (req, res, next) => {
 
     const user = await prisma.user.findUnique({ where: { email: String(email).toLowerCase() } });
     if (!user) {
+      // MERGE (Studio-Verse): still run a bcrypt compare against a dummy
+      // hash so a nonexistent account takes the same time to reject as a
+      // real wrong-password attempt — prevents email enumeration via
+      // response timing.
+      await bcrypt.compare(password, DUMMY_HASH);
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
     if (!user.passwordHash) {
+      await bcrypt.compare(password, DUMMY_HASH);
       return res.status(401).json({ error: "This account uses Google Sign-In — continue with Google instead." });
+    }
+
+    // MERGE (Studio-Verse): account lockout — checked before the password
+    // compare so a locked account can't be brute-forced further while
+    // locked, but after the null-checks above so those don't leak
+    // lock-vs-nonexistent-account timing differences worth caring about.
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      const minutesLeft = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 60000);
+      return res.status(403).json({ error: `Too many failed attempts. Try again in ${minutesLeft} minute${minutesLeft === 1 ? "" : "s"}.` });
     }
 
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) {
+      const attempts = user.failedLoginAttempts + 1;
+      const lockingNow = attempts >= ACCOUNT_LOCK_MAX_FAILED_ATTEMPTS;
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          failedLoginAttempts: lockingNow ? 0 : attempts,
+          lockedUntil: lockingNow ? new Date(Date.now() + ACCOUNT_LOCK_DURATION_MINUTES * 60000) : null,
+        },
+      });
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
     if (user.suspendedAt) {
       return res.status(403).json({ error: "This account has been suspended" });
+    }
+
+    if (user.failedLoginAttempts > 0 || user.lockedUntil) {
+      await prisma.user.update({ where: { id: user.id }, data: { failedLoginAttempts: 0, lockedUntil: null } });
     }
 
     const token = signToken(user);
@@ -141,7 +184,21 @@ router.post("/login", authLimiter, async (req, res, next) => {
   }
 });
 
-router.post("/logout", (req, res) => {
+router.post("/logout", async (req, res) => {
+  // MERGE (Studio-Verse): real token invalidation, not just clearing the
+  // cookie — a Bearer token in localStorage would otherwise keep working
+  // for up to 30 days after "logging out". Best-effort: an already-
+  // invalid/missing token just means there's nothing to blocklist.
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : req.query?.token || req.cookies?.pandaspot_token;
+  if (token) {
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      await blocklistToken(payload);
+    } catch {
+      // invalid/expired token — nothing to blocklist, still clear the cookie below
+    }
+  }
   clearAuthCookie(res);
   res.status(204).end();
 });

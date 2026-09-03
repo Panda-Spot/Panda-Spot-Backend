@@ -10,7 +10,8 @@ import { averageAndNormalize, insertGuestSearch, similarityForPhoto } from "../l
 import { getEffectiveThreshold, adjustThresholdOnFeedback } from "../lib/threshold.js";
 import { zipFilenameForEvent, streamPhotosZip, buildPhotosZipToDisk, zipDownloadPath } from "../lib/zip.js";
 import { sendZipReadyEmail } from "../lib/mailer.js";
-import { ALLOWED_EXTENSIONS, saveEventPhoto } from "../lib/storage.js";
+import { ALLOWED_EXTENSIONS } from "../lib/storage.js";
+import { getStorageProvider } from "../lib/storageProvider.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import {
@@ -110,6 +111,11 @@ router.get("/:slug", async (req, res, next) => {
       logo_url: event.owner?.logoPath ? `/files/branding/${event.owner.id}/logo` : null,
       brand_color: event.owner?.brandColor ?? null,
       expired: isExpired(event),
+      // MERGE (Studio-Verse): lets the guest frontend show the right UI —
+      // a studio can run either, both, or (temporarily) neither on this
+      // event. See MERGE_PLAN.md D6.
+      face_search_enabled: event.faceSearchEnabled,
+      photo_selection_enabled: event.photoSelectionEnabled,
       guest_upload_enabled: event.guestUploadEnabled,
       // When present, the frontend shows a picker instead of the search
       // form directly — a parent with sub-galleries is a pure menu, not a
@@ -129,6 +135,11 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
     }
     if (isExpired(event)) {
       return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+    // MERGE (Studio-Verse): the studio has this feature off — see
+    // MERGE_PLAN.md D6. Independent of Photo Selection's own state.
+    if (!event.faceSearchEnabled) {
+      return res.status(403).json({ error: "Face Search isn't turned on for this event." });
     }
 
     const files = req.files || [];
@@ -242,6 +253,9 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
     }
     if (isExpired(event)) {
       return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+    if (!event.faceSearchEnabled) {
+      return res.status(403).json({ error: "Face Search isn't turned on for this event." });
     }
 
     const files = req.files || [];
@@ -390,7 +404,7 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
 
       const photoId = randomUUID();
       const storedFilename = `${photoId}${ext}`;
-      const storagePath = await saveEventPhoto(event.id, storedFilename, file.buffer);
+      const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
       const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
       const faces = detection.faces || [];
       // Best-effort only, guest uploads exclusively — see checkModeration's

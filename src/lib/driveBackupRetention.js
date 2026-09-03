@@ -2,7 +2,8 @@ import path from "node:path";
 import { prisma } from "./prisma.js";
 import { downloadFile } from "./googleDrive.js";
 import { deleteFileFromDrive } from "./driveBackup.js";
-import { saveEventShootsPhoto, deleteFileIfExists } from "./storage.js";
+import { deleteFileIfExists } from "./storage.js";
+import { getStorageProvider } from "./storageProvider.js";
 import { sendDriveBackupReclaimNoticeEmail } from "./mailer.js";
 
 // The platform's own Drive account (see lib/driveBackupAuth.js) is a
@@ -38,7 +39,7 @@ async function reclaimPhotos(photos, { force = false } = {}) {
       if (!storagePath) {
         const buffer = await downloadFile(photo.driveFileId);
         const ext = path.extname(photo.filename) || ".jpg";
-        storagePath = await saveEventShootsPhoto(photo.eventId, `${photo.id}${ext}`, buffer);
+        storagePath = await getStorageProvider().writeShootsOriginal(photo.eventId, `${photo.id}${ext}`, buffer);
       }
       // Only clear driveFileId once the Drive copy is actually confirmed
       // gone — clearing it regardless of outcome would let a failed delete
@@ -81,7 +82,7 @@ export async function reclaimEventDriveBackups(eventId) {
  * (search included), not just full-res access. */
 async function purgePhoto(photo) {
   if (photo.driveFileId) await deleteFileFromDrive(photo.driveFileId).catch(() => {});
-  await deleteFileIfExists(photo.storagePath);
+  await getStorageProvider().deleteOriginal(photo.storagePath);
   await deleteFileIfExists(photo.thumbnailPath);
   await prisma.face.deleteMany({ where: { photoId: photo.id } });
   await prisma.photo.delete({ where: { id: photo.id } });

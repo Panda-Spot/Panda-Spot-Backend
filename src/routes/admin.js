@@ -8,6 +8,7 @@ import { deleteEventCascade } from "../lib/eventLifecycle.js";
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, DEFAULT_PHOTO_RETENTION_DAYS } from "../lib/planLimits.js";
 import { sendEmailVerificationEmail } from "../lib/mailer.js";
 import { getDriveAccountQuota } from "../lib/driveBackup.js";
+import { getPlatformSettings, getActiveSubscription } from "../lib/subscriptionAccess.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 
@@ -154,7 +155,22 @@ router.get("/users/:id", async (req, res, next) => {
       })
     );
 
+    // MERGE (Studio-Verse Billing & Subscriptions, Phase 14): surfaces the
+    // tenant's subscription in the same admin client-detail view Studio-
+    // Verse had — informational only, see lib/subscriptionAccess.js's own
+    // safety note on why this isn't enforced against uploads yet.
+    const subscription = await getActiveSubscription(user.id);
+
     res.json({
+      subscription: subscription
+        ? {
+            plan_name: subscription.subscriptionPlan?.planName ?? null,
+            status: subscription.status,
+            photo_quota_total: subscription.photoQuotaTotal,
+            photo_quota_used: subscription.photoQuotaUsed,
+            expires_at: subscription.expiresAt,
+          }
+        : null,
       id: user.id,
       name: user.name,
       email: user.email,
@@ -512,6 +528,117 @@ router.get("/metrics", async (req, res, next) => {
       top_clients: { sort, users: rankedUsers },
       drive_backup_quota: driveQuota,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Subscription plan catalog (MERGE: Studio-Verse Billing &
+// Subscriptions, Phase 12) — platform-wide, so it lives in the existing
+// admin router rather than a new one. ---
+
+router.get("/plans", async (req, res, next) => {
+  try {
+    const plans = await prisma.subscriptionPlan.findMany({ orderBy: { displayOrder: "asc" } });
+    res.json(plans);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/plans", async (req, res, next) => {
+  try {
+    const {
+      plan_name: planName,
+      plan_type: planType,
+      duration_value: durationValue,
+      duration_unit: durationUnit,
+      photo_quota: photoQuota,
+      price,
+      wallet_credits: walletCredits,
+      wallet_tier: walletTier,
+      ai_credit_cost_per_photo: aiCreditCostPerPhoto,
+      includes_ai_media: includesAiMedia,
+      display_order: displayOrder,
+    } = req.body || {};
+    if (!planName || !["SUBSCRIPTION", "WALLET"].includes(planType) || price == null) {
+      return res.status(400).json({ error: "plan_name, plan_type (SUBSCRIPTION|WALLET), and price are required" });
+    }
+    // MERGE (Phase 15 security/robustness review): a SUBSCRIPTION plan
+    // missing duration/photoQuota, or a WALLET plan missing
+    // walletCredits/walletTier, isn't a security hole but would 500 later
+    // inside subscribeToPlan/rechargeWallet (e.g. `increment: null`) —
+    // validate the type-specific required fields up front instead.
+    if (planType === "SUBSCRIPTION" && (!durationValue || !["DAYS", "MONTHS", "YEARS"].includes(durationUnit) || photoQuota == null)) {
+      return res.status(400).json({ error: "SUBSCRIPTION plans require duration_value, duration_unit (DAYS|MONTHS|YEARS), and photo_quota" });
+    }
+    if (planType === "WALLET" && (!walletCredits || !["INITIAL", "TOPUP"].includes(walletTier))) {
+      return res.status(400).json({ error: "WALLET plans require wallet_credits and wallet_tier (INITIAL|TOPUP)" });
+    }
+    const plan = await prisma.subscriptionPlan.create({
+      data: {
+        planName,
+        planType,
+        durationValue: durationValue ?? null,
+        durationUnit: durationUnit ?? null,
+        photoQuota: photoQuota ?? null,
+        price,
+        walletCredits: walletCredits ?? null,
+        walletTier: walletTier ?? null,
+        aiCreditCostPerPhoto: aiCreditCostPerPhoto ?? null,
+        includesAiMedia: !!includesAiMedia,
+        displayOrder: displayOrder ?? 0,
+      },
+    });
+    res.status(201).json(plan);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/plans/:id", async (req, res, next) => {
+  try {
+    const plan = await prisma.subscriptionPlan.findUnique({ where: { id: req.params.id } });
+    if (!plan) return res.status(404).json({ error: "Plan not found" });
+    const { is_active: isActive, display_order: displayOrder, price } = req.body || {};
+    const updated = await prisma.subscriptionPlan.update({
+      where: { id: plan.id },
+      data: {
+        isActive: isActive ?? undefined,
+        displayOrder: displayOrder ?? undefined,
+        price: price ?? undefined,
+      },
+    });
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Platform trial/grace settings (MERGE: Studio-Verse) ---
+
+router.get("/platform-settings", async (req, res, next) => {
+  try {
+    res.json(await getPlatformSettings());
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/platform-settings", async (req, res, next) => {
+  try {
+    const { trial_duration_days, trial_photo_quota, monthly_grace_days, yearly_grace_days } = req.body || {};
+    const updated = await prisma.platformSettings.upsert({
+      where: { id: "singleton" },
+      update: {
+        trialDurationDays: trial_duration_days ?? undefined,
+        trialPhotoQuota: trial_photo_quota ?? undefined,
+        monthlyGraceDays: monthly_grace_days ?? undefined,
+        yearlyGraceDays: yearly_grace_days ?? undefined,
+      },
+      create: { id: "singleton" },
+    });
+    res.json(updated);
   } catch (err) {
     next(err);
   }

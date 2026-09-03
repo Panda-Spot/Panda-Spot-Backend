@@ -30,3 +30,10 @@ export const guestWhatsAppLinkLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, 
 export const guestUploadLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 10 }); // guest crowdsourced photo upload
 export const guestLikeLimiter = makeLimiter({ windowMs: 5 * 60 * 1000, limit: 60 }); // guest like/unlike toggle
 export const guestCommentLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 20 }); // guest comment post
+
+// MERGE (Studio-Verse Photo Selection, Phase 15 security review): the
+// client-invite accept endpoint is public/unauthenticated and creates a
+// real account from a user-supplied password — same risk profile as
+// /auth/register, which already has registerLimiter. This was a real gap
+// (added in Phase 7, no limiter applied) found during this review pass.
+export const clientInviteLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 10 }); // client-invite preview + accept

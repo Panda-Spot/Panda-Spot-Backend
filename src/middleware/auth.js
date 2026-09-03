@@ -1,11 +1,17 @@
 import jwt from "jsonwebtoken";
+import { randomUUID } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const COOKIE_NAME = "pandaspot_token";
+const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days, matches the existing token lifetime
 
+/// MERGE (Studio-Verse): every token gets a unique `jti` so a single token
+/// can be blocklisted early (real logout, "log out everywhere" after a
+/// password reset) without needing to rotate JWT_SECRET and invalidate
+/// every session at once.
 export function signToken(user) {
-  return jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: "30d" });
+  return jwt.sign({ sub: user.id, email: user.email, jti: randomUUID() }, JWT_SECRET, { expiresIn: TOKEN_TTL_SECONDS });
 }
 
 // The frontend (Vercel) and this API (VPS) live on entirely different
@@ -76,7 +82,16 @@ export async function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Invalid or expired session" });
   }
   try {
-    const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { suspendedAt: true } });
+    // MERGE (Studio-Verse): reject a token that's been explicitly logged
+    // out / force-invalidated early, even though it's still
+    // cryptographically valid and unexpired.
+    if (payload.jti) {
+      const blocked = await prisma.tokenBlocklist.findUnique({ where: { jti: payload.jti } });
+      if (blocked) {
+        return res.status(401).json({ error: "Invalid or expired session" });
+      }
+    }
+    const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { suspendedAt: true, role: true } });
     if (!user) {
       // Deleted by an admin (see routes/admin.js) — the token is otherwise
       // still cryptographically valid for up to 30 days, so this needs an
@@ -86,11 +101,25 @@ export async function requireAuth(req, res, next) {
     if (user.suspendedAt) {
       return res.status(403).json({ error: "This account has been suspended" });
     }
+    req.user = { id: payload.sub, email: payload.email, jti: payload.jti, exp: payload.exp, role: user.role };
+    return next();
   } catch (err) {
     return next(err);
   }
-  req.user = { id: payload.sub, email: payload.email };
-  next();
+}
+
+/// MERGE (Studio-Verse): blocklists the currently-authenticated request's
+/// own token so it can't be reused, even though it hasn't naturally
+/// expired yet. Call from routes/auth.js's /logout (real invalidation,
+/// not just clearing the cookie) and anywhere a password changes /
+/// "log out everywhere" is triggered.
+export async function blocklistToken({ jti, exp }) {
+  if (!jti || !exp) return; // older tokens signed before this feature have no jti — nothing to blocklist
+  await prisma.tokenBlocklist.upsert({
+    where: { jti },
+    create: { jti, expiresAt: new Date(exp * 1000) },
+    update: {},
+  });
 }
 
 /** Non-throwing variant: attaches req.user if a valid token is present, otherwise leaves it undefined. */

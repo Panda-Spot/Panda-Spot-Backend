@@ -7,9 +7,29 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// 4-tier role model, added for the Studio-Verse merge (see MERGE_PLAN.md
+/// D2). Every row that existed before this migration is backfilled as
+/// ADMIN (a studio owner) — that's exactly what every pre-merge PandaSpot
+/// account already was. SUPER_ADMIN is the platform operator (was
+/// implicit via ADMIN_EMAILS env var before — see routes/admin.js; that
+/// check stays as a belt-and-suspenders guard, this column is now the
+/// real source of truth). USER is a studio's client (Photo Selection
+/// login). INVITED generalizes the old EventCollaborator/EventInvite
+/// bolt-on into a first-class scoped-access role.
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  USER
+  INVITED
+}
+
 model User {
   id           String   @id @default(uuid())
   email        String   @unique
+  /// MERGE: added for the Studio-Verse merge — see the Role enum's own
+  /// comment. Defaults ADMIN so every existing account keeps working
+  /// exactly as before (a studio owner) without any other backfill.
+  role         Role     @default(ADMIN)
   /// Null for Google-only accounts (no password was ever set) — see routes/auth.js's
   /// /auth/google handler and the login route's null-check.
   passwordHash String?
@@ -24,6 +44,34 @@ model User {
   brandColor String?
 
   collaboratesOn EventCollaborator[]
+
+  /// MERGE (Studio-Verse Photo Selection): events this USER-role client
+  /// has been granted gallery access to, and the favourites/picks they've
+  /// made.
+  eventAccess       EventUserMapping[]
+  clientFavourites  ClientFavourite[]
+  studioFavourites  StudioFavourite[]
+
+  /// MERGE (Studio-Verse Billing & Subscriptions): this ADMIN-role user
+  /// acting as the studio ("tenant" in Studio-Verse's terms — this merge
+  /// has no separate Tenant table, an ADMIN User IS the tenant).
+  subscriptions      TenantSubscription[]
+  wallet             TenantWallet?
+  walletTransactions WalletTransaction[]
+  billingSettings    TenantBillingSettings?
+  studioServices     StudioService[]
+  quotationsAsTenant Quotation[]            @relation("QuotationTenant")
+  billsAsTenant      Bill[]                 @relation("BillTenant")
+  paymentsAsTenant   Payment[]              @relation("PaymentTenant")
+  /// A USER-role client being billed — see resolveClient's own comment on
+  /// Quotation/Bill below for why this is just the same User model,
+  /// unlike Studio-Verse's separate legacy BillingClient table.
+  quotationsAsClient Quotation[]            @relation("QuotationClient")
+  billsAsClient      Bill[]                 @relation("BillClient")
+
+  /// MERGE (Studio-Verse Support Tickets, Phase 13).
+  supportTickets      SupportTicket[]
+  supportTicketReplies SupportTicketReply[]
 
   /// Google account id (the JWT `sub` claim) once linked via Sign in with
   /// Google — null for accounts that have never used it.
@@ -54,6 +102,29 @@ model User {
   /// lib/photoRetention.js deletes just the full-res file (thumbnail +
   /// search data are never touched by this). Null means "use the default".
   customPhotoRetentionDays Int?
+
+  /// MERGE (Studio-Verse): account-lockout counters for the login route.
+  /// failedLoginAttempts resets to 0 on any successful login; lockedUntil
+  /// is set once attempts hit ACCOUNT_LOCK_MAX_FAILED_ATTEMPTS and blocks
+  /// login (with a clear message) until it passes, then the next attempt
+  /// is allowed to try again fresh. Independent of suspendedAt (an admin
+  /// action) — this is purely a self-triggered, self-clearing brute-force
+  /// defense.
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+}
+
+/// MERGE (Studio-Verse): a specific JWT (by its `jti` claim), blocked
+/// before its natural expiry — powers real logout (a Bearer token can't
+/// otherwise be invalidated early) and "log out everywhere" after a
+/// password reset. expiresAt mirrors the token's own `exp` so a cleanup
+/// job can safely delete rows for tokens that would have expired anyway.
+/// See middleware/auth.js's requireAuth, which checks this table on every
+/// authenticated request.
+model TokenBlocklist {
+  jti       String   @id
+  expiresAt DateTime
+  createdAt DateTime @default(now())
 }
 
 /// A single-use, time-limited token emailed to confirm account ownership.
@@ -108,6 +179,33 @@ model Event {
   collaborators EventCollaborator[]
   invites       EventInvite[]
   alertSubscriptions GuestAlertSubscription[]
+
+  /// MERGE (Studio-Verse): independent feature toggles so an event can run
+  /// Face Search and/or Photo Selection at the same time — see
+  /// MERGE_PLAN.md D6. faceSearchEnabled defaults true because every
+  /// event created before this migration IS a face-search event today;
+  /// photoSelectionEnabled defaults false since it's a brand-new
+  /// capability nothing existing opted into yet.
+  faceSearchEnabled     Boolean @default(true)
+  photoSelectionEnabled Boolean @default(false)
+
+  /// MERGE (Studio-Verse): studio can unpublish/republish an event
+  /// independent of guest-access expiry (expiresAt) — while unpublished,
+  /// Photo Selection clients see a "not ready yet" state. Null = never
+  /// published (new default for events created after this migration);
+  /// existing events are backfilled to their own createdAt, since they've
+  /// effectively been "published" (live to guests) since creation.
+  publishedAt DateTime?
+  /// MERGE (Studio-Verse): per-event opt-out of allowing clients/guests to
+  /// download full-resolution originals (view/favourite only). Defaults
+  /// true (download allowed) to match PandaSpot's existing behavior for
+  /// every event that predates this flag.
+  allowDownload Boolean @default(true)
+
+  /// MERGE (Studio-Verse Photo Selection): which USER-role clients have
+  /// access to this event's gallery to browse/favourite/submit.
+  clientAccess  EventUserMapping[]
+  clientInvites ClientInvite[]
 
   /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
   /// — a freshly-created event has no upload/import/PandaShoots UI at all
@@ -302,6 +400,87 @@ model Photo {
 
   likes    PhotoLike[]
   comments PhotoComment[]
+
+  /// MERGE (Studio-Verse Photo Selection): favourites this photo has
+  /// received from logged-in clients / the studio's own separate picks.
+  clientFavourites ClientFavourite[]
+  studioFavourites StudioFavourite[]
+}
+
+/// MERGE (Studio-Verse Photo Selection): a pending invite for a client to
+/// gain Photo Selection access to one event — mirrors EventInvite (staff
+/// collaborator invites) exactly in shape, but accepting one creates an
+/// EventUserMapping (+ a brand-new USER-role account if the email doesn't
+/// have one yet) instead of an EventCollaborator. See routes/
+/// clientInvites.js. favouriteCap is copied onto the EventUserMapping
+/// created at accept time.
+model ClientInvite {
+  id           String    @id @default(uuid())
+  eventId      String
+  event        Event     @relation(fields: [eventId], references: [id])
+  email        String
+  token        String    @unique
+  favouriteCap Int?
+  createdAt    DateTime  @default(now())
+  acceptedAt   DateTime?
+
+  @@index([eventId])
+  @@index([email])
+}
+
+/// MERGE (Studio-Verse Photo Selection): grants a USER-role client access
+/// to browse/favourite/submit on one event's gallery — the Photo
+/// Selection equivalent of PandaSpot's EventCollaborator (which is a
+/// studio-staff concept, not a client concept). One row per (event, user).
+/// favouriteCap/submittedAt reproduce Studio-Verse's favourite-cap +
+/// one-way submit-lock behavior exactly (see STUDIO_VERSE_HANDOFF.md).
+model EventUserMapping {
+  id           String    @id @default(uuid())
+  eventId      String
+  event        Event     @relation(fields: [eventId], references: [id])
+  userId       String
+  user         User      @relation(fields: [userId], references: [id])
+  createdAt    DateTime  @default(now())
+  /// Null = no cap (unlimited favourites). Set by the studio per client.
+  favouriteCap Int?
+  /// Once set, this client's favourite selection is locked — matches
+  /// Studio-Verse's one-way "submit" action (no un-submitting).
+  submittedAt  DateTime?
+
+  @@unique([eventId, userId])
+  @@index([userId])
+}
+
+/// MERGE (Studio-Verse Photo Selection): a client's favourite on one
+/// photo. Distinct from PhotoLike (PandaSpot's anonymous-guest reaction
+/// system, keyed by guestClientId) — this is a real logged-in User acting
+/// within their granted EventUserMapping access.
+model ClientFavourite {
+  id        String   @id @default(uuid())
+  photoId   String
+  photo     Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([photoId, userId])
+  @@index([userId])
+}
+
+/// MERGE (Studio-Verse Photo Selection): the studio's own separate "picks"
+/// on a client's event — kept as its own table (not reusing
+/// ClientFavourite) because Studio-Verse treats studio picks and client
+/// favourites as two independent lists over the same photo pool.
+model StudioFavourite {
+  id        String   @id @default(uuid())
+  photoId   String
+  photo     Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([photoId, userId])
+  @@index([userId])
 }
 
 /// A guest's reaction on a photo — one per (photo, guest); tapping a
@@ -430,4 +609,323 @@ model ZipDownload {
   readyAt      DateTime?
 
   @@index([eventId])
+}
+
+// =====================================================================
+// MERGE (Studio-Verse Billing & Subscriptions) — Phase 12. Ported field-
+// for-field from Studio-Verse's schema (see MERGE_PLAN.md for the full
+// business-rule extraction this was based on), renamed to this project's
+// camelCase convention. "Tenant" in Studio-Verse's language is just an
+// ADMIN-role User here — there's no separate Tenant table in the unified
+// model, so every `tenantId` below is a plain FK to User.id. No real
+// payment gateway is ported (Studio-Verse never had one either — see
+// PaymentMethod: payments are recorded, not gatewayed).
+// =====================================================================
+
+enum PlanType {
+  SUBSCRIPTION
+  WALLET
+}
+
+enum DurationUnit {
+  DAYS
+  MONTHS
+  YEARS
+}
+
+enum WalletTier {
+  INITIAL
+  TOPUP
+}
+
+enum TenantSubscriptionStatus {
+  TRIAL
+  ACTIVE
+  GRACE
+  EXPIRED
+  CANCELLED
+}
+
+enum QuotationStatus {
+  DRAFT
+  CONFIRMED
+}
+
+enum BillStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+}
+
+enum PaymentMethod {
+  CASH
+  GPAY
+  CARD
+  BANK_TRANSFER
+  CHEQUE
+}
+
+model SubscriptionPlan {
+  id                       String       @id @default(uuid())
+  planName                 String
+  planType                 PlanType
+  /// SUBSCRIPTION only.
+  durationValue            Int?
+  durationUnit             DurationUnit?
+  photoQuota               Int?
+  price                    Decimal      @db.Decimal(10, 2)
+  /// WALLET only — credits granted on purchase.
+  walletCredits            Int?
+  walletTier               WalletTier?
+  /// WALLET only — credits deducted per AI-matched photo.
+  aiCreditCostPerPhoto     Int?
+  /// SUBSCRIPTION only — whether events on this plan get Face Search.
+  includesAiMedia          Boolean      @default(false)
+  /// Grandfathering: only tenants created before this date can see/pick
+  /// this plan — lets a plan be retired without breaking existing subs.
+  specialAccessCutoffDate  DateTime?
+  displayOrder             Int          @default(0)
+  isActive                 Boolean      @default(true)
+  createdAt                DateTime     @default(now())
+  updatedAt                DateTime     @updatedAt
+
+  subscriptions TenantSubscription[]
+}
+
+/// MERGE: one row per subscription period/state change for a tenant — see
+/// lib/subscriptionAccess.js for the lazy lifecycle sweep
+/// (TRIAL/ACTIVE → GRACE → EXPIRED) this model drives. The partial unique
+/// index below (hand-added to the migration, Prisma's schema DSL can't
+/// express a `WHERE` clause) is the same "exactly one active row" pattern
+/// proven in Studio-Verse — enforced at the DB level, not just in code.
+model TenantSubscription {
+  id                 String                    @id @default(uuid())
+  tenantId           String
+  tenant             User                      @relation(fields: [tenantId], references: [id])
+  subscriptionPlanId String?
+  subscriptionPlan   SubscriptionPlan?         @relation(fields: [subscriptionPlanId], references: [id])
+  status             TenantSubscriptionStatus
+  /// Free-text, matching Studio-Verse exactly (not an enum there either):
+  /// SUBSCRIBE | UPGRADE | DOWNGRADE | TRIAL | FREE_GRANT | ADMIN_SET.
+  changeType         String?
+  lockedPrice        Decimal?                  @db.Decimal(10, 2)
+  isPriceLocked      Boolean                   @default(false)
+  isFreeGrant        Boolean                   @default(false)
+  photoQuotaTotal    Int
+  photoQuotaUsed     Int                       @default(0)
+  startsAt           DateTime                  @default(now())
+  expiresAt          DateTime?
+  graceEndsAt        DateTime?
+  isActive           Boolean                   @default(true)
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
+
+  @@index([tenantId])
+}
+
+model TenantWallet {
+  id             String   @id @default(uuid())
+  tenantId       String   @unique
+  tenant         User     @relation(fields: [tenantId], references: [id])
+  balanceCredits Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+/// MERGE: the wallet ledger — every RECHARGE/AI_USAGE/ADJUSTMENT gets a
+/// row here, each carrying the resulting balanceAfter for point-in-time
+/// reconstruction (see lib/subscriptionAccess.js).
+model WalletTransaction {
+  id           String   @id @default(uuid())
+  tenantId     String
+  tenant       User     @relation(fields: [tenantId], references: [id])
+  /// RECHARGE | AI_USAGE | ADJUSTMENT
+  type         String
+  /// Signed — negative for usage/deductions.
+  credits      Int
+  balanceAfter Int
+  reference    String?
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+/// MERGE: platform-wide trial/grace defaults, Super-Admin-tunable at
+/// runtime (mirrors the DEFAULT_TRIAL_*/DEFAULT_*_GRACE_DAYS env vars
+/// already in .env.example, which now only seed this row on first boot —
+/// see lib/subscriptionAccess.js). Singleton: always id "singleton".
+model PlatformSettings {
+  id                 String   @id @default("singleton")
+  trialDurationDays  Int      @default(7)
+  trialPhotoQuota    Int      @default(200)
+  monthlyGraceDays   Int      @default(3)
+  yearlyGraceDays    Int      @default(12)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+/// MERGE: per-tenant atomic document-numbering counters (see
+/// lib/billingAccess.js's claimNextNumber — an upsert-with-increment
+/// inside the same transaction that creates the document, ported
+/// verbatim from Studio-Verse) plus display-only GST fields.
+model TenantBillingSettings {
+  id                    String   @id @default(uuid())
+  tenantId              String   @unique
+  tenant                User     @relation(fields: [tenantId], references: [id])
+  nextQuotationNumber   Int      @default(1)
+  nextBillNumber        Int      @default(1)
+  nextReceiptNumber     Int      @default(1)
+  gstinNumber           String?
+  gstState              String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model StudioService {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    User     @relation(fields: [tenantId], references: [id])
+  name      String
+  price     Decimal? @db.Decimal(10, 2)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+}
+
+/// MERGE: `clientId` is a real USER-role `User` — this merge has no
+/// separate legacy BillingClient table (Studio-Verse's own is explicitly
+/// dead/superseded — see MERGE_PLAN.md). quotationNumber is unique per
+/// tenant (not globally), claimed atomically via TenantBillingSettings.
+model Quotation {
+  id              String          @id @default(uuid())
+  tenantId        String
+  tenant          User            @relation("QuotationTenant", fields: [tenantId], references: [id])
+  clientId        String
+  client          User            @relation("QuotationClient", fields: [clientId], references: [id])
+  quotationNumber Int
+  status          QuotationStatus @default(DRAFT)
+  /// Flat, whole-document discount — see lib/billingAccess.js's payable
+  /// calculation. Independent of each item's own discountPerUnit.
+  discountAmount  Decimal         @default(0) @db.Decimal(10, 2)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  items QuotationItem[]
+  bill  Bill?
+
+  @@unique([tenantId, quotationNumber])
+  @@index([tenantId])
+  @@index([clientId])
+}
+
+model QuotationItem {
+  id              String    @id @default(uuid())
+  quotationId     String
+  quotation       Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  name            String
+  price           Decimal   @db.Decimal(10, 2)
+  quantity        Int
+  /// Flat, per-unit discount — see Quotation.discountAmount's comment.
+  discountPerUnit Decimal   @default(0) @db.Decimal(10, 2)
+}
+
+/// MERGE: can ONLY be created from a confirmed Quotation (see
+/// routes/billing.js's confirm endpoint — enforced in application code,
+/// same as Studio-Verse: there is deliberately no create-Bill-directly
+/// route). Immutable once created: deliberately no update endpoint,
+/// matching Studio-Verse's approach exactly (enforced by the absence of
+/// a mutation route, not a DB trigger).
+model Bill {
+  id             String     @id @default(uuid())
+  tenantId       String
+  tenant         User       @relation("BillTenant", fields: [tenantId], references: [id])
+  clientId       String
+  client         User       @relation("BillClient", fields: [clientId], references: [id])
+  quotationId    String     @unique
+  quotation      Quotation  @relation(fields: [quotationId], references: [id])
+  billNumber     Int
+  status         BillStatus @default(UNPAID)
+  discountAmount Decimal    @default(0) @db.Decimal(10, 2)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  items    BillItem[]
+  payments Payment[]
+
+  @@unique([tenantId, billNumber])
+  @@index([tenantId])
+  @@index([clientId])
+}
+
+model BillItem {
+  id              String  @id @default(uuid())
+  billId          String
+  bill            Bill    @relation(fields: [billId], references: [id], onDelete: Cascade)
+  name            String
+  price           Decimal @db.Decimal(10, 2)
+  quantity        Int
+  discountPerUnit Decimal @default(0) @db.Decimal(10, 2)
+}
+
+/// MERGE: partial/split payments against one Bill — see
+/// routes/billing.js's overpayment guard (a 0.01 epsilon absorbs
+/// Decimal/float rounding, matching Studio-Verse exactly).
+model Payment {
+  id            String        @id @default(uuid())
+  tenantId      String
+  tenant        User          @relation("PaymentTenant", fields: [tenantId], references: [id])
+  billId        String
+  bill          Bill          @relation(fields: [billId], references: [id])
+  receiptNumber Int
+  amount        Decimal       @db.Decimal(10, 2)
+  method        PaymentMethod
+  remark        String?
+  createdAt     DateTime      @default(now())
+
+  @@unique([tenantId, receiptNumber])
+  @@index([tenantId])
+  @@index([billId])
+}
+
+// =====================================================================
+// MERGE (Studio-Verse Support Tickets) — Phase 13.
+// =====================================================================
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+/// MERGE: raised by a tenant (ADMIN-role User), read/replied to by a
+/// SUPER_ADMIN. See routes/support.js for the auto-bump-to-IN_PROGRESS-
+/// on-admin-reply rule.
+model SupportTicket {
+  id        String              @id @default(uuid())
+  tenantId  String
+  tenant    User                @relation(fields: [tenantId], references: [id])
+  subject   String
+  status    SupportTicketStatus @default(OPEN)
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  replies SupportTicketReply[]
+
+  @@index([tenantId])
+}
+
+model SupportTicketReply {
+  id        String        @id @default(uuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User          @relation(fields: [authorId], references: [id])
+  message   String
+  createdAt DateTime      @default(now())
+
+  @@index([ticketId])
 }

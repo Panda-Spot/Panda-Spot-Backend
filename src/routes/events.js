@@ -6,12 +6,13 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
-import { ALLOWED_EXTENSIONS, saveEventPhoto, deleteFileIfExists } from "../lib/storage.js";
+import { ALLOWED_EXTENSIONS, deleteFileIfExists } from "../lib/storage.js";
+import { getStorageProvider } from "../lib/storageProvider.js";
 import { detectFaces } from "../lib/faceEngine.js";
 import { insertFace } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { loadAccessibleEvent } from "../lib/access.js";
-import { sendCollaboratorInviteEmail } from "../lib/mailer.js";
+import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter } from "../lib/rateLimiters.js";
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
@@ -159,6 +160,8 @@ router.get("/:id", async (req, res, next) => {
       drive_backup_enabled: event.driveBackupEnabled,
       drive_backup_available: isDriveBackupConfigured(),
       started: !!event.startedAt,
+      face_search_enabled: event.faceSearchEnabled,
+      photo_selection_enabled: event.photoSelectionEnabled,
       guest_upload_enabled: event.guestUploadEnabled,
       guest_upload_window_days: event.guestUploadWindowDays,
       pending_guest_upload_count: pendingGuestUploadCount,
@@ -306,6 +309,34 @@ router.post("/:id/guest-uploads/window", async (req, res, next) => {
   }
 });
 
+// MERGE (Studio-Verse): the central "one event, two independent feature
+// toggles" requirement (see MERGE_PLAN.md D6) — a studio can run Face
+// Search and/or Photo Selection on the same event, at the same time.
+// Owner or collaborator, matching every other event-settings toggle here.
+// Both can be true; both can be false (an event with neither is just a
+// plain gallery for now, which is a valid state, not an error).
+router.post("/:id/features/toggle", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { feature, enabled } = req.body || {};
+    if (feature !== "faceSearch" && feature !== "photoSelection") {
+      return res.status(400).json({ error: 'feature must be "faceSearch" or "photoSelection"' });
+    }
+
+    const data = feature === "faceSearch" ? { faceSearchEnabled: !!enabled } : { photoSelectionEnabled: !!enabled };
+    const updated = await prisma.event.update({ where: { id: event.id }, data });
+    res.json({
+      face_search_enabled: updated.faceSearchEnabled,
+      photo_selection_enabled: updated.photoSelectionEnabled,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Owner-only — deleting the whole event (guest link, every photo, every
 // collaborator) is a much bigger action than removing one bad photo.
 // Deletes in FK dependency order (children before the Event row itself),
@@ -363,7 +394,7 @@ async function processUploadJob(jobId, event, files) {
         if (detection) {
           const photoId = randomUUID();
           const storedFilename = `${photoId}${ext}`;
-          const storagePath = await saveEventPhoto(event.id, storedFilename, file.buffer);
+          const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
           const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
 
           const faces = detection.faces || [];
@@ -1068,7 +1099,7 @@ router.delete("/:id/photos/:photoId", async (req, res, next) => {
     await prisma.face.deleteMany({ where: { photoId: photo.id } });
     await prisma.photo.delete({ where: { id: photo.id } });
 
-    await deleteFileIfExists(photo.storagePath);
+    await getStorageProvider().deleteOriginal(photo.storagePath);
     await deleteFileIfExists(photo.thumbnailPath);
 
     res.status(204).end();
@@ -1242,6 +1273,112 @@ router.delete("/:id/invites/:inviteId", async (req, res, next) => {
     }
 
     await prisma.eventInvite.delete({ where: { id: invite.id } });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Photo Selection client management (MERGE: Studio-Verse) — owner or
+// collaborator (matching everything else on this event), unlike
+// collaborator management above which is owner-only. Inviting a client is
+// a routine per-event task any second shooter should be able to do, not a
+// sensitive access-control action like adding another collaborator. ---
+
+router.post("/:id/clients/invite", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { email, favourite_cap: favouriteCap } = req.body || {};
+    if (!email || typeof email !== "string" || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: "A valid email address is required" });
+    }
+    if (favouriteCap != null && (!Number.isInteger(favouriteCap) || favouriteCap < 1)) {
+      return res.status(400).json({ error: "favourite_cap must be a positive integer, or omitted for no cap" });
+    }
+    const normalizedEmail = email.toLowerCase();
+
+    const existingUser = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    if (existingUser && existingUser.role === "USER") {
+      await prisma.eventUserMapping.upsert({
+        where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
+        create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null },
+        update: {},
+      });
+      return res.json({ status: "added", email: normalizedEmail });
+    }
+    if (existingUser && existingUser.role !== "USER") {
+      return res.status(409).json({ error: "This email already has a different kind of PandaSpot account" });
+    }
+
+    let invite = await prisma.clientInvite.findFirst({
+      where: { eventId: event.id, acceptedAt: null, email: { equals: normalizedEmail, mode: "insensitive" } },
+    });
+    if (!invite) {
+      const token = randomBytes(24).toString("base64url");
+      invite = await prisma.clientInvite.create({
+        data: { eventId: event.id, email: normalizedEmail, token, favouriteCap: favouriteCap ?? null },
+      });
+    }
+
+    const inviteUrl = `${PUBLIC_WEB_URL}/client-invites/${invite.token}`;
+    await sendClientInviteEmail(normalizedEmail, event.name, inviteUrl);
+
+    res.json({ status: "invited", email: normalizedEmail });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/:id/clients", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mappings = await prisma.eventUserMapping.findMany({
+      where: { eventId: event.id },
+      include: { user: true },
+    });
+    const pendingInviteRows = await prisma.clientInvite.findMany({
+      where: { eventId: event.id, acceptedAt: null },
+    });
+
+    res.json({
+      clients: mappings.map((m) => ({
+        user_id: m.user.id,
+        email: m.user.email,
+        name: m.user.name,
+        favourite_cap: m.favouriteCap,
+        submitted_at: m.submittedAt,
+      })),
+      pending_invites: pendingInviteRows.map((i) => ({
+        invite_id: i.id,
+        email: i.email,
+        invited_at: i.createdAt,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/:id/clients/:userId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mapping = await prisma.eventUserMapping.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: req.params.userId } },
+    });
+    if (!mapping) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+
+    await prisma.eventUserMapping.delete({ where: { id: mapping.id } });
     res.status(204).end();
   } catch (err) {
     next(err);

@@ -1,5 +1,5 @@
 import { prisma } from "./prisma.js";
-import { deleteFileIfExists } from "./storage.js";
+import { getStorageProvider } from "./storageProvider.js";
 
 /**
  * The platform-wide default retention policy: a photo's full-res original
@@ -22,7 +22,7 @@ export async function runPhotoRetentionSweep() {
 
   for (const photo of duePhotos) {
     try {
-      await deleteFileIfExists(photo.storagePath);
+      await getStorageProvider().deleteOriginal(photo.storagePath);
       await prisma.photo.update({ where: { id: photo.id }, data: { storagePath: null } });
     } catch (err) {
       console.error(`Photo retention sweep failed for photo ${photo.id}:`, err.message);
