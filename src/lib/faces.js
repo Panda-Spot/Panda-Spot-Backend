@@ -85,7 +85,10 @@ export async function searchSimilarPhotos({ eventId, embedding, threshold }) {
       f."photoId" AS "photoId",
       MAX(1 - (f.embedding <=> ${vectorLiteral}::vector)) AS similarity
     FROM "Face" f
+    INNER JOIN "Photo" p ON p.id = f."photoId"
     WHERE f."eventId" = ${eventId}
+      AND p."faceSearchVisible" = true
+      AND p."approvalStatus" = 'approved'
     GROUP BY f."photoId"
     HAVING MAX(1 - (f.embedding <=> ${vectorLiteral}::vector)) >= ${threshold}
     ORDER BY similarity DESC

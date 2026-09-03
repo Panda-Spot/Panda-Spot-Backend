@@ -126,6 +126,17 @@ router.get("/:id", async (req, res, next) => {
     const { event, role } = accessible;
 
     const photoCount = await prisma.photo.count({ where: { eventId: event.id } });
+    const aiIndexedPhotoCount = await prisma.photo.count({
+      where: { eventId: event.id, faceIndexedAt: { not: null } },
+    });
+    const faceSearchSearchablePhotoCount = await prisma.photo.count({
+      where: {
+        eventId: event.id,
+        approvalStatus: "approved",
+        faceSearchVisible: true,
+        faceIndexedAt: { not: null },
+      },
+    });
     const storageUsedBytes = await eventStorageUsedBytes(prisma, event.id);
     const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
     const pendingGuestUploadCount = await prisma.photo.count({
@@ -145,6 +156,8 @@ router.get("/:id", async (req, res, next) => {
       createdAt: event.createdAt,
       expires_at: event.expiresAt,
       photo_count: photoCount,
+      ai_indexed_photo_count: aiIndexedPhotoCount,
+      face_search_searchable_photo_count: faceSearchSearchablePhotoCount,
       storage_used_bytes: storageUsedBytes,
       storage_limit_bytes: effectiveStorageLimitBytes(owner),
       role,

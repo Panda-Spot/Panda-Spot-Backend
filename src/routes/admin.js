@@ -374,7 +374,7 @@ router.get("/users/:id", async (req, res, next) => {
     // tenant's subscription in the same admin client-detail view Studio-
     // Verse had — informational only, see lib/subscriptionAccess.js's own
     // safety note on why this isn't enforced against uploads yet.
-    const [subscription, subscriptionHistory, wallet] = await Promise.all([
+    const [subscription, subscriptionHistory, wallet, aiIndexedPhotoCount] = await Promise.all([
       getActiveSubscription(user.id),
       prisma.tenantSubscription.findMany({
         where: { tenantId: user.id },
@@ -382,12 +382,19 @@ router.get("/users/:id", async (req, res, next) => {
         orderBy: { startsAt: "desc" },
       }),
       prisma.tenantWallet.findUnique({ where: { tenantId: user.id } }),
+      prisma.photo.count({
+        where: {
+          event: { ownerId: user.id },
+          faceIndexedAt: { not: null },
+        },
+      }),
     ]);
 
     res.json({
       subscription: serializeSubscription(subscription),
       subscription_history: subscriptionHistory.map(serializeSubscription),
       wallet_balance: wallet?.balanceCredits ?? 0,
+      ai_indexed_photo_count: aiIndexedPhotoCount,
       id: user.id,
       name: user.name,
       email: user.email,

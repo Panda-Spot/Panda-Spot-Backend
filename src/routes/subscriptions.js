@@ -42,7 +42,15 @@ router.get("/me", async (req, res, next) => {
       getActiveSubscription(req.user.id),
       getPlatformSettings(),
     ]);
-    const wallet = await prisma.tenantWallet.findUnique({ where: { tenantId: req.user.id } });
+    const [wallet, aiIndexedPhotoCount] = await Promise.all([
+      prisma.tenantWallet.findUnique({ where: { tenantId: req.user.id } }),
+      prisma.photo.count({
+        where: {
+          event: { ownerId: req.user.id },
+          faceIndexedAt: { not: null },
+        },
+      }),
+    ]);
     res.json({
       free_access_enabled: settings?.freeAccessEnabled ?? true,
       subscription: subscription
@@ -58,6 +66,7 @@ router.get("/me", async (req, res, next) => {
           }
         : null,
       wallet_balance: wallet?.balanceCredits ?? 0,
+      ai_indexed_photo_count: aiIndexedPhotoCount,
     });
   } catch (err) {
     next(err);
