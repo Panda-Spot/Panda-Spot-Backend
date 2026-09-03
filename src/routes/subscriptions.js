@@ -6,6 +6,7 @@ import {
   activateTrial,
   downgradePlan,
   getActiveSubscription,
+  getPlatformSettings,
   rechargeWallet,
   subscribeToPlan,
   upgradePlan,
@@ -37,9 +38,13 @@ router.get("/plans", async (req, res, next) => {
 
 router.get("/me", async (req, res, next) => {
   try {
-    const subscription = await getActiveSubscription(req.user.id);
+    const [subscription, settings] = await Promise.all([
+      getActiveSubscription(req.user.id),
+      getPlatformSettings(),
+    ]);
     const wallet = await prisma.tenantWallet.findUnique({ where: { tenantId: req.user.id } });
     res.json({
+      free_access_enabled: settings?.freeAccessEnabled ?? true,
       subscription: subscription
         ? {
             id: subscription.id,

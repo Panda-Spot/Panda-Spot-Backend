@@ -10,6 +10,7 @@ import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.
 import { emitJobEvent } from "./jobQueue.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 import { publishLiveEvent } from "./liveEvents.js";
+import { assertQuotaAvailable, consumeQuota } from "./subscriptionAccess.js";
 
 // Once per day — see runDueAutoSyncs below.
 const AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -19,11 +20,14 @@ const AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
  * — never writes the original to local disk (see schema.prisma's Photo
  * notes). Returns `{ skipped: reason }` or `{ fileSize, facesFound }`.
  */
-async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes) {
+async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, quotaRef) {
   const fileSize = parseInt(file.size, 10) || 0;
   const ext = guessExtension(file.mimeType, file.name);
 
   if (!ext) return { skipped: `${file.name} (unsupported file type)` };
+  if (quotaRef?.subscription && quotaRef.used >= quotaRef.subscription.photoQuotaTotal) {
+    return { skipped: `${file.name} (photo quota reached)` };
+  }
   if (usedBytesRef.value + fileSize > storageLimitBytes) {
     return { skipped: `${file.name} (event storage limit reached)` };
   }
@@ -78,6 +82,8 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes) 
   }
 
   usedBytesRef.value += fileSize;
+  if (quotaRef?.subscription) quotaRef.used += 1;
+  await consumeQuota(event.ownerId);
   const photoShape = {
     photo_id: photo.id,
     filename: photo.filename,
@@ -134,11 +140,13 @@ export async function processDriveImportJob(jobId, event, files) {
   const usedBytesRef = { value: await eventStorageUsedBytes(prisma, event.id) };
   const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
   const storageLimitBytes = effectiveStorageLimitBytes(owner);
+  const subscription = await assertQuotaAvailable(event.ownerId);
+  const quotaRef = subscription ? { subscription, used: subscription.photoQuotaUsed } : null;
   const newPhotoIds = [];
 
   try {
     for (const file of files) {
-      const result = await importOneDriveFile(event, file, usedBytesRef, storageLimitBytes);
+      const result = await importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, quotaRef);
       if (result.skipped) skipped.push(result.skipped);
       else {
         facesFoundSoFar += result.facesFound;
@@ -200,10 +208,12 @@ export async function processDriveSyncJob(jobId, event, currentFiles) {
     const usedBytesRef = { value: await eventStorageUsedBytes(prisma, event.id) };
     const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
     const storageLimitBytes = effectiveStorageLimitBytes(owner);
+    const subscription = await assertQuotaAvailable(event.ownerId);
+    const quotaRef = subscription ? { subscription, used: subscription.photoQuotaUsed } : null;
     const newPhotoIds = [];
 
     for (const file of newFiles) {
-      const result = await importOneDriveFile(event, file, usedBytesRef, storageLimitBytes);
+      const result = await importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, quotaRef);
       if (result.skipped) skipped.push(result.skipped);
       else {
         facesFoundSoFar += result.facesFound;

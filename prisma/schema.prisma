@@ -770,6 +770,10 @@ model PlatformSettings {
   trialPhotoQuota    Int      @default(200)
   monthlyGraceDays   Int      @default(3)
   yearlyGraceDays    Int      @default(12)
+  /// Platform launch switch: while true, every studio can keep using all
+  /// upload/import/Shoots paths even though quota lifecycle code is wired.
+  /// Super Admin can turn this off later to enforce paid/trial plans.
+  freeAccessEnabled  Boolean  @default(true)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 }

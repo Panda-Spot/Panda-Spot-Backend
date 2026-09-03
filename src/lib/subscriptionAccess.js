@@ -4,17 +4,11 @@ import { prisma } from "./prisma.js";
 /// Verse's src/utils/subscriptionAccess.js. "Tenant" = an ADMIN-role
 /// User in this merge (see the schema's own top-of-file comment).
 ///
-/// SAFETY NOTE, read before wiring anything here into a live upload
-/// route: every PandaSpot studio that existed before this migration has
-/// NO TenantSubscription row at all. If assertQuotaAvailable (or any
-/// GRACE/EXPIRED check) were added to the real upload path today, it
-/// would immediately block every existing user, since "no active
-/// subscription" and "expired subscription" look identical from here.
-/// This is why that wiring is deliberately NOT done in this pass — it
-/// needs an explicit grandfathering rollout (e.g. bulk-creating a
-/// trial/free TenantSubscription for every existing ADMIN) as its own
-/// separate, reviewed step, not something to slip in silently. See
-/// MERGE_PLAN.md Phase 12 for the full note.
+/// SAFETY NOTE: every PandaSpot studio that existed before this migration
+/// has no TenantSubscription row. assertQuotaAvailable therefore treats
+/// "no subscription history at all" as a legacy grandfathered account and
+/// allows uploads. Once a studio has any trial/plan/grant history, the
+/// Studio-Verse lifecycle is enforced normally.
 
 const FALLBACK_TRIAL_DURATION_DAYS = parseInt(process.env.DEFAULT_TRIAL_DURATION_DAYS || "7", 10);
 const FALLBACK_TRIAL_PHOTO_QUOTA = parseInt(process.env.DEFAULT_TRIAL_PHOTO_QUOTA || "200", 10);
@@ -33,6 +27,7 @@ export async function getPlatformSettings() {
       trialPhotoQuota: FALLBACK_TRIAL_PHOTO_QUOTA,
       monthlyGraceDays: FALLBACK_MONTHLY_GRACE_DAYS,
       yearlyGraceDays: FALLBACK_YEARLY_GRACE_DAYS,
+      freeAccessEnabled: true,
     },
   });
 }
@@ -152,18 +147,37 @@ export async function purgeTenantContent(tenantId) {
   ]);
 }
 
-/** Throws if uploading should be blocked right now (GRACE/EXPIRED, or no
- * subscription at all). Available for future wiring — see this file's
- * top-of-file safety note for why it's not wired into any real upload
- * route yet. */
+/** Throws if uploading should be blocked right now (GRACE/EXPIRED, or quota
+ * exhausted). Legacy studios with no subscription history are grandfathered:
+ * they predate the merge and keep uploading until a plan/trial/grant is
+ * explicitly assigned, after which the Studio-Verse quota lifecycle applies. */
 export async function assertQuotaAvailable(tenantId) {
+  const settings = await getPlatformSettings();
+  if (settings.freeAccessEnabled) return null;
+
   const sub = await getActiveSubscription(tenantId);
-  if (!sub || sub.status === "GRACE" || sub.status === "EXPIRED" || sub.status === "CANCELLED") {
+  if (!sub) {
+    const hasHistory = await prisma.tenantSubscription.count({ where: { tenantId } });
+    if (hasHistory === 0) return null;
+    throw new Error("No active subscription — uploads are paused until you renew.");
+  }
+  if (sub.status === "GRACE" || sub.status === "EXPIRED" || sub.status === "CANCELLED") {
     throw new Error("No active subscription — uploads are paused until you renew.");
   }
   if (sub.photoQuotaUsed >= sub.photoQuotaTotal) {
     throw new Error("Photo quota reached for your current plan.");
   }
+  return sub;
+}
+
+export async function consumeQuota(tenantId, count = 1) {
+  if (!count || count < 1) return;
+  const settings = await getPlatformSettings();
+  if (settings.freeAccessEnabled) return;
+  await prisma.tenantSubscription.updateMany({
+    where: { tenantId, isActive: true, status: { in: ["TRIAL", "ACTIVE"] } },
+    data: { photoQuotaUsed: { increment: count } },
+  });
 }
 
 /** One-time-only trial activation. Studio-Verse enforces this via a

@@ -1020,7 +1020,7 @@ router.get("/platform-settings", async (req, res, next) => {
 
 router.patch("/platform-settings", async (req, res, next) => {
   try {
-    const { trial_duration_days, trial_photo_quota, monthly_grace_days, yearly_grace_days } = req.body || {};
+    const { trial_duration_days, trial_photo_quota, monthly_grace_days, yearly_grace_days, free_access_enabled: freeAccessEnabled } = req.body || {};
     const updated = await prisma.platformSettings.upsert({
       where: { id: "singleton" },
       update: {
@@ -1028,8 +1028,9 @@ router.patch("/platform-settings", async (req, res, next) => {
         trialPhotoQuota: trial_photo_quota ?? undefined,
         monthlyGraceDays: monthly_grace_days ?? undefined,
         yearlyGraceDays: yearly_grace_days ?? undefined,
+        freeAccessEnabled: freeAccessEnabled ?? undefined,
       },
-      create: { id: "singleton" },
+      create: { id: "singleton", freeAccessEnabled: freeAccessEnabled ?? true },
     });
     res.json(updated);
   } catch (err) {

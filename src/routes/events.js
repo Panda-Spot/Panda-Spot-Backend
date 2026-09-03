@@ -28,6 +28,7 @@ import { isDriveBackupConfigured, isDriveBackupBetaUser } from "../lib/driveBack
 import { reclaimEventDriveBackups } from "../lib/driveBackupRetention.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
 import { uploadToDriveFolder, MIME_BY_EXT } from "../lib/driveBackup.js";
+import { assertQuotaAvailable, consumeQuota } from "../lib/subscriptionAccess.js";
 
 const PUBLIC_WEB_URL = process.env.PUBLIC_WEB_URL || "http://localhost:5173";
 // Loose format check — mirrors guest.js's /e/:slug/download/email regex.
@@ -369,9 +370,11 @@ async function processUploadJob(jobId, event, files) {
   let usedBytes = await eventStorageUsedBytes(prisma, event.id);
   const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
   const storageLimitBytes = effectiveStorageLimitBytes(owner);
+  let subscription = null;
   const newPhotoIds = [];
 
   try {
+    subscription = await assertQuotaAvailable(event.ownerId);
     for (const file of files) {
       const ext = path.extname(file.originalname).toLowerCase();
       let addedPhoto = null;
@@ -380,6 +383,8 @@ async function processUploadJob(jobId, event, files) {
         skipped.push(`${file.originalname} (unsupported file type)`);
       } else if (!contentMatchesExtension(file.buffer, ext)) {
         skipped.push(`${file.originalname} (file content doesn't match its extension)`);
+      } else if (subscription && subscription.photoQuotaUsed + newPhotoIds.length >= subscription.photoQuotaTotal) {
+        skipped.push(`${file.originalname} (photo quota reached)`);
       } else if (usedBytes + file.buffer.length > storageLimitBytes) {
         skipped.push(`${file.originalname} (event storage limit reached)`);
       } else {
@@ -425,6 +430,7 @@ async function processUploadJob(jobId, event, files) {
           facesFoundSoFar += faces.length;
           usedBytes += file.buffer.length;
           newPhotoIds.push(photo.id);
+          await consumeQuota(event.ownerId);
           addedPhoto = {
             photo_id: photo.id,
             filename: photo.filename,
@@ -1074,10 +1080,17 @@ router.post("/:id/photos/:photoId/approve", async (req, res, next) => {
       return res.json({ ok: true, already_approved: true });
     }
 
+    try {
+      await assertQuotaAvailable(event.ownerId);
+    } catch (err) {
+      return res.status(403).json({ error: err.message || "Photo quota unavailable" });
+    }
+
     const updated = await prisma.photo.update({
       where: { id: photo.id },
       data: { approvalStatus: "approved" },
     });
+    await consumeQuota(event.ownerId);
 
     publishLiveEvent(event.id, {
       type: "photo_added",

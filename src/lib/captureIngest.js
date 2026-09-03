@@ -11,6 +11,7 @@ import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetent
 import { publishLiveEvent } from "./liveEvents.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 import { uploadToDriveFolder, MIME_BY_EXT } from "./driveBackup.js";
+import { assertQuotaAvailable, consumeQuota } from "./subscriptionAccess.js";
 
 /**
  * Runs one already-on-disk file (from Shoots' FTP staging area — see
@@ -43,6 +44,11 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
 
   const usedBytes = await eventStorageUsedBytes(prisma, event.id);
   const owner = await prisma.user.findUnique({ where: { id: event.ownerId } });
+  try {
+    await assertQuotaAvailable(event.ownerId);
+  } catch (err) {
+    return skip(event.id, originalFilename, err.message || "photo quota unavailable");
+  }
   if (usedBytes + buffer.length > effectiveStorageLimitBytes(owner)) {
     return skip(event.id, originalFilename, "event storage limit reached");
   }
@@ -113,6 +119,8 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       detScore: face.det_score,
     });
   }
+
+  await consumeQuota(event.ownerId);
 
   publishLiveEvent(event.id, {
     type: "photo_added",
