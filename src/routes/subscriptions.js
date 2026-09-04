@@ -150,4 +150,35 @@ router.get("/wallet/transactions", async (req, res, next) => {
   }
 });
 
+// MERGE (Studio-Verse plan-change history, Phase 18H): the tenant's own
+// full subscription ledger — every subscribe/upgrade/downgrade/trial/free
+// grant row, newest first. Read-only; mirrors the history the admin
+// console already shows per studio.
+router.get("/history", async (req, res, next) => {
+  try {
+    const rows = await prisma.tenantSubscription.findMany({
+      where: { tenantId: req.user.id },
+      include: { subscriptionPlan: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(
+      rows.map((sub) => ({
+        id: sub.id,
+        plan_id: sub.subscriptionPlanId,
+        plan_name: sub.subscriptionPlan?.planName ?? null,
+        status: sub.status,
+        change_type: sub.changeType,
+        is_free_grant: sub.isFreeGrant,
+        photo_quota_total: sub.photoQuotaTotal,
+        photo_quota_used: sub.photoQuotaUsed,
+        starts_at: sub.startsAt,
+        expires_at: sub.expiresAt,
+        created_at: sub.createdAt,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;

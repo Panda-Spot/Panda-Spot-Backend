@@ -60,6 +60,9 @@ model User {
   wallet             TenantWallet?
   walletTransactions WalletTransaction[]
   billingSettings    TenantBillingSettings?
+  /// MERGE (Studio-Verse tenant profile, Phase 18H): contact/address
+  /// details, lazily created on first profile read/write.
+  tenantProfile      TenantProfile?
   studioServices     StudioService[]
   quotationsAsTenant Quotation[]            @relation("QuotationTenant")
   billsAsTenant      Bill[]                 @relation("BillTenant")
@@ -204,10 +207,31 @@ model Event {
   /// every event that predates this flag.
   allowDownload Boolean @default(true)
 
+  /// MERGE (Studio-Verse EventDetail depth, Phase 18E): soft archive — an
+  /// archived event is hidden from guests (see lib/expiry.js, where
+  /// archived counts as guest-closed) and from Photo Selection clients
+  /// (see routes/client.js), while the studio keeps full access and can
+  /// restore at any time. Null = active. Distinct from permanent deletion
+  /// (lib/eventLifecycle.js), which is irreversible.
+  archivedAt DateTime?
+  /// Cover photo for the dashboard grid / client gallery header (16:9
+  /// crop applied client-side before upload). Stored under the event's
+  /// own directory so cascade-delete removes it with everything else.
+  coverPhotoPath String?
+  /// Optional display metadata edited from the event page (mirrors
+  /// Studio-Verse's event edit fields). All nullable — older events
+  /// simply show name-only until the studio fills these in.
+  eventDate   DateTime?
+  eventVenue  String?
+  description String?
+
   /// MERGE (Studio-Verse Photo Selection): which USER-role clients have
   /// access to this event's gallery to browse/favourite/submit.
   clientAccess  EventUserMapping[]
   clientInvites ClientInvite[]
+  /// MERGE (Studio-Verse resumable upload, Phase 18H): in-progress and
+  /// finished chunked-upload trackers for this event.
+  uploadStages  MediaUploadStage[]
   supportTickets SupportTicket[]
 
   /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
@@ -442,6 +466,22 @@ model ClientInvite {
   @@index([email])
 }
 
+/// MERGE (Studio-Verse tenant profile, Phase 18H): a studio's contact /
+/// address details — the equivalent of Studio-Verse's tenant_name /
+/// tenant_phone_number / tenant_studio_address columns. Kept as a 1:1
+/// extension (rather than columns on User) so the identity row stays lean;
+/// auto-created lazily on first profile read/write. All fields optional —
+/// older accounts simply show name-only until the studio fills these in.
+model TenantProfile {
+  id           String   @id @default(uuid())
+  tenantId     String   @unique
+  tenant       User     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  phone        String?
+  studioAddress String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
 /// MERGE (Studio-Verse Photo Selection): grants a USER-role client access
 /// to browse/favourite/submit on one event's gallery — the Photo
 /// Selection equivalent of PandaSpot's EventCollaborator (which is a
@@ -460,9 +500,39 @@ model EventUserMapping {
   /// Once set, this client's favourite selection is locked — matches
   /// Studio-Verse's one-way "submit" action (no un-submitting).
   submittedAt  DateTime?
+  /// MERGE (Studio-Verse Access Board, Phase 18E): optional per-client
+  /// gallery expiry — past this date the client's access reads as gone
+  /// (see routes/client.js), without deleting the grant. Null = no expiry.
+  accessExpires DateTime?
+  /// Soft revoke — the studio's "remove now, maybe restore later". Revoked
+  /// grants read as gone to the client but stay visible (with state) on
+  /// the studio's Clients page and Access Board until hard-removed.
+  revokedAt DateTime?
 
   @@unique([eventId, userId])
   @@index([userId])
+}
+
+/// MERGE (Studio-Verse resumable upload, Phase 18H): progress tracker for
+/// one chunked large-file upload — the local-disk equivalent of
+/// Studio-Verse's S3-multipart MediaUploadStage. Parts land in
+/// storage/uploads/parts/<id>.part and are assembled on complete, after
+/// which the file rejoins the regular async upload job (face detection,
+/// thumbnailing, quota/storage checks), so a large file ends up a fully
+/// normal Photo row. Status is one of "Uploading" | "Completed" | "Aborted".
+model MediaUploadStage {
+  id            String   @id @default(uuid())
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  filename      String
+  mimeType      String   @default("application/octet-stream")
+  totalBytes    Int      @default(0)
+  receivedBytes Int      @default(0)
+  status        String   @default("Uploading")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([eventId])
 }
 
 /// MERGE (Studio-Verse Photo Selection): a client's favourite on one

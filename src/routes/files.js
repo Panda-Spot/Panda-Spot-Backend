@@ -126,10 +126,27 @@ router.get("/events/:eventId/photos/:photoId/thumb", async (req, res, next) => {
   }
 });
 
+// MERGE (Studio-Verse cover, Phase 18E): serves an event's cover photo for
+// dashboard grids and gallery headers. UUID trust model, like every other
+// route in this file — the event id is not enumerable.
+router.get("/events/:eventId/cover", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.eventId } });
+    if (!event || !event.coverPhotoPath) {
+      return res.status(404).json({ error: "No cover set" });
+    }
+    if (!existsSync(event.coverPhotoPath)) {
+      return res.status(404).json({ error: "Cover file missing on disk" });
+    }
+    res.sendFile(event.coverPhotoPath);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Public by design: guests viewing an event's page need to see the
 // photographer's studio branding without logging in.
-router.get("/branding/:userId/logo", async (req, res, next) => {
-  try {
+router.get("/branding/:userId/logo", async (req, res, next) => {  try {
     const user = await prisma.user.findUnique({ where: { id: req.params.userId } });
     if (!user || !user.logoPath) {
       return res.status(404).json({ error: "No logo set" });

@@ -14,6 +14,44 @@ function getTransporter() {
   return transporter;
 }
 
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+export async function sendStudioCredentialsEmail(to, studioName, email, temporaryPassword, loginUrl) {
+  const t = getTransporter();
+  const subject = "Your PandaSpot studio account is ready";
+  const text =
+    `Your PandaSpot studio account has been created.\n\n` +
+    `Studio: ${studioName || "PandaSpot Studio"}\n` +
+    `Login: ${loginUrl}\n` +
+    `Email: ${email}\n` +
+    `Temporary password: ${temporaryPassword}\n\n` +
+    `Sign in and change this password from your account settings.`;
+  if (!t) {
+    console.warn(`SMTP not configured — would have emailed ${to} the studio credentials:\n${text}`);
+    return;
+  }
+  await t.sendMail({
+    from: process.env.SMTP_FROM || "PandaSpot <no-reply@pandaspot.example>",
+    to,
+    subject,
+    text,
+    html:
+      `<p>Your PandaSpot studio account has been created.</p>` +
+      `<p><strong>Studio:</strong> ${escapeHtml(studioName || "PandaSpot Studio")}<br>` +
+      `<strong>Login:</strong> <a href="${escapeHtml(loginUrl)}">${escapeHtml(loginUrl)}</a><br>` +
+      `<strong>Email:</strong> ${escapeHtml(email)}<br>` +
+      `<strong>Temporary password:</strong> ${escapeHtml(temporaryPassword)}</p>` +
+      `<p>Sign in and change this password from your account settings.</p>`,
+  });
+}
+
 export async function sendZipReadyEmail(to, downloadUrl) {
   const t = getTransporter();
   if (!t) {

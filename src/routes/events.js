@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, raw } from "express";
 import { randomUUID, randomBytes } from "node:crypto";
 import path from "node:path";
 import fsp from "node:fs/promises";
@@ -6,7 +6,15 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
-import { ALLOWED_EXTENSIONS, deleteFileIfExists } from "../lib/storage.js";
+import {
+  ALLOWED_EXTENSIONS,
+  appendUploadPart,
+  deleteFileIfExists,
+  deleteUploadPart,
+  saveEventCover,
+  uploadPartPath,
+  uploadPartSize,
+} from "../lib/storage.js";
 import { getStorageProvider } from "../lib/storageProvider.js";
 import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
@@ -26,6 +34,7 @@ import { checkAndNotifyForNewPhotos } from "../lib/guestAlerts.js";
 import { isDriveBackupConfigured, isDriveBackupBetaUser } from "../lib/driveBackupAuth.js";
 import { reclaimEventDriveBackups } from "../lib/driveBackupRetention.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
+import { streamPhotosZip, zipFilenameForEvent } from "../lib/zip.js";
 import { uploadToDriveFolder, MIME_BY_EXT } from "../lib/driveBackup.js";
 import { assertQuotaAvailable, consumeAiPhotoCredits, consumeQuota } from "../lib/subscriptionAccess.js";
 
@@ -81,6 +90,17 @@ router.post("/", async (req, res, next) => {
 
 router.get("/", async (req, res, next) => {
   try {
+    // MERGE (Studio-Verse archive, Phase 18E): ?status=active (default) |
+    // archived | all. Defaulting to active keeps archived events out of
+    // every existing caller's way; nothing already stored changes, since
+    // archivedAt is null on every pre-existing row.
+    const status = req.query.status ?? "active";
+    if (!["active", "archived", "all"].includes(status)) {
+      return res.status(400).json({ error: 'status must be "active", "archived", or "all"' });
+    }
+    const archivedFilter =
+      status === "active" ? { archivedAt: null } : status === "archived" ? { archivedAt: { not: null } } : {};
+
     // Union of events owned by this user and events they collaborate on,
     // each tagged with their role on that event.
     // Sub-galleries are real Events but aren't shown as their own top-level
@@ -88,7 +108,7 @@ router.get("/", async (req, res, next) => {
     // GET /:id's sub_galleries), and the owner manages them from the
     // parent's detail page too.
     const owned = await prisma.event.findMany({
-      where: { ownerId: req.user.id, parentEventId: null },
+      where: { ownerId: req.user.id, parentEventId: null, ...archivedFilter },
       include: { _count: { select: { photos: true } } },
     });
     const collabRows = await prisma.eventCollaborator.findMany({
@@ -99,7 +119,9 @@ router.get("/", async (req, res, next) => {
     const all = [
       ...owned.map((e) => ({ ...e, role: "owner" })),
       ...collabRows.map((c) => ({ ...c.event, role: "collaborator" })),
-    ];
+    ].filter((e) =>
+      status === "all" ? true : status === "active" ? !e.archivedAt : !!e.archivedAt
+    );
     all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     res.json(
@@ -110,10 +132,104 @@ router.get("/", async (req, res, next) => {
         guestLink: guestLinkPath(e.guestSlug),
         createdAt: e.createdAt,
         expires_at: e.expiresAt,
+        archived_at: e.archivedAt,
+        cover_url: e.coverPhotoPath ? `/files/events/${e.id}/cover` : null,
         photo_count: e._count.photos,
         role: e.role,
       }))
     );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse dashboard analytics, Phase 18H): studio-scoped
+// aggregates for the Dashboard charts — totals, per-month buckets, top
+// events, active/archived split. Owned + collaborated events, all time
+// unless a bucket says otherwise. Read-only; powers the Media Uploads
+// area chart and the status donut the Dashboard deliberately left out
+// until this endpoint existed.
+router.get("/analytics/summary", async (req, res, next) => {
+  try {
+    const owned = await prisma.event.findMany({
+      where: { ownerId: req.user.id },
+      select: { id: true, name: true, createdAt: true, archivedAt: true },
+    });
+    const collabRows = await prisma.eventCollaborator.findMany({
+      where: { userId: req.user.id },
+      select: { event: { select: { id: true, name: true, createdAt: true, archivedAt: true } } },
+    });
+    const seen = new Map();
+    for (const e of [...owned, ...collabRows.map((c) => c.event)]) {
+      if (e && !seen.has(e.id)) seen.set(e.id, e);
+    }
+    const events = [...seen.values()];
+    const ids = events.map((e) => e.id);
+
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5);
+    sixMonthsAgo.setDate(1);
+    sixMonthsAgo.setHours(0, 0, 0, 0);
+
+    const [photoCount, clientCount, clientFavCount, pickCount, recentPhotos, topGroups] = await Promise.all([
+      ids.length ? prisma.photo.count({ where: { eventId: { in: ids } } }) : 0,
+      ids.length ? prisma.eventUserMapping.count({ where: { eventId: { in: ids } } }) : 0,
+      ids.length ? prisma.clientFavourite.count({ where: { photo: { eventId: { in: ids } } } }) : 0,
+      ids.length
+        ? prisma.studioFavourite.count({ where: { userId: req.user.id, photo: { eventId: { in: ids } } } })
+        : 0,
+      ids.length
+        ? prisma.photo.findMany({
+            where: { eventId: { in: ids }, createdAt: { gte: sixMonthsAgo } },
+            select: { createdAt: true },
+          })
+        : [],
+      ids.length
+        ? prisma.photo.groupBy({
+            by: ["eventId"],
+            where: { eventId: { in: ids } },
+            _count: { eventId: true },
+            orderBy: { _count: { eventId: "desc" } },
+            take: 5,
+          })
+        : [],
+    ]);
+
+    const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const months = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date();
+      d.setMonth(d.getMonth() - i);
+      months.push(monthKey(d));
+    }
+    const eventsByMonth = months.map((month) => ({
+      month,
+      count: events.filter((e) => monthKey(new Date(e.createdAt)) === month).length,
+    }));
+    const mediaByMonth = months.map((month) => ({
+      month,
+      count: recentPhotos.filter((p) => monthKey(new Date(p.createdAt)) === month).length,
+    }));
+
+    const nameById = Object.fromEntries(events.map((e) => [e.id, e.name]));
+    const archived = events.filter((e) => e.archivedAt).length;
+
+    res.json({
+      totals: {
+        events: events.length,
+        photos: photoCount,
+        clients: clientCount,
+        favourites: clientFavCount + pickCount,
+      },
+      events_by_month: eventsByMonth,
+      media_by_month: mediaByMonth,
+      top_events: topGroups.map((g) => ({
+        event_id: g.eventId,
+        event_name: nameById[g.eventId] ?? "(deleted event)",
+        media_count: g._count.eventId,
+      })),
+      event_status: { active: events.length - archived, archived },
+    });
   } catch (err) {
     next(err);
   }
@@ -175,6 +291,13 @@ router.get("/:id", async (req, res, next) => {
       started: !!event.startedAt,
       face_search_enabled: event.faceSearchEnabled,
       photo_selection_enabled: event.photoSelectionEnabled,
+      published_at: event.publishedAt,
+      archived_at: event.archivedAt,
+      allow_download: event.allowDownload,
+      cover_url: event.coverPhotoPath ? `/files/events/${event.id}/cover` : null,
+      event_date: event.eventDate,
+      event_venue: event.eventVenue,
+      description: event.description,
       guest_upload_enabled: event.guestUploadEnabled,
       guest_upload_window_days: event.guestUploadWindowDays,
       pending_guest_upload_count: pendingGuestUploadCount,
@@ -345,6 +468,412 @@ router.post("/:id/features/toggle", async (req, res, next) => {
       face_search_enabled: updated.faceSearchEnabled,
       photo_selection_enabled: updated.photoSelectionEnabled,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse EventDetail depth, Phase 18E): edit the event's own
+// display metadata — name plus the optional date/venue/description that
+// Studio-Verse events carry. Owner or collaborator. Null clears an
+// optional field; name (when given) must stay non-blank.
+router.patch("/:id", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { name, event_date: eventDate, event_venue: eventVenue, description } = req.body || {};
+    const data = {};
+    if (name !== undefined) {
+      if (typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "name must be a non-empty string" });
+      }
+      data.name = name.trim();
+    }
+    if (eventDate !== undefined) {
+      if (eventDate === null || eventDate === "") {
+        data.eventDate = null;
+      } else {
+        const d = new Date(eventDate);
+        if (Number.isNaN(d.getTime())) {
+          return res.status(400).json({ error: "event_date must be a valid date, or null to clear" });
+        }
+        data.eventDate = d;
+      }
+    }
+    if (eventVenue !== undefined) {
+      if (eventVenue !== null && typeof eventVenue !== "string") {
+        return res.status(400).json({ error: "event_venue must be a string, or null to clear" });
+      }
+      data.eventVenue = eventVenue?.trim() ? eventVenue.trim() : null;
+    }
+    if (description !== undefined) {
+      if (description !== null && typeof description !== "string") {
+        return res.status(400).json({ error: "description must be a string, or null to clear" });
+      }
+      data.description = description?.trim() ? description.trim() : null;
+    }
+
+    const updated = await prisma.event.update({ where: { id: event.id }, data });
+    res.json({
+      id: updated.id,
+      name: updated.name,
+      event_date: updated.eventDate,
+      event_venue: updated.eventVenue,
+      description: updated.description,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse): publish stamps publishedAt — the studio declaring
+// uploads finished. One-way (no unpublish), exactly like Studio-Verse:
+// for a Photo Selection event this is the "gallery is ready" marker the
+// client UI reflects. Owner or collaborator.
+router.post("/:id/publish", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { publishedAt: event.publishedAt ?? new Date() },
+    });
+    res.json({ published_at: updated.publishedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse archive/restore, Phase 18E): soft archive hides the
+// event from guests (lib/expiry.js) and Photo Selection clients
+// (routes/client.js) without deleting anything; restore reverses it.
+// Permanent deletion stays the separate owner-only DELETE /:id.
+router.post("/:id/archive", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { archivedAt: event.archivedAt ?? new Date() },
+    });
+    res.json({ archived_at: updated.archivedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/restore", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { archivedAt: null },
+    });
+    res.json({ archived_at: updated.archivedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse): per-event download opt-out — when false, guests
+// (routes/guest.js) can't download zips and clients see a view-only
+// gallery; the studio's own download below always works. Owner or
+// collaborator, like every other event-settings toggle here.
+router.post("/:id/allow-download", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { allow_download: allowDownload } = req.body || {};
+    if (typeof allowDownload !== "boolean") {
+      return res.status(400).json({ error: "allow_download must be a boolean" });
+    }
+
+    const updated = await prisma.event.update({ where: { id: event.id }, data: { allowDownload } });
+    res.json({ allow_download: updated.allowDownload });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse cover crop, Phase 18E): upload/replace the event's
+// cover photo. The 16:9 crop happens client-side (react-easy-crop) before
+// upload; the server stores the bytes as-is after the same
+// extension + content-sniff validation logos go through. One cover per
+// event — replacing deletes the old file. Served at
+// GET /files/events/:eventId/cover (UUID trust model, like all of files.js).
+router.post("/:id/cover", upload.single("cover"), async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No cover file uploaded (expected multipart field 'cover')" });
+    }
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) {
+      return res.status(400).json({ error: "Unsupported cover file type" });
+    }
+    if (!contentMatchesExtension(req.file.buffer, ext)) {
+      return res.status(400).json({ error: "File content doesn't match its extension" });
+    }
+
+    const coverPath = await saveEventCover(event.id, req.file.originalname, req.file.buffer);
+    const updated = await prisma.event.update({ where: { id: event.id }, data: { coverPhotoPath: coverPath } });
+    res.json({ cover_url: updated.coverPhotoPath ? `/files/events/${event.id}/cover` : null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/:id/cover", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (event.coverPhotoPath) {
+      await deleteFileIfExists(event.coverPhotoPath);
+      await prisma.event.update({ where: { id: event.id }, data: { coverPhotoPath: null } });
+    }
+    res.json({ cover_url: null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse studio zip, Phase 18E): the studio's own full-event
+// download — every approved photo, regardless of gallery membership.
+// Unlike the guest zip (routes/guest.js), this ignores allowDownload (a
+// studio can always take its own photos home) and needs no photo_ids.
+router.get("/:id/download-zip", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photos = await prisma.photo.findMany({
+      where: { eventId: event.id, approvalStatus: "approved" },
+      orderBy: { createdAt: "asc" },
+    });
+    if (photos.length === 0) {
+      return res.status(404).json({ error: "This event has no approved photos to download" });
+    }
+
+    const zipFilename = zipFilenameForEvent(event);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipFilename}"`);
+
+    await streamPhotosZip(photos, res);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse large upload, Phase 18H): resumable chunked upload
+// for files too big for one multipart POST — the local-disk equivalent of
+// Studio-Verse's S3-multipart flow (initiate → parts → complete/abort)
+// with its MediaUploadStage tracker. Differences are all storage-layer,
+// never behavior: parts accumulate in storage/uploads/parts/ instead of an
+// S3 multipart session, and the cap is 500MB (not 5GB) since an assembled
+// file is briefly held in memory when it rejoins the regular async upload
+// job below — the face-detection/thumbnailing/quota/storage pipeline is
+// then byte-for-byte the same as a normal upload, so a large file ends up
+// a fully normal Photo row. Clients send 8MB chunks (per-chunk cap 16MB)
+// and resume by asking the stage how many bytes already arrived.
+const MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024;
+const LARGE_CHUNK_BYTES = 8 * 1024 * 1024;
+const LARGE_PART_LIMIT = "16mb";
+
+async function loadUploadStage(event, stageId, res) {
+  const stage = await prisma.mediaUploadStage.findFirst({
+    where: { id: stageId, eventId: event.id },
+  });
+  if (!stage) {
+    res.status(404).json({ error: "Upload session not found" });
+    return null;
+  }
+  return stage;
+}
+
+router.post("/:id/uploads/large/initiate", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.startedAt) {
+      return res.status(400).json({ error: "Start this event before uploading photos." });
+    }
+
+    const { filename, file_size: fileSize, content_type: contentType } = req.body || {};
+    if (!filename || typeof filename !== "string") {
+      return res.status(400).json({ error: "filename is required" });
+    }
+    const size = Number(fileSize);
+    if (!Number.isFinite(size) || size <= 0) {
+      return res.status(400).json({ error: "file_size must be a positive number" });
+    }
+    if (size > MAX_LARGE_UPLOAD_BYTES) {
+      return res.status(413).json({ error: "File too large. Maximum allowed is 500MB per file." });
+    }
+    const ext = path.extname(filename).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) {
+      return res.status(415).json({ error: "Unsupported file type. Only images are accepted." });
+    }
+
+    try {
+      await assertQuotaAvailable(event.ownerId);
+    } catch (quotaErr) {
+      return res.status(quotaErr.statusCode || 403).json({ error: quotaErr.message });
+    }
+
+    const stage = await prisma.mediaUploadStage.create({
+      data: {
+        eventId: event.id,
+        filename,
+        mimeType: typeof contentType === "string" && contentType ? contentType : "application/octet-stream",
+        totalBytes: Math.floor(size),
+        status: "Uploading",
+      },
+    });
+    res.status(201).json({
+      stage_id: stage.id,
+      received_bytes: 0,
+      chunk_bytes: LARGE_CHUNK_BYTES,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put(
+  "/:id/uploads/large/part",
+  raw({ type: "application/octet-stream", limit: LARGE_PART_LIMIT }),
+  async (req, res, next) => {
+    try {
+      const accessible = await loadAccessibleEvent(req, res);
+      if (!accessible) return;
+      const { event } = accessible;
+
+      const { stage_id: stageId, offset } = req.query || {};
+      const stage = await loadUploadStage(event, stageId, res);
+      if (!stage) return;
+      if (stage.status !== "Uploading") {
+        return res.status(409).json({ error: `This upload session is ${stage.status.toLowerCase()}` });
+      }
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: "Missing chunk body." });
+      }
+      const at = Number(offset);
+      if (!Number.isInteger(at) || at < 0) {
+        return res.status(400).json({ error: "offset must be a non-negative integer" });
+      }
+      if (at + req.body.length > stage.totalBytes) {
+        return res.status(400).json({ error: "Chunk overruns the declared file size." });
+      }
+
+      try {
+        const received = await appendUploadPart(stage.id, at, req.body);
+        await prisma.mediaUploadStage.update({
+          where: { id: stage.id },
+          data: { receivedBytes: received },
+        });
+        res.json({ received_bytes: received, total_bytes: stage.totalBytes });
+      } catch (partErr) {
+        if (partErr.status) return res.status(partErr.status).json({ error: partErr.message });
+        throw partErr;
+      }
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.get("/:id/uploads/large/:stageId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const stage = await loadUploadStage(event, req.params.stageId, res);
+    if (!stage) return;
+    const onDisk = await uploadPartSize(stage.id);
+    res.json({
+      stage_id: stage.id,
+      filename: stage.filename,
+      total_bytes: stage.totalBytes,
+      received_bytes: Math.max(stage.receivedBytes, onDisk),
+      status: stage.status,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/uploads/large/complete", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { stage_id: stageId } = req.body || {};
+    const stage = await loadUploadStage(event, stageId, res);
+    if (!stage) return;
+    if (stage.status !== "Uploading") {
+      return res.status(409).json({ error: `This upload session is ${stage.status.toLowerCase()}` });
+    }
+
+    const onDisk = await uploadPartSize(stage.id);
+    if (onDisk !== stage.totalBytes) {
+      return res.status(400).json({
+        error: `Upload incomplete: received ${onDisk} of ${stage.totalBytes} bytes.`,
+      });
+    }
+
+    const buffer = await fsp.readFile(uploadPartPath(stage.id));
+    if (!contentMatchesExtension(buffer, path.extname(stage.filename).toLowerCase())) {
+      return res.status(415).json({ error: "File content doesn't match its extension" });
+    }
+
+    await prisma.mediaUploadStage.update({ where: { id: stage.id }, data: { status: "Completed" } });
+    await deleteUploadPart(stage.id);
+
+    const { id: jobId } = createJob();
+    res.status(202).json({ job_id: jobId });
+
+    processUploadJob(jobId, event, [{ originalname: stage.filename, buffer }]).catch((err) => {
+      console.error(`Unhandled error in large-upload job ${jobId}:`, err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/uploads/large/abort", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { stage_id: stageId } = req.body || {};
+    const stage = await loadUploadStage(event, stageId, res);
+    if (!stage) return;
+
+    await deleteUploadPart(stage.id);
+    await prisma.mediaUploadStage.update({ where: { id: stage.id }, data: { status: "Aborted" } });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
@@ -1431,6 +1960,12 @@ router.get("/:id/clients", async (req, res, next) => {
     const pendingInviteRows = await prisma.clientInvite.findMany({
       where: { eventId: event.id, acceptedAt: null },
     });
+    const favouriteCounts = await prisma.clientFavourite.groupBy({
+      by: ["userId"],
+      where: { photo: { eventId: event.id, photoSelectionVisible: true } },
+      _count: { userId: true },
+    });
+    const countByUser = Object.fromEntries(favouriteCounts.map((c) => [c.userId, c._count.userId]));
 
     res.json({
       clients: mappings.map((m) => ({
@@ -1438,7 +1973,10 @@ router.get("/:id/clients", async (req, res, next) => {
         email: m.user.email,
         name: m.user.name,
         favourite_cap: m.favouriteCap,
+        favourite_count: countByUser[m.user.id] || 0,
         submitted_at: m.submittedAt,
+        access_expires: m.accessExpires,
+        revoked_at: m.revokedAt,
       })),
       pending_invites: pendingInviteRows.map((i) => ({
         invite_id: i.id,
@@ -1466,6 +2004,283 @@ router.delete("/:id/clients/:userId", async (req, res, next) => {
 
     await prisma.eventUserMapping.delete({ where: { id: mapping.id } });
     res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse Access Board, Phase 18E): edit one client's grant —
+// favourite cap and/or access expiry. Null clears either field. Owner or
+// collaborator, like every other event-settings action here.
+router.patch("/:id/clients/:userId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mapping = await prisma.eventUserMapping.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: req.params.userId } },
+    });
+    if (!mapping) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+
+    const { favourite_cap: favouriteCap, access_expires: accessExpires } = req.body || {};
+    const data = {};
+    if (favouriteCap !== undefined) {
+      if (favouriteCap !== null && (!Number.isInteger(favouriteCap) || favouriteCap < 1)) {
+        return res.status(400).json({ error: "favourite_cap must be a positive integer, or null for no cap" });
+      }
+      data.favouriteCap = favouriteCap;
+    }
+    if (accessExpires !== undefined) {
+      if (accessExpires === null || accessExpires === "") {
+        data.accessExpires = null;
+      } else {
+        const d = new Date(accessExpires);
+        if (Number.isNaN(d.getTime())) {
+          return res.status(400).json({ error: "access_expires must be a valid date, or null to clear" });
+        }
+        data.accessExpires = d;
+      }
+    }
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "No grant change provided." });
+    }
+
+    const updated = await prisma.eventUserMapping.update({ where: { id: mapping.id }, data });
+    res.json({
+      user_id: updated.userId,
+      favourite_cap: updated.favouriteCap,
+      access_expires: updated.accessExpires,
+      submitted_at: updated.submittedAt,
+      revoked_at: updated.revokedAt,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse submit-on-behalf, Phase 18E): the studio force-locks
+// a client's selection (submit) or re-opens it (unsubmit). The client's
+// own POST /client/events/:id/submit stays one-way for the client
+// themselves — only the studio can unlock.
+router.post("/:id/clients/:userId/submit", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mapping = await prisma.eventUserMapping.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: req.params.userId } },
+    });
+    if (!mapping) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+
+    const updated = await prisma.eventUserMapping.update({
+      where: { id: mapping.id },
+      data: { submittedAt: mapping.submittedAt ?? new Date() },
+    });
+    res.json({ submitted_at: updated.submittedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/clients/:userId/unsubmit", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mapping = await prisma.eventUserMapping.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: req.params.userId } },
+    });
+    if (!mapping) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+
+    const updated = await prisma.eventUserMapping.update({
+      where: { id: mapping.id },
+      data: { submittedAt: null },
+    });
+    res.json({ submitted_at: updated.submittedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse revoke/restore, Phase 18E): soft revoke keeps the
+// grant row (and its cap/expiry/submitted state) so the studio can
+// restore it later; hard removal stays DELETE …/clients/:userId.
+router.post("/:id/clients/:userId/revoke", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mapping = await prisma.eventUserMapping.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: req.params.userId } },
+    });
+    if (!mapping) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+
+    const updated = await prisma.eventUserMapping.update({
+      where: { id: mapping.id },
+      data: { revokedAt: mapping.revokedAt ?? new Date() },
+    });
+    res.json({ revoked_at: updated.revokedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/clients/:userId/restore", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mapping = await prisma.eventUserMapping.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: req.params.userId } },
+    });
+    if (!mapping) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+
+    const updated = await prisma.eventUserMapping.update({
+      where: { id: mapping.id },
+      data: { revokedAt: null },
+    });
+    res.json({ revoked_at: updated.revokedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse grouped favourites, Phase 18E): the studio's read
+// side of Photo Selection — per-client groups plus a deduplicated merged
+// view with "who favourited this" attribution. Favourites on photos
+// hidden from Photo Selection since are excluded, matching what clients
+// could ever have picked.
+router.get("/:id/favourites", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const mappings = await prisma.eventUserMapping.findMany({
+      where: { eventId: event.id },
+      include: { user: true },
+    });
+    const favourites = await prisma.clientFavourite.findMany({
+      where: { photo: { eventId: event.id, photoSelectionVisible: true } },
+      include: {
+        photo: true,
+        user: true,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    const photoShape = (p) => ({
+      photo_id: p.id,
+      filename: p.filename,
+      createdAt: p.createdAt,
+      url: `/files/events/${event.id}/photos/${p.id}`,
+      thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
+    });
+
+    const groups = mappings.map((m) => ({
+      user_id: m.user.id,
+      email: m.user.email,
+      name: m.user.name,
+      favourite_cap: m.favouriteCap,
+      submitted_at: m.submittedAt,
+      access_expires: m.accessExpires,
+      revoked_at: m.revokedAt,
+      photos: favourites.filter((f) => f.userId === m.userId).map((f) => photoShape(f.photo)),
+    }));
+
+    const mergedMap = new Map();
+    for (const f of favourites) {
+      if (!mergedMap.has(f.photoId)) {
+        mergedMap.set(f.photoId, { ...photoShape(f.photo), favourited_by: [] });
+      }
+      mergedMap.get(f.photoId).favourited_by.push({
+        user_id: f.user.id,
+        email: f.user.email,
+        name: f.user.name,
+      });
+    }
+
+    res.json({ groups, merged: [...mergedMap.values()] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse studio picks, Phase 18E): the studio's own separate
+// curation list over the same photo pool — independent of what any client
+// favourited. The acting studio user owns their picks (userId = req.user).
+router.get("/:id/studio-picks", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const picks = await prisma.studioFavourite.findMany({
+      where: { userId: req.user.id, photo: { eventId: event.id } },
+      select: { photoId: true },
+    });
+    res.json({ photo_ids: picks.map((p) => p.photoId) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/studio-picks", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { photo_id: photoId } = req.body || {};
+    if (!photoId || typeof photoId !== "string") {
+      return res.status(400).json({ error: "photo_id is required" });
+    }
+    const photo = await prisma.photo.findFirst({ where: { id: photoId, eventId: event.id } });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    await prisma.studioFavourite.upsert({
+      where: { photoId_userId: { photoId: photo.id, userId: req.user.id } },
+      create: { photoId: photo.id, userId: req.user.id },
+      update: {},
+    });
+    res.json({ photo_id: photo.id, is_pick: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/:id/studio-picks/:photoId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({ where: { id: req.params.photoId, eventId: event.id } });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    await prisma.studioFavourite.deleteMany({
+      where: { photoId: photo.id, userId: req.user.id },
+    });
+    res.json({ photo_id: photo.id, is_pick: false });
   } catch (err) {
     next(err);
   }

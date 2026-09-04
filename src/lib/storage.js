@@ -59,6 +59,90 @@ export function existsSync(filePath) {
   return fs.existsSync(filePath);
 }
 
+/**
+ * Saves (or replaces) an event's cover photo. Lives directly in the
+ * event's own directory as `cover.<ext>` so cascade-delete removes it
+ * with everything else — no lifecycle hook needed. Client-side 16:9
+ * cropping happens before upload; the server stores the bytes as-is after
+ * the usual extension + content-sniff checks at the route layer.
+ */
+export async function saveEventCover(eventId, filename, buffer) {
+  const dir = await ensureEventDir(eventId);
+
+  const ext = path.extname(filename).toLowerCase();
+  const newPath = path.join(dir, `cover${ext}`);
+
+  // Remove any previous cover under a different extension.
+  let existing = [];
+  try {
+    existing = await fsp.readdir(dir);
+  } catch {
+    existing = [];
+  }
+  for (const entry of existing) {
+    if (entry.startsWith("cover.") && path.join(dir, entry) !== newPath) {
+      await fsp.unlink(path.join(dir, entry)).catch(() => {});
+    }
+  }
+
+  await fsp.writeFile(newPath, buffer);
+  return newPath;
+}
+
+/** Absolute directory for in-progress chunked-upload part files. */
+export function uploadPartsDir() {
+  return path.join(storageRoot(), "uploads", "parts");
+}
+
+/** Absolute path of one upload stage's accumulating part file. */
+export function uploadPartPath(stageId) {
+  return path.join(uploadPartsDir(), `${stageId}.part`);
+}
+
+/**
+ * Appends one chunk to a stage's part file. The offset must equal the
+ * bytes already received — this is what makes interrupted uploads
+ * resumable (the client asks the stage how much arrived and continues
+ * from there) and rejects overlapping/duplicate writes.
+ */
+export async function appendUploadPart(stageId, offset, buffer) {
+  await fsp.mkdir(uploadPartsDir(), { recursive: true });
+  const fullPath = uploadPartPath(stageId);
+  let current = 0;
+  try {
+    current = (await fsp.stat(fullPath)).size;
+  } catch {
+    current = 0;
+  }
+  if (current !== offset) {
+    throw Object.assign(
+      new Error(`Chunk offset ${offset} does not match received bytes ${current} — resume from ${current}`),
+      { status: 409 }
+    );
+  }
+  const handle = await fsp.open(fullPath, "a");
+  try {
+    await handle.write(buffer, 0, buffer.length, current);
+  } finally {
+    await handle.close();
+  }
+  return current + buffer.length;
+}
+
+/** Bytes received so far for a stage (0 when no part file exists yet). */
+export async function uploadPartSize(stageId) {
+  try {
+    return (await fsp.stat(uploadPartPath(stageId))).size;
+  } catch {
+    return 0;
+  }
+}
+
+/** Best-effort removal of a stage's part file (abort/cleanup path). */
+export async function deleteUploadPart(stageId) {
+  await fsp.unlink(uploadPartPath(stageId)).catch(() => {});
+}
+
 /** Absolute directory for a given event's photo thumbnails (kept separate from originals). */
 export function eventThumbDir(eventId) {
   return path.join(eventDir(eventId), "thumbs");

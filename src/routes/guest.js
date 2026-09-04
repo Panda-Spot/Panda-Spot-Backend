@@ -812,6 +812,11 @@ router.post("/:slug/download", guestDownloadLimiter, async (req, res, next) => {
     if (isExpired(event)) {
       return res.status(410).json({ error: "This event's guest access has closed." });
     }
+    // MERGE (Studio-Verse allow_download, Phase 18E): the studio opted this
+    // event out of downloads — view/search still work, zips don't.
+    if (!event.allowDownload) {
+      return res.status(403).json({ error: "Downloads are disabled for this event by the studio." });
+    }
 
     const photoIds = req.body?.photo_ids;
     if (!Array.isArray(photoIds) || photoIds.length === 0) {
@@ -846,6 +851,11 @@ router.post("/:slug/download/email", guestDownloadLimiter, async (req, res, next
     }
     if (isExpired(event)) {
       return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+    // MERGE (Studio-Verse allow_download, Phase 18E): the studio opted this
+    // event out of downloads — view/search still work, zips don't.
+    if (!event.allowDownload) {
+      return res.status(403).json({ error: "Downloads are disabled for this event by the studio." });
     }
 
     const { photo_ids: photoIds, email } = req.body || {};
@@ -919,6 +929,13 @@ router.get("/:slug/downloads/:downloadId", async (req, res, next) => {
     const zipDownload = await prisma.zipDownload.findUnique({ where: { id: req.params.downloadId } });
     if (!zipDownload || zipDownload.eventId !== event.id) {
       return res.status(404).json({ error: "Download not found" });
+    }
+
+    // MERGE (Studio-Verse allow_download, Phase 18E): gated at serve time
+    // too, so opting out also stops pre-built zips — same as Studio-Verse's
+    // per-request mediaServe check.
+    if (!event.allowDownload) {
+      return res.status(403).json({ error: "Downloads are disabled for this event by the studio." });
     }
 
     if (zipDownload.status !== "ready") {

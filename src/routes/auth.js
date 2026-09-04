@@ -215,6 +215,55 @@ router.get("/me", requireAuth, async (req, res, next) => {
   }
 });
 
+// MERGE (Studio-Verse): authenticated password change — verifies the
+// current password, enforces the same 8-char minimum as registration, and
+// blocklists the presented token so every other session using it must log
+// in again (Studio-Verse's changePassword, see STUDIO_VERSE_HANDOFF.md §5).
+// Google-only accounts (no password set yet) may set one without a current
+// password; everyone else must prove the old one.
+router.put("/change-password", requireAuth, async (req, res, next) => {
+  try {
+    const { current_password: currentPassword, new_password: newPassword } = req.body || {};
+    if (!newPassword || typeof newPassword !== "string") {
+      return res.status(400).json({ error: "current_password and new_password are required" });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters" });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    if (user.passwordHash) {
+      if (!currentPassword || typeof currentPassword !== "string") {
+        return res.status(400).json({ error: "current_password and new_password are required" });
+      }
+      if (currentPassword === newPassword) {
+        return res.status(400).json({ error: "New password must be different from the current password" });
+      }
+      const isMatch = await bcrypt.compare(currentPassword, user.passwordHash);
+      if (!isMatch) {
+        return res.status(401).json({ error: "Current password is incorrect" });
+      }
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) },
+    });
+
+    // Force re-login everywhere this token was in use.
+    await blocklistToken({ jti: req.user.jti, exp: req.user.exp });
+    clearAuthCookie(res);
+
+    res.json({ ok: true, message: "Password changed successfully. Please log in again." });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/email-verification/request", requireAuth, async (req, res, next) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });

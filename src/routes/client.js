@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
 import { signMediaToken } from "../lib/mediaTokens.js";
+import { streamPhotosZip, zipFilenameForEvent } from "../lib/zip.js";
 
 const router = Router();
 
@@ -18,10 +19,28 @@ router.use(requireAuth, requireRole("USER"));
 async function loadClientAccess(req, res) {
   const mapping = await prisma.eventUserMapping.findUnique({
     where: { eventId_userId: { eventId: req.params.id, userId: req.user.id } },
-    include: { event: { include: { owner: { select: { studioName: true, watermarkIntensity: true } } } } },
+    include: { event: { include: { owner: { select: { studioName: true, watermarkIntensity: true, brandColor: true } } } } },
   });
   if (!mapping) {
     res.status(404).json({ error: "You don't have access to this event" });
+    return null;
+  }
+  // MERGE (Studio-Verse revoke/expiry/archive, Phase 18E+18F): a revoked
+  // grant, a past access_expires, or an archived event all read as "no
+  // access" — but unlike a never-granted event, the response names the
+  // event and the reason so the client app can render its Access Expired
+  // screen instead of a generic 404. Safe: UUIDs aren't enumerable, and
+  // every one of these clients was explicitly granted this event before.
+  if (mapping.revokedAt) {
+    res.status(404).json({ error: "You don't have access to this event", event_name: mapping.event.name, reason: "revoked" });
+    return null;
+  }
+  if (mapping.accessExpires && new Date(mapping.accessExpires) < new Date()) {
+    res.status(404).json({ error: "You don't have access to this event", event_name: mapping.event.name, reason: "expired" });
+    return null;
+  }
+  if (mapping.event.archivedAt) {
+    res.status(404).json({ error: "You don't have access to this event", event_name: mapping.event.name, reason: "archived" });
     return null;
   }
   if (!mapping.event.photoSelectionEnabled) {
@@ -41,12 +60,26 @@ router.get("/events", async (req, res, next) => {
     res.json(
       mappings
         .filter((m) => m.event.photoSelectionEnabled)
-        .map((m) => ({
-          event_id: m.event.id,
-          event_name: m.event.name,
-          favourite_cap: m.favouriteCap,
-          submitted_at: m.submittedAt,
-        }))
+        .map((m) => {
+          // MERGE (Studio-Verse folder grid, Phase 18F): revoked/expired/
+          // archived grants stay visible with accessible:false + a reason
+          // (lock overlay + Access Expired screen) instead of vanishing —
+          // the client was explicitly granted each of these before.
+          const revoked = !!m.revokedAt;
+          const expired = !!m.accessExpires && new Date(m.accessExpires) < new Date();
+          const archived = !!m.event.archivedAt;
+          return {
+            event_id: m.event.id,
+            event_name: m.event.name,
+            event_date: m.event.eventDate,
+            cover_url: m.event.coverPhotoPath ? `/files/events/${m.event.id}/cover` : null,
+            favourite_cap: m.favouriteCap,
+            submitted_at: m.submittedAt,
+            access_expires: m.accessExpires,
+            accessible: !revoked && !expired && !archived,
+            reason: revoked ? "revoked" : expired ? "expired" : archived ? "archived" : null,
+          };
+        })
     );
   } catch (err) {
     next(err);
@@ -65,10 +98,18 @@ router.get("/events/:id", async (req, res, next) => {
     res.json({
       event_id: mapping.event.id,
       event_name: mapping.event.name,
+      event_date: mapping.event.eventDate,
+      cover_url: mapping.event.coverPhotoPath ? `/files/events/${mapping.event.id}/cover` : null,
       favourite_cap: mapping.favouriteCap,
       favourite_count: favouriteCount,
       submitted_at: mapping.submittedAt,
+      access_expires: mapping.accessExpires,
+      published_at: mapping.event.publishedAt,
       allow_download: mapping.event.allowDownload,
+      // Brand equivalents of the public guest lookup's studio fields (same
+      // values, no extra leak) — drive the gallery's brand re-theming.
+      brand_color: mapping.event.owner?.brandColor ?? null,
+      logo_url: `/files/branding/${mapping.event.ownerId}/logo`,
       watermark_text: mapping.event.owner?.studioName || mapping.event.name,
       watermark_intensity: mapping.event.owner?.watermarkIntensity ?? 0.75,
     });
@@ -163,6 +204,59 @@ router.post("/events/:id/submit", async (req, res, next) => {
       data: { submittedAt: new Date() },
     });
     res.json({ submitted_at: updated.submittedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse Studio Pick indicator, Phase 18F): the photo ids the
+// studio itself picked on this event — shown as a distinct badge so
+// clients can see what the photographer already favourited. Ids only;
+// every one of these photos is already visible to this client.
+router.get("/events/:id/studio-pick-ids", async (req, res, next) => {
+  try {
+    const mapping = await loadClientAccess(req, res);
+    if (!mapping) return;
+
+    const picks = await prisma.studioFavourite.findMany({
+      where: { userId: mapping.event.ownerId, photo: { eventId: mapping.eventId } },
+      select: { photoId: true },
+    });
+    res.json({ photo_ids: picks.map((p) => p.photoId) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse favourites zip, Phase 18F): the client's own
+// favourited photos as one zip. Honors the studio's allow_download
+// opt-out exactly like the guest zip does.
+router.post("/events/:id/download-zip", async (req, res, next) => {
+  try {
+    const mapping = await loadClientAccess(req, res);
+    if (!mapping) return;
+    if (!mapping.event.allowDownload) {
+      return res.status(403).json({ error: "Downloads are disabled for this event by the studio." });
+    }
+
+    const favourites = await prisma.clientFavourite.findMany({
+      where: {
+        userId: req.user.id,
+        photo: { eventId: mapping.eventId, approvalStatus: "approved", photoSelectionVisible: true },
+      },
+      include: { photo: true },
+      orderBy: { createdAt: "asc" },
+    });
+    const photos = favourites.map((f) => f.photo);
+    if (photos.length === 0) {
+      return res.status(404).json({ error: "You have no favourite photos to download yet" });
+    }
+
+    const zipFilename = zipFilenameForEvent(mapping.event);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipFilename}"`);
+
+    await streamPhotosZip(photos, res);
   } catch (err) {
     next(err);
   }

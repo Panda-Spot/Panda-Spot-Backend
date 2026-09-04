@@ -80,4 +80,59 @@ router.post("/", upload.single("logo"), async (req, res, next) => {
   }
 });
 
+// MERGE (Studio-Verse tenant profile, Phase 18H): contact/address details
+// backing the Studio Profile page's contact section — the equivalent of
+// Studio-Verse's tenant_phone_number / tenant_studio_address. Lazily
+// created so older accounts get a row on first read.
+
+function profileResponse(row) {
+  return {
+    phone: row?.phone ?? null,
+    studio_address: row?.studioAddress ?? null,
+  };
+}
+
+router.get("/profile", async (req, res, next) => {
+  try {
+    const row = await prisma.tenantProfile.upsert({
+      where: { tenantId: req.user.id },
+      create: { tenantId: req.user.id },
+      update: {},
+    });
+    res.json(profileResponse(row));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/profile", async (req, res, next) => {
+  try {
+    const { phone, studio_address: studioAddress } = req.body || {};
+    const data = {};
+    if (phone !== undefined) {
+      if (phone !== null && (typeof phone !== "string" || phone.trim() === "")) {
+        return res.status(400).json({ error: "phone must be a non-empty string, or null to clear" });
+      }
+      data.phone = phone === null ? null : phone.trim().slice(0, 30);
+    }
+    if (studioAddress !== undefined) {
+      if (studioAddress !== null && (typeof studioAddress !== "string" || studioAddress.trim() === "")) {
+        return res.status(400).json({ error: "studio_address must be a non-empty string, or null to clear" });
+      }
+      data.studioAddress = studioAddress === null ? null : studioAddress.trim().slice(0, 500);
+    }
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "No profile change provided." });
+    }
+    const row = await prisma.tenantProfile.upsert({
+      where: { tenantId: req.user.id },
+      create: { tenantId: req.user.id, ...data },
+      update: data,
+    });
+    res.json(profileResponse(row));
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;

@@ -4,13 +4,14 @@ import { randomBytes } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/admin.js";
+import { requireRole } from "../middleware/role.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
 import { deleteFileIfExists, removeEventDir } from "../lib/storage.js";
 import { zipDownloadPath } from "../lib/zip.js";
 import { deleteFileFromDrive } from "../lib/driveBackup.js";
 import { FREE_EVENT_LIMIT, FREE_EVENT_STORAGE_BYTES, DEFAULT_PHOTO_RETENTION_DAYS } from "../lib/planLimits.js";
-import { sendEmailVerificationEmail } from "../lib/mailer.js";
+import { sendEmailVerificationEmail, sendStudioCredentialsEmail } from "../lib/mailer.js";
 import { getDriveAccountQuota } from "../lib/driveBackup.js";
 import { computePlanExpiry, getPlatformSettings, getActiveSubscription } from "../lib/subscriptionAccess.js";
 
@@ -140,6 +141,45 @@ async function wipeStudioStorage(userId) {
     await removeEventDir(eventId);
   }
   return { deletedCount: photos.length, eventCount: eventIds.length };
+}
+
+async function resetStudioWorkspace(user) {
+  const events = await prisma.event.findMany({ where: { ownerId: user.id } });
+  for (const event of events) {
+    await deleteEventCascade(event);
+  }
+
+  const supportTickets = await prisma.supportTicket.findMany({
+    where: { OR: [{ tenantId: user.id }, { requesterId: user.id }] },
+    select: { id: true },
+  });
+  const supportTicketIds = supportTickets.map((t) => t.id);
+
+  await prisma.$transaction([
+    prisma.supportTicketReply.deleteMany({
+      where: { OR: [{ authorId: user.id }, { ticketId: { in: supportTicketIds } }] },
+    }),
+    prisma.supportTicket.deleteMany({ where: { id: { in: supportTicketIds } } }),
+    prisma.payment.deleteMany({ where: { OR: [{ tenantId: user.id }, { bill: { tenantId: user.id } }] } }),
+    prisma.billItem.deleteMany({ where: { bill: { tenantId: user.id } } }),
+    prisma.bill.deleteMany({ where: { tenantId: user.id } }),
+    prisma.quotationItem.deleteMany({ where: { quotation: { tenantId: user.id } } }),
+    prisma.quotation.deleteMany({ where: { tenantId: user.id } }),
+    prisma.studioService.deleteMany({ where: { tenantId: user.id } }),
+    prisma.tenantBillingSettings.upsert({
+      where: { tenantId: user.id },
+      update: {
+        nextQuotationNumber: 1,
+        nextBillNumber: 1,
+        nextReceiptNumber: 1,
+        gstinNumber: null,
+        gstState: null,
+      },
+      create: { tenantId: user.id },
+    }),
+  ]);
+
+  return { eventCount: events.length, supportTicketCount: supportTickets.length };
 }
 
 async function findAssignableSubscriptionPlan(planId, res) {
@@ -303,6 +343,7 @@ router.post("/users", async (req, res, next) => {
       if (!freeUntil) return res.status(400).json({ error: "free_access_until is required when granting a free plan" });
     }
 
+    const generatedPassword = !password;
     const plainPassword = password || generateTempPassword();
     const passwordHash = await bcrypt.hash(plainPassword, BCRYPT_ROUNDS);
     const now = new Date();
@@ -336,12 +377,23 @@ router.post("/users", async (req, res, next) => {
       return created;
     });
 
+    let credentialsEmailSent = false;
+    if (generatedPassword) {
+      try {
+        await sendStudioCredentialsEmail(user.email, user.name, user.email, plainPassword, `${PUBLIC_WEB_URL}/login`);
+        credentialsEmailSent = true;
+      } catch (err) {
+        console.error(`Failed to email generated studio credentials for ${user.id}:`, err.message);
+      }
+    }
+
     res.status(201).json({
       id: user.id,
       name: user.name,
       email: user.email,
       role: user.role,
-      generated_password: password ? null : plainPassword,
+      generated_password: generatedPassword ? plainPassword : null,
+      credentials_email_sent: credentialsEmailSent,
     });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message });
@@ -375,6 +427,7 @@ router.get("/users/:id", async (req, res, next) => {
           storage_used_bytes: storageAgg._sum.fileSize || 0,
           created_at: e.createdAt,
           expires_at: e.expiresAt,
+          archived_at: e.archivedAt,
         };
       })
     );
@@ -574,6 +627,26 @@ router.delete("/users/:id/storage", async (req, res, next) => {
   }
 });
 
+router.delete("/users/:id/reset", async (req, res, next) => {
+  try {
+    const user = await requireStudioUser(req.params.id, res);
+    if (!user) return;
+    const { confirm_email: confirmEmail } = req.body || {};
+    if ((confirmEmail || "").trim().toLowerCase() !== user.email.toLowerCase()) {
+      return res.status(400).json({ error: "confirm_email must match this studio's exact email address" });
+    }
+
+    const result = await resetStudioWorkspace(user);
+    res.json({
+      ok: true,
+      deleted_event_count: result.eventCount,
+      deleted_support_ticket_count: result.supportTicketCount,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/users/:id/suspend", async (req, res, next) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.params.id } });
@@ -675,6 +748,54 @@ router.post("/users/:id/verify", async (req, res, next) => {
   }
 });
 
+// MERGE (Studio-Verse): Super-Admin account-recovery console — unlock a
+// lockout-frozen account and force-reset any account's password by email.
+// Deliberately gated on role === SUPER_ADMIN (stricter than this router's
+// default requireAdmin, which also admits ADMIN_EMAILS studio admins),
+// matching Studio-Verse where only Super Admin sees the Accounts tab.
+router.post("/users/unlock-account", requireRole("SUPER_ADMIN"), async (req, res, next) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "email is required" });
+    }
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    if (!user) return res.status(404).json({ error: "No account found for that email" });
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { failedLoginAttempts: 0, lockedUntil: null },
+    });
+    res.json({ ok: true, message: `Account "${user.email}" has been unlocked successfully.` });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/users/reset-password", requireRole("SUPER_ADMIN"), async (req, res, next) => {
+  try {
+    const { email, new_password: newPassword } = req.body || {};
+    if (!email || typeof email !== "string" || !newPassword || typeof newPassword !== "string") {
+      return res.status(400).json({ error: "email and new_password are required" });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters" });
+    }
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    if (!user) return res.status(404).json({ error: "No account found for that email" });
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS),
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    });
+    res.json({ ok: true, message: `Password for "${user.email}" has been reset successfully.` });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Permanently deletes a user/studio account: every event they own (via the
 // same cascade the owner-facing DELETE /events/:id route uses), then every
 // user-linked billing/subscription/support row, then the User row itself.
@@ -743,14 +864,22 @@ router.get("/events", async (req, res, next) => {
   try {
     const { page, pageSize, skip } = parsePage(req);
     const search = (req.query.search || "").trim();
-    const where = search
-      ? {
-          OR: [
-            { name: { contains: search, mode: "insensitive" } },
-            { owner: { email: { contains: search, mode: "insensitive" } } },
-          ],
-        }
-      : {};
+    // MERGE (Studio-Verse archive visibility, Phase 18G): platform-wide the
+    // default is `all` (an admin sees everything); the studio Dashboard
+    // defaults to active-only instead. Same three-way filter vocabulary.
+    const status = req.query.status ?? "all";
+    if (!["active", "archived", "all"].includes(status)) {
+      return res.status(400).json({ error: 'status must be "active", "archived", or "all"' });
+    }
+    const archivedFilter =
+      status === "active" ? { archivedAt: null } : status === "archived" ? { archivedAt: { not: null } } : {};
+    const where = { ...archivedFilter };
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: "insensitive" } },
+        { owner: { email: { contains: search, mode: "insensitive" } } },
+      ];
+    }
 
     const [total, events] = await Promise.all([
       prisma.event.count({ where }),
@@ -775,6 +904,7 @@ router.get("/events", async (req, res, next) => {
         photo_count: e._count.photos,
         created_at: e.createdAt,
         expires_at: e.expiresAt,
+        archived_at: e.archivedAt,
       })),
     });
   } catch (err) {
@@ -919,6 +1049,22 @@ router.get("/metrics", async (req, res, next) => {
 
     const driveQuota = await getDriveAccountQuota();
 
+    // MERGE (Studio-Verse storage analytics, Phase 18G): top events by
+    // bytes for the platform "Storage by Event" chart. Aggregated from the
+    // same fileSize source the per-user rollups use — no new tracking.
+    const storageByEventRows = await prisma.photo.groupBy({
+      by: ["eventId"],
+      _sum: { fileSize: true },
+      _count: { eventId: true },
+      orderBy: { _sum: { fileSize: "desc" } },
+      take: 8,
+    });
+    const storageByEventEvents = await prisma.event.findMany({
+      where: { id: { in: storageByEventRows.map((r) => r.eventId) } },
+      include: { owner: { select: { email: true } } },
+    });
+    const eventById = Object.fromEntries(storageByEventEvents.map((e) => [e.id, e]));
+
     res.json({
       guest_engagement: {
         total_searches: totalSearches,
@@ -935,6 +1081,13 @@ router.get("/metrics", async (req, res, next) => {
         drive_backup_enabled: driveBackupOnCount,
         active_guest_alert_subscriptions: activeAlertSubs,
       },
+      storage_by_event: storageByEventRows.map((r) => ({
+        event_id: r.eventId,
+        event_name: eventById[r.eventId]?.name ?? "(deleted event)",
+        owner_email: eventById[r.eventId]?.owner.email ?? "—",
+        storage_used_bytes: r._sum.fileSize || 0,
+        photo_count: r._count.eventId,
+      })),
       top_clients: { sort, users: rankedUsers },
       drive_backup_quota: driveQuota,
     });

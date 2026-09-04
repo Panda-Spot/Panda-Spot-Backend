@@ -45,10 +45,65 @@ function itemsFromBody(items) {
   }));
 }
 
+// --- GST display settings (Phase 18H) ---
+// Display-only fields printed on quotation/bill/receipt PDFs (see
+// lib/billingPdf.js) — no tax math anywhere, matching Studio-Verse's own
+// GST display fields. Lazily created so pre-existing studios get a row on
+// first read.
+
+function serializeBillingSettings(row) {
+  return {
+    gstin_number: row?.gstinNumber ?? null,
+    gst_state: row?.gstState ?? null,
+  };
+}
+
+router.get("/settings", async (req, res, next) => {
+  try {
+    const row = await prisma.tenantBillingSettings.upsert({
+      where: { tenantId: req.user.id },
+      create: { tenantId: req.user.id },
+      update: {},
+    });
+    res.json(serializeBillingSettings(row));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/settings", async (req, res, next) => {
+  try {
+    const { gstin_number: gstinNumber, gst_state: gstState } = req.body || {};
+    const data = {};
+    if (gstinNumber !== undefined) {
+      if (gstinNumber !== null && (typeof gstinNumber !== "string" || gstinNumber.trim() === "")) {
+        return res.status(400).json({ error: "gstin_number must be a non-empty string, or null to clear" });
+      }
+      data.gstinNumber = gstinNumber === null ? null : gstinNumber.trim().slice(0, 20);
+    }
+    if (gstState !== undefined) {
+      if (gstState !== null && (typeof gstState !== "string" || gstState.trim() === "")) {
+        return res.status(400).json({ error: "gst_state must be a non-empty string, or null to clear" });
+      }
+      data.gstState = gstState === null ? null : gstState.trim().slice(0, 60);
+    }
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "No settings change provided." });
+    }
+    const row = await prisma.tenantBillingSettings.upsert({
+      where: { tenantId: req.user.id },
+      create: { tenantId: req.user.id, ...data },
+      update: data,
+    });
+    res.json(serializeBillingSettings(row));
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- Service catalog ---
 
-router.get("/services", async (req, res, next) => {
-  try {
+router.get("/services", async (req, res, next) => {  try {
     const services = await prisma.studioService.findMany({ where: { tenantId: req.user.id }, orderBy: { name: "asc" } });
     res.json(services);
   } catch (err) {
