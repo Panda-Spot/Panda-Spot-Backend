@@ -31,7 +31,9 @@ function safeZipEntryName(filename) {
 /**
  * Streams a zip of the given photos straight to an HTTP response (used by
  * the instant-download route). Caller must have already set
- * Content-Type/Content-Disposition headers.
+ * Content-Type/Content-Disposition headers. Duplicate filenames (common in
+ * merged selections — two cameras writing DSC_0001.JPG) get a " (2)"
+ * suffix so no file silently overwrites another on extraction.
  */
 export async function streamPhotosZip(photos, res) {
   const archive = archiver("zip", { zlib: { level: 9 } });
@@ -41,8 +43,25 @@ export async function streamPhotosZip(photos, res) {
   });
   archive.pipe(res);
 
+  const usedNames = new Set();
+  const uniqueName = (filename) => {
+    let name = safeZipEntryName(filename);
+    if (!usedNames.has(name.toLowerCase())) {
+      usedNames.add(name.toLowerCase());
+      return name;
+    }
+    const dot = name.lastIndexOf(".");
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    let i = 2;
+    while (usedNames.has(`${stem} (${i})${ext}`.toLowerCase())) i += 1;
+    name = `${stem} (${i})${ext}`;
+    usedNames.add(name.toLowerCase());
+    return name;
+  };
+
   for (const photo of photos) {
-    const entryName = safeZipEntryName(photo.filename);
+    const entryName = uniqueName(photo.filename);
     if (photo.storagePath && fs.existsSync(photo.storagePath)) {
       archive.file(photo.storagePath, { name: entryName });
     } else if (photo.driveFileId) {

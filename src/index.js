@@ -6,6 +6,7 @@ import cookieParser from "cookie-parser";
 import authRoutes from "./routes/auth.js";
 import eventsRoutes from "./routes/events.js";
 import albumsRoutes from "./routes/albums.js";
+import selectionExportRoutes from "./routes/selectionExport.js";
 import clientAlbumsRoutes from "./routes/clientAlbums.js";
 import clientRoutes from "./routes/client.js";
 import guestRoutes from "./routes/guest.js";
@@ -66,6 +67,7 @@ app.use("/auth", authRoutes);
 // Albums before events: both share the /events/:id prefix and Express
 // matches routers in registration order.
 app.use("/events/:id/albums", albumsRoutes);
+app.use("/events/:id/selection", selectionExportRoutes);
 app.use("/events", eventsRoutes);
 app.use("/e", guestRoutes);
 app.use("/files", filesRoutes);

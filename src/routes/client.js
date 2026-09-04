@@ -4,6 +4,13 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
 import { signMediaToken } from "../lib/mediaTokens.js";
 import { streamPhotosZip, zipFilenameForEvent } from "../lib/zip.js";
+import {
+  buildProofingPdf,
+  buildSelectionCsv,
+  buildSelectionTxt,
+  exportFilename,
+  resolveSelection,
+} from "../lib/selectionExport.js";
 
 const router = Router();
 
@@ -228,6 +235,78 @@ router.get("/events/:id/studio-pick-ids", async (req, res, next) => {
     res.json({ photo_ids: picks.map((p) => p.photoId) });
   } catch (err) {
     next(err);
+  }
+});
+
+// MERGE (Selection export, Phase 1): the client's own picked filenames
+// as CSV/TXT plus a branded proofing PDF of their selection — only when
+// the studio allows downloads (same allow_download gate as the
+// favourites zip below). Submitted or not, the record exports either way.
+async function loadSelfSelection(req, res) {
+  const mapping = await loadClientAccess(req, res);
+  if (!mapping) return null;
+  if (!mapping.event.allowDownload) {
+    res.status(403).json({ error: "Downloads are disabled for this event by the studio." });
+    return null;
+  }
+  try {
+    return await resolveSelection({ eventId: mapping.eventId, selfUserId: req.user.id });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || "Could not resolve selection" });
+    return null;
+  }
+}
+
+router.get("/events/:id/selection/export.csv", async (req, res) => {
+  const selection = await loadSelfSelection(req, res);
+  if (!selection) return;
+  try {
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${exportFilename(selection.event.name, "my-selection", "csv")}"`
+    );
+    res.send(buildSelectionCsv(selection));
+  } catch (err) {
+    console.error(`Selection export failed (client csv event=${req.params.id} user=${req.user.id}):`, err);
+    if (!res.headersSent) res.status(500).json({ error: "Export failed — please try again." });
+  }
+});
+
+router.get("/events/:id/selection/export.txt", async (req, res) => {
+  const selection = await loadSelfSelection(req, res);
+  if (!selection) return;
+  try {
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${exportFilename(selection.event.name, "my-selection", "txt")}"`
+    );
+    res.send(buildSelectionTxt(selection));
+  } catch (err) {
+    console.error(`Selection export failed (client txt event=${req.params.id} user=${req.user.id}):`, err);
+    if (!res.headersSent) res.status(500).json({ error: "Export failed — please try again." });
+  }
+});
+
+router.get("/events/:id/selection/report.pdf", async (req, res) => {
+  const selection = await loadSelfSelection(req, res);
+  if (!selection) return;
+  try {
+    const u = selection.clients[0]?.user;
+    const pdf = await buildProofingPdf({
+      ...selection,
+      scopeLabel: `${u?.name || "Client"} (${u?.email || "?"})`,
+    });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${exportFilename(selection.event.name, "my-selection", "pdf")}"`
+    );
+    res.send(pdf);
+  } catch (err) {
+    console.error(`Selection export failed (client pdf event=${req.params.id} user=${req.user.id}):`, err);
+    if (!res.headersSent) res.status(500).json({ error: "Export failed — please try again." });
   }
 });
 
