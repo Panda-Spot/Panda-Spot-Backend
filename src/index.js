@@ -5,12 +5,14 @@ import cookieParser from "cookie-parser";
 
 import authRoutes from "./routes/auth.js";
 import eventsRoutes from "./routes/events.js";
+import albumsRoutes from "./routes/albums.js";
+import clientAlbumsRoutes from "./routes/clientAlbums.js";
+import clientRoutes from "./routes/client.js";
 import guestRoutes from "./routes/guest.js";
 import filesRoutes from "./routes/files.js";
 import brandingRoutes from "./routes/branding.js";
 import invitesRoutes from "./routes/invites.js";
 import clientInvitesRoutes from "./routes/clientInvites.js";
-import clientRoutes from "./routes/client.js";
 import subscriptionsRoutes from "./routes/subscriptions.js";
 import billingRoutes from "./routes/billing.js";
 import supportRoutes from "./routes/support.js";
@@ -61,6 +63,9 @@ app.use(express.json());
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.use("/auth", authRoutes);
+// Albums before events: both share the /events/:id prefix and Express
+// matches routers in registration order.
+app.use("/events/:id/albums", albumsRoutes);
 app.use("/events", eventsRoutes);
 app.use("/e", guestRoutes);
 app.use("/files", filesRoutes);
@@ -68,6 +73,7 @@ app.use("/branding", brandingRoutes);
 app.use("/invites", invitesRoutes);
 app.use("/client-invites", clientInvitesRoutes);
 app.use("/client", clientRoutes);
+app.use("/client/events/:eventId/albums", clientAlbumsRoutes);
 app.use("/subscriptions", subscriptionsRoutes);
 app.use("/billing", billingRoutes);
 app.use("/support", supportRoutes);

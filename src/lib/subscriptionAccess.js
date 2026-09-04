@@ -259,11 +259,14 @@ function assertPlanSwapAllowed(currentSub, targetPlan) {
  * unchanged, only swaps the plan/quota ceiling — no proration, matching
  * Studio-Verse exactly. Not price-locked (unlike a fresh subscribe). */
 async function swapActivePlan(tenantId, targetPlanId, changeType) {
-  const [currentSub, targetPlan] = await Promise.all([
+  const [currentSub, targetPlan, tenant] = await Promise.all([
     prisma.tenantSubscription.findFirst({ where: { tenantId, isActive: true }, include: { subscriptionPlan: true } }),
     prisma.subscriptionPlan.findUnique({ where: { id: targetPlanId } }),
+    prisma.user.findUnique({ where: { id: tenantId }, select: { id: true, createdAt: true } }),
   ]);
   if (!targetPlan || !targetPlan.isActive) throw new Error("Plan not found");
+  if (!tenant) throw new Error("Studio not found");
+  assertPlanVisibleToTenant(targetPlan, tenant);
   assertPlanSwapAllowed(currentSub, targetPlan);
 
   return prisma.$transaction(async (tx) => {

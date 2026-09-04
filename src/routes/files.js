@@ -150,6 +150,49 @@ router.get("/events/:eventId/cover", async (req, res, next) => {
     next(err);
   }
 });
+// MERGE (Album proofing, Phase 23): serves one album spread image, its
+// thumbnail, or a version's print PDF. Same UUID trust model as the photo
+// routes above — the filename is a randomUUID, not enumerable, and URLs are
+// only ever handed out by the studio/client album APIs (which enforce the
+// DRAFT-invisibility rule). Album files are local-disk only, so there is no
+// Drive fallback here.
+router.get("/events/:eventId/albums/:albumId/files/:filename", async (req, res, next) => {
+  try {
+    const { eventId, albumId, filename } = req.params;
+    if (filename.includes("/") || filename.includes("\\") || filename.startsWith(".")) {
+      return res.status(404).json({ error: "File not found" });
+    }
+    const album = await prisma.album.findFirst({
+      where: { id: albumId, eventId },
+      include: { versions: { include: { pages: true } } },
+    });
+    if (!album) return res.status(404).json({ error: "File not found" });
+    let diskPath = null;
+    for (const version of album.versions) {
+      if (version.printPdfPath && path.basename(version.printPdfPath) === filename) {
+        diskPath = version.printPdfPath;
+        break;
+      }
+      for (const page of version.pages) {
+        if (path.basename(page.storagePath) === filename) {
+          diskPath = page.storagePath;
+          break;
+        }
+        if (page.thumbnailPath && path.basename(page.thumbnailPath) === filename) {
+          diskPath = page.thumbnailPath;
+          break;
+        }
+      }
+      if (diskPath) break;
+    }
+    if (!diskPath || !existsSync(diskPath)) {
+      return res.status(404).json({ error: "File not found" });
+    }
+    res.sendFile(diskPath);
+  } catch (err) {
+    next(err);
+  }
+});
 // Public by design: guests viewing an event's page need to see the
 // photographer's studio branding without logging in.
 router.get("/branding/:userId/logo", async (req, res, next) => {

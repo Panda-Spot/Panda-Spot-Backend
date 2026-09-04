@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 import { randomUUID } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
+import { envSuperAdminUser, isEnvSuperAdminEmail } from "./admin.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const COOKIE_NAME = "pandaspot_token";
@@ -11,7 +12,12 @@ const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days, matches the existing to
 /// password reset) without needing to rotate JWT_SECRET and invalidate
 /// every session at once.
 export function signToken(user) {
-  return jwt.sign({ sub: user.id, email: user.email, jti: randomUUID() }, JWT_SECRET, { expiresIn: TOKEN_TTL_SECONDS });
+  const isEnvSuperAdmin = user.role === "SUPER_ADMIN" && isEnvSuperAdminEmail(user.email) && user.id === "env-super-admin";
+  return jwt.sign(
+    { sub: user.id, email: user.email, role: user.role, env_super_admin: isEnvSuperAdmin, jti: randomUUID() },
+    JWT_SECRET,
+    { expiresIn: TOKEN_TTL_SECONDS }
+  );
 }
 
 // The frontend (Vercel) and this API (VPS) live on entirely different
@@ -90,6 +96,12 @@ export async function requireAuth(req, res, next) {
       if (blocked) {
         return res.status(401).json({ error: "Invalid or expired session" });
       }
+    }
+    if (payload.env_super_admin && payload.sub === "env-super-admin" && isEnvSuperAdminEmail(payload.email)) {
+      const admin = envSuperAdminUser();
+      if (!admin) return res.status(401).json({ error: "Invalid or expired session" });
+      req.user = { id: admin.id, email: admin.email, jti: payload.jti, exp: payload.exp, role: admin.role, envSuperAdmin: true };
+      return next();
     }
     const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { suspendedAt: true, role: true } });
     if (!user) {

@@ -106,7 +106,6 @@ export async function saveEventCover(eventId, filename, buffer) {
 export function uploadPartsDir() {
   return path.join(storageRoot(), "uploads", "parts");
 }
-
 /** Absolute path of one upload stage's accumulating part file. */
 export function uploadPartPath(stageId) {
   return path.join(uploadPartsDir(), `${stageId}.part`);
@@ -247,4 +246,25 @@ export async function saveBrandingWatermark(userId, filename, buffer) {
 
   await fsp.writeFile(newPath, buffer);
   return newPath;
+}
+
+/** Absolute directory for one album's files (inside its event's own
+ * directory, so event cascade-delete removes album files with everything
+ * else — no lifecycle hook needed). */
+export function albumDir(eventId, albumId) {
+  return path.join(eventDir(eventId), "albums", albumId);
+}
+
+/** Absolute directory for one album version's spread images. */
+export function albumVersionDir(eventId, albumId, versionNumber) {
+  return path.join(albumDir(eventId, albumId), `v${versionNumber}`);
+}
+
+/** Writes one album spread image, returns the absolute path. */
+export async function saveAlbumPage(eventId, albumId, versionNumber, filename, buffer) {
+  const dir = albumVersionDir(eventId, albumId, versionNumber);
+  await fsp.mkdir(dir, { recursive: true });
+  const fullPath = path.join(dir, filename);
+  await fsp.writeFile(fullPath, buffer);
+  return fullPath;
 }

@@ -990,7 +990,7 @@ router.get("/events/:id", async (req, res, next) => {
       include: {
         owner: true,
         collaborators: { include: { user: true } },
-        _count: { select: { photos: true } },
+        _count: { select: { photos: true, albums: true } },
       },
     });
     if (!event) return res.status(404).json({ error: "Event not found" });
@@ -1012,6 +1012,7 @@ router.get("/events/:id", async (req, res, next) => {
       guest_slug: event.guestSlug,
       owner: { id: event.owner.id, name: event.owner.name, email: event.owner.email },
       photo_count: event._count.photos,
+      album_count: event._count.albums,
       photo_source_counts: photoSourceCounts,
       storage_used_bytes: storageAgg._sum.fileSize || 0,
       created_at: event.createdAt,
@@ -1076,8 +1077,70 @@ router.get("/events/:id/photos", async (req, res, next) => {
   }
 });
 
-router.delete("/events/:id", async (req, res, next) => {
+// MERGE (Album proofing, Phase 23): platform support sees every album on
+// an event — version count, latest version, open pins — for abuse/billing
+// triage. Read-only; status changes go through the SUPER_ADMIN override.
+router.get("/events/:id/albums", async (req, res, next) => {
   try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+    const albums = await prisma.album.findMany({
+      where: { eventId: event.id },
+      include: {
+        versions: { select: { id: true, versionNumber: true, printPdfPath: true, _count: { select: { pages: true } } } },
+      },
+      orderBy: { updatedAt: "desc" },
+    });
+    res.json(
+      await Promise.all(
+        albums.map(async (a) => ({
+          album_id: a.id,
+          name: a.name,
+          status: a.status,
+          locked_at: a.lockedAt,
+          updated_at: a.updatedAt,
+          version_count: a.versions.length,
+          latest_version: a.versions.length ? Math.max(...a.versions.map((v) => v.versionNumber)) : null,
+          page_count_latest: (() => {
+            if (!a.versions.length) return 0;
+            const latest = a.versions.reduce((x, y) => (x.versionNumber >= y.versionNumber ? x : y));
+            return latest._count.pages;
+          })(),
+          open_pins: await prisma.albumComment.count({
+            where: { version: { albumId: a.id }, parentId: null, pinNumber: { not: null }, resolvedAt: null },
+          }),
+        }))
+      )
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// SUPER_ADMIN escape hatch: force any album status (e.g. unlock an
+// APPROVED album for a studio that can't be reached). Leaving APPROVED
+// clears lockedAt; entering APPROVED stamps it.
+router.post("/events/:id/albums/:albumId/status", requireRole("SUPER_ADMIN"), async (req, res, next) => {
+  try {
+    const { status } = req.body || {};
+    if (!["DRAFT", "SENT", "CHANGES_REQUESTED", "APPROVED"].includes(status)) {
+      return res.status(400).json({ error: "status must be DRAFT, SENT, CHANGES_REQUESTED or APPROVED" });
+    }
+    const album = await prisma.album.findFirst({
+      where: { id: req.params.albumId, eventId: req.params.id },
+    });
+    if (!album) return res.status(404).json({ error: "Album not found" });
+    const updated = await prisma.album.update({
+      where: { id: album.id },
+      data: { status, lockedAt: status === "APPROVED" ? album.lockedAt || new Date() : null },
+    });
+    res.json({ album_id: updated.id, status: updated.status, locked_at: updated.lockedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/events/:id", async (req, res, next) => {  try {
     const event = await prisma.event.findUnique({ where: { id: req.params.id } });
     if (!event) return res.status(404).json({ error: "Event not found" });
     await deleteEventCascade(event);

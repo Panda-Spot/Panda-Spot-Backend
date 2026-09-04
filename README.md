@@ -89,15 +89,15 @@ meantime, not just cosmetic. See "Plan limits" and "Event expiry" below.
 | `FACE_MATCH_THRESHOLD` | Cosine-similarity cutoff for a guest selfie match, default `0.36` |
 | `PORT` | This server's port, default `4000` |
 | `CORS_ORIGIN` | The frontend's origin — required (not `*`) since auth uses cookies with `credentials: true` |
-| `SMTP_HOST` | SMTP host for emailing guests their zip download link; unset = no-op (logs the link instead) |
+| `SMTP_HOST` | SMTP host for transactional PandaSpot emails; unset = no-op logging |
 | `SMTP_PORT` | SMTP port, default `587` |
 | `SMTP_SECURE` | `"true"`/`"false"`, default `false` |
 | `SMTP_USER` / `SMTP_PASS` | SMTP auth, optional |
-| `SMTP_FROM` | From header for zip-ready emails |
+| `SMTP_FROM` | From header for PandaSpot emails |
 | `PUBLIC_SERVER_URL` | This server's own public base URL, used to build the emailed zip download link, default `http://localhost:4000` |
 | `PUBLIC_WEB_URL` | The frontend web app's public base URL, used to build collaborator invite links (`${PUBLIC_WEB_URL}/invites/:token`), default `http://localhost:5173` |
 | `GOOGLE_CLIENT_ID` | Google OAuth Client ID for "Sign in with Google" (Google Cloud Console > APIs & Services > Credentials). Unset by default — `POST /auth/google` responds `503` cleanly until this is configured. |
-| `ADMIN_EMAILS` | Comma-separated allowlist of email addresses allowed to hit `/admin/*` (the platform-operator overview — not a general role system). e.g. `"you@example.com,teammate@example.com"`. Unset = nobody can access `/admin/*`. |
+| `SUPER_ADMIN_EMAIL`, `SUPER_ADMIN_PASSWORD`, `SUPER_ADMIN_NAME` | Env-backed platform operator login. This account does not need a `User` row; matching `/auth/login` credentials issue a `SUPER_ADMIN` session. |
 | `GOOGLE_DRIVE_API_KEY` | Google Drive API key (Cloud Console > APIs & Services > Credentials > API key, with the Drive API enabled) for the "import from a public Google Drive folder" feature — see "Google Drive import" below. This is a **separate** credential from `GOOGLE_CLIENT_ID` above (that one is Sign-In OAuth; this one is a plain read-only Drive API v3 key). Unset by default — `POST /events/:id/import/drive` responds a clean `400` until this is configured. |
 | `FTP_PORT`, `FTP_PASV_MIN`, `FTP_PASV_MAX`, `FTP_PUBLIC_HOST`, `FTP_TLS_CERT_PATH`, `FTP_TLS_KEY_PATH` | PandaShoots (camera-to-cloud live upload) FTP server config — see "PandaShoots" below. `FTP_PUBLIC_HOST` and the passive port range must be reachable through the VPS firewall/NAT for camera uploads to work over the internet. |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM` | WhatsApp delivery (see "WhatsApp delivery" below) — Twilio's WhatsApp Business API, called directly via REST (no SDK). Unset by default — `lib/whatsapp.js` logs instead of sending. |
@@ -113,10 +113,9 @@ gates login or feature access, it's purely a UI nudge (see `emailVerifiedAt`
 on `User`). `POST /auth/login` returns a clear 401 if the account is
 Google-only (no `passwordHash` set) rather than attempting a password check.
 
-Every user response also now includes `is_admin: boolean` — `true` only if
-the account's email is in the `ADMIN_EMAILS` allowlist (see "Platform admin"
-below). This is purely so the frontend knows whether to show an Admin nav
-link; the real gate is server-side on `/admin/*`.
+Every user response also now includes `is_admin: boolean` — `true` only for a
+`SUPER_ADMIN` session. This is purely so the frontend knows whether to show an
+Admin nav link; the real gate is server-side on `/admin/*`.
 
 Every user response also includes `drive_backup_beta: boolean` (true if this
 email is in `DRIVE_BACKUP_BETA_EMAILS` — lets this photographer see the
@@ -136,7 +135,7 @@ real gates are server-side.
 | POST | `/auth/password-reset/request` | — | 10/15min/IP | `{ email }` → **always** responds `{ ok: true }` regardless of whether the account exists (no user-enumeration); emails a reset link if it does |
 | POST | `/auth/password-reset/:token/confirm` | — | — | `{ password }` (min 8 chars) → sets the new password. `{ ok: true }`; `404` if the token is invalid/expired/already used |
 | POST | `/auth/google` | — | — | `{ id_token }` (a Google Identity Services credential) → verifies it server-side, creates the account on first sign-in or links `googleId` to a matching existing email, response includes `token`. `503` if `GOOGLE_CLIENT_ID` isn't configured; `401` if the token doesn't verify |
-| GET | `/auth/google/drive-backup/connect` | required (admin) | — | **Advanced/beta, one-time setup** — see "Drive backup" below. A full-page redirect (not a fetch) to Google's consent screen for the platform's single Drive backup account. `403` if this account isn't in `ADMIN_EMAILS`; `503` if `GOOGLE_CLIENT_ID`/`SECRET` aren't set. |
+| GET | `/auth/google/drive-backup/connect` | required (super admin) | — | **Advanced/beta, one-time setup** — see "Drive backup" below. A full-page redirect (not a fetch) to Google's consent screen for the platform's single Drive backup account. `403` if this session is not the env-backed `SUPER_ADMIN`; `503` if `GOOGLE_CLIENT_ID`/`SECRET` aren't set. |
 | GET | `/auth/google/drive-backup/callback` | — | — | Google's redirect target — exchanges the code for a refresh token and renders it once as plain text for the admin to copy into `.env` as `GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN` (never stored in the database). |
 
 ### Events (photographer)
@@ -260,16 +259,14 @@ photographer so the frontend can show "closes in N days" ahead of time.
 
 ## Platform admin (operator-only, not a general role system)
 
-A small `/admin/*` surface for the platform operator (you) to see aggregate
-usage — total users/events/photos/storage/searches and the 20 most recently
-created events. Gated by `ADMIN_EMAILS` (comma-separated allowlist env var),
-checked against the JWT's `email` claim — no DB round-trip needed
-(`src/middleware/admin.js`). This is deliberately *not* a general role/permission
-system; it's a hardcoded allowlist for the operator's own use.
+The `/admin/*` surface is for the platform operator to manage studios,
+plans, usage, support, and lifecycle actions. It is gated by a `SUPER_ADMIN`
+session from `SUPER_ADMIN_EMAIL` + `SUPER_ADMIN_PASSWORD`; that account is
+env-backed and does not need a `User` row in the database.
 
 | Method | Path | Auth | What |
 |---|---|---|---|
-| GET | `/admin/overview` | admin allowlist only | `{ total_users, total_events, total_photos, total_storage_bytes, total_searches, daily_signups, daily_events, recent_events: [{ id, name, owner_email, photo_count, created_at }] }` — `daily_signups`/`daily_events` are zero-filled 30-day `[{ date, count }]` series (`src/lib/dailyBuckets.js`) for trend charts. `403 { error: "Admin access required" }` for any authenticated non-admin user; `401` if not authenticated at all. |
+| GET | `/admin/overview` | super admin only | `{ total_users, total_events, total_photos, total_storage_bytes, total_searches, daily_signups, daily_events, recent_events: [{ id, name, owner_email, photo_count, created_at }] }` — `daily_signups`/`daily_events` are zero-filled 30-day `[{ date, count }]` series (`src/lib/dailyBuckets.js`) for trend charts. `403 { error: "Admin access required" }` for any authenticated non-admin user; `401` if not authenticated at all. |
 
 ## Verifying the full flow (do this on the VPS)
 
@@ -465,7 +462,7 @@ for a real event.
 The other direction from Drive import/sync: mirroring photos PandaSpot
 *produces* — specifically, PandaShoots camera captures — into an event's connected
 Drive folder. Deliberately gated behind `DRIVE_BACKUP_BETA_EMAILS` (same
-allowlist pattern as `ADMIN_EMAILS`) — it hasn't been tested against a real
+env allowlist pattern as other platform-controlled features) — it hasn't been tested against a real
 Google account yet, and its storage model (below) is a real, disclosed
 tradeoff rather than a permanent archive.
 
@@ -480,7 +477,7 @@ named collaborators — so the platform account's uploads succeed in a
 photographer's folder the same way a person opening the link and dragging a
 file in would, with no per-photographer consent flow needed at all.
 
-**Setup (one-time, admin-only):** an `ADMIN_EMAILS` account visits
+**Setup (one-time, super-admin-only):** the env-backed `SUPER_ADMIN` account visits
 `GET /auth/google/drive-backup/connect` in a browser (a full-page redirect
 to Google's consent screen, requesting only the narrow `drive.file` scope —
 access limited to files/folders this account creates, never its whole

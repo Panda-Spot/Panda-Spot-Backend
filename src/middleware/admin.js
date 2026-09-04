@@ -1,18 +1,35 @@
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
-  .split(",")
-  .map((e) => e.trim().toLowerCase())
-  .filter(Boolean);
+const SUPER_ADMIN_EMAIL = (process.env.SUPER_ADMIN_EMAIL || process.env.ADMIN_EMAIL || "")
+  .trim()
+  .toLowerCase();
 
 export function isAdminEmail(email) {
-  return ADMIN_EMAILS.includes((email || "").toLowerCase());
+  return !!SUPER_ADMIN_EMAIL && SUPER_ADMIN_EMAIL === (email || "").toLowerCase();
 }
 
-/// MERGE (Studio-Verse): a SUPER_ADMIN-role account (see the Role enum in
-/// schema.prisma) is now also accepted, alongside the original
-/// ADMIN_EMAILS env-var allowlist — kept as a belt-and-suspenders
-/// fallback rather than removed, since it's working production behavior.
+export function isEnvSuperAdminEmail(email) {
+  return isAdminEmail(email);
+}
+
+export function isEnvSuperAdminCredentials(email, password) {
+  return isEnvSuperAdminEmail(email) && !!process.env.SUPER_ADMIN_PASSWORD && password === process.env.SUPER_ADMIN_PASSWORD;
+}
+
+export function envSuperAdminUser() {
+  if (!SUPER_ADMIN_EMAIL) return null;
+  return {
+    id: "env-super-admin",
+    email: SUPER_ADMIN_EMAIL,
+    name: process.env.SUPER_ADMIN_NAME || "PandaSpot Super Admin",
+    role: "SUPER_ADMIN",
+    emailVerifiedAt: new Date(),
+  };
+}
+
+/// Platform admin access is restricted to the SUPER_ADMIN role. The
+/// production super-admin account can be env-backed, so it does not need a
+/// User row in the database.
 export function requireAdmin(req, res, next) {
-  if (!isAdminEmail(req.user?.email) && req.user?.role !== "SUPER_ADMIN") {
+  if (req.user?.role !== "SUPER_ADMIN") {
     return res.status(403).json({ error: "Admin access required" });
   }
   next();

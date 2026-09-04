@@ -56,6 +56,8 @@ model User {
   eventAccess       EventUserMapping[]
   clientFavourites  ClientFavourite[]
   studioFavourites  StudioFavourite[]
+  /// Album proofing authorship (pins + replies, Phase 23).
+  albumComments     AlbumComment[]
 
   /// MERGE (Studio-Verse Billing & Subscriptions): this ADMIN-role user
   /// acting as the studio ("tenant" in Studio-Verse's terms — this merge
@@ -236,6 +238,8 @@ model Event {
   /// MERGE (Studio-Verse resumable upload, Phase 18H): in-progress and
   /// finished chunked-upload trackers for this event.
   uploadStages  MediaUploadStage[]
+  /// Album proofing projects (Phase 23).
+  albums        Album[]
   supportTickets SupportTicket[]
 
   /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
@@ -454,6 +458,8 @@ model Photo {
   /// received from logged-in clients / the studio's own separate picks.
   clientFavourites ClientFavourite[]
   studioFavourites StudioFavourite[]
+  /// Album staging refs pointing at this photo (Phase 23, zero-cost).
+  albumSources AlbumSource[]
 }
 
 /// MERGE (Studio-Verse Photo Selection): a pending invite for a client to
@@ -1041,4 +1047,125 @@ model SupportTicketReply {
   createdAt DateTime      @default(now())
 
   @@index([ticketId])
+}
+
+// =====================================================================
+// ALBUM PROOFING (Phase 23)
+// =====================================================================
+
+/// Album proofing review lifecycle (studio-designed spreads reviewed by
+/// the client): DRAFT (studio working, invisible to clients) -> SENT
+/// (under client review) -> CHANGES_REQUESTED (client asked for a new
+/// round) -> SENT (each new version re-sends automatically) ->
+/// APPROVED (client signed off; lockedAt set, everything frozen until
+/// the studio reopens back to DRAFT).
+enum AlbumStatus {
+  DRAFT
+  SENT
+  CHANGES_REQUESTED
+  APPROVED
+}
+
+/// One album project inside an event (e.g. "Wedding Album"). The flow:
+/// studio stages source photos (zero-cost refs to Photo rows) ->
+/// downloads full-res -> designs spreads externally -> uploads spread
+/// images (or a print PDF) as a version -> client reviews, pins
+/// comments, requests changes or approves. Files live under
+/// storage/events/<id>/albums/ so event cascade-delete removes them.
+model Album {
+  id        String      @id @default(uuid())
+  eventId   String
+  event     Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name      String
+  status    AlbumStatus @default(DRAFT)
+  lockedAt  DateTime?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  sources  AlbumSource[]
+  versions AlbumVersion[]
+
+  @@index([eventId])
+}
+
+/// Zero-cost staging refs from photo-selection favourites (or any event
+/// photos) into an album — points at the same Photo row, no file copy.
+/// The studio downloads these full-res originals to design spreads from.
+model AlbumSource {
+  id        String   @id @default(uuid())
+  albumId   String
+  album     Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  photoId   String
+  photo     Photo    @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([albumId, photoId])
+  @@index([albumId])
+}
+
+/// One revision round (Version 1, 2, Final…). Either spread images
+/// (ordered pages for the flipbook) or a single print PDF — never both.
+model AlbumVersion {
+  id            String   @id @default(uuid())
+  albumId       String
+  album         Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  versionNumber Int
+  note          String?
+  /// Print-ready file for download (optional, images still drive review).
+  printPdfPath  String?
+  createdAt     DateTime @default(now())
+
+  pages    AlbumPage[]
+  comments AlbumComment[]
+
+  @@unique([albumId, versionNumber])
+  @@index([albumId])
+}
+
+/// One spread/page image inside a version, ordered for the flipbook.
+model AlbumPage {
+  id           String       @id @default(uuid())
+  versionId    String
+  version      AlbumVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  pageNumber   Int
+  storagePath  String
+  thumbnailPath String?
+  filename     String
+  fileSize     Int          @default(0)
+  createdAt    DateTime     @default(now())
+
+  comments AlbumComment[]
+
+  @@unique([versionId, pageNumber])
+  @@index([versionId])
+}
+
+/// Pinned revision feedback on a version: top-level pins carry an
+/// optional page + 0-100 position (numbered per version+page) or act as
+/// general version notes when positionless; replies thread under a
+/// parent pin. Resolution is studio-side. Frozen once the album is
+/// APPROVED (no new pins/replies then).
+model AlbumComment {
+  id         String       @id @default(uuid())
+  versionId  String
+  version    AlbumVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  pageId     String?
+  page       AlbumPage?   @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     User         @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parentId   String?
+  parent     AlbumComment?  @relation("AlbumCommentThread", fields: [parentId], references: [id], onDelete: Cascade)
+  replies    AlbumComment[] @relation("AlbumCommentThread")
+  /// Display number within its version+page (top-level positioned pins
+  /// only; replies and general notes carry null).
+  pinNumber  Int?
+  xPct       Float?
+  yPct       Float?
+  message    String
+  resolvedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([versionId])
+  @@index([pageId])
+  @@index([parentId])
 }

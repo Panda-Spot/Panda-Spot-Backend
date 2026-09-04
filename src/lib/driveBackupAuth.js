@@ -19,7 +19,7 @@ import { OAuth2Client } from "google-auth-library";
 // GOOGLE_DRIVE_BACKUP_REFRESH_TOKEN is obtained ONCE by an admin running the
 // /auth/google/drive-backup/connect -> .../callback flow below (admin-only),
 // then pasted into the server's real .env and the process restarted — same
-// "env vars only load at process start" pattern as ADMIN_EMAILS.
+// "env vars only load at process start" pattern as the SUPER_ADMIN_* secrets.
 
 const REDIRECT_URI =
   process.env.GOOGLE_DRIVE_BACKUP_REDIRECT_URI ||
