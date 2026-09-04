@@ -14,6 +14,7 @@ import {
   deleteFileIfExists,
   deleteUploadPart,
   saveEventCover,
+  saveEventSponsorLogo,
   uploadPartPath,
   uploadPartSize,
 } from "../lib/storage.js";
@@ -300,6 +301,12 @@ router.get("/:id", async (req, res, next) => {
       published_at: event.publishedAt,
       archived_at: event.archivedAt,
       allow_download: event.allowDownload,
+      // Phase 8 (live TV wall): on-air settings source of truth.
+      tv_mode: event.tvMode,
+      tv_transition_ms: event.tvTransitionMs,
+      tv_show_qr: event.tvShowQr,
+      sponsor_name: event.sponsorName,
+      sponsor_logo_url: event.sponsorLogoPath ? `/files/events/${event.id}/sponsor-logo` : null,
       // Phase 3 (gallery access upgrade): settings panel source of truth
       // (key itself never leaves the server — only whether one is set).
       access_mode: event.accessMode,
@@ -513,6 +520,10 @@ router.patch("/:id", async (req, res, next) => {
       access_key: accessKey,
       expires_at: expiresAt,
       expiry_preset: expiryPreset,
+      tv_mode: tvMode,
+      tv_transition_ms: tvTransitionMs,
+      tv_show_qr: tvShowQr,
+      sponsor_name: sponsorName,
     } = req.body || {};
     const data = {};
     if (name !== undefined) {
@@ -600,6 +611,34 @@ router.patch("/:id", async (req, res, next) => {
       }
       data.expiresAt = d;
     }
+    // Phase 8 (live TV wall): on-air settings on the same studio PATCH.
+    if (tvMode !== undefined) {
+      if (tvMode !== "all" && tvMode !== "highlights") {
+        return res.status(400).json({ error: 'tv_mode must be "all" or "highlights"' });
+      }
+      data.tvMode = tvMode;
+    }
+    if (tvTransitionMs !== undefined) {
+      if (!Number.isInteger(tvTransitionMs) || tvTransitionMs < 2000 || tvTransitionMs > 30000) {
+        return res.status(400).json({ error: "tv_transition_ms must be an integer 2000-30000" });
+      }
+      data.tvTransitionMs = tvTransitionMs;
+    }
+    if (tvShowQr !== undefined) {
+      if (typeof tvShowQr !== "boolean") {
+        return res.status(400).json({ error: "tv_show_qr must be a boolean" });
+      }
+      data.tvShowQr = tvShowQr;
+    }
+    if (sponsorName !== undefined) {
+      if (sponsorName !== null && typeof sponsorName !== "string") {
+        return res.status(400).json({ error: "sponsor_name must be a string, or null to clear" });
+      }
+      if (sponsorName && sponsorName.length > 120) {
+        return res.status(400).json({ error: "sponsor_name is limited to 120 characters" });
+      }
+      data.sponsorName = sponsorName?.trim() ? sponsorName.trim() : null;
+    }
 
     // Private key lifecycle: a plaintext access_key sets a fresh bcrypt
     // hash, null/"" clears it (back to a keyless gallery). Locking an
@@ -639,6 +678,11 @@ router.patch("/:id", async (req, res, next) => {
       access_key_set: !!updated.accessKeyHash,
       expires_at: updated.expiresAt,
       expiry_preset: updated.expiryPreset,
+      tv_mode: updated.tvMode,
+      tv_transition_ms: updated.tvTransitionMs,
+      tv_show_qr: updated.tvShowQr,
+      sponsor_name: updated.sponsorName,
+      sponsor_logo_url: updated.sponsorLogoPath ? `/files/events/${event.id}/sponsor-logo` : null,
     });
   } catch (err) {
     next(err);
@@ -765,6 +809,76 @@ router.delete("/:id/cover", async (req, res, next) => {
       await prisma.event.update({ where: { id: event.id }, data: { coverPhotoPath: null } });
     }
     res.json({ cover_url: null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 8 (live TV wall): sponsor logo overlay upload — same single-file
+// pattern as the event cover. Served at GET /files/events/:eventId/sponsor-logo.
+router.post("/:id/sponsor-logo", upload.single("logo"), async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No logo file uploaded (expected multipart field 'logo')" });
+    }
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!IMAGE_EXTENSIONS.has(ext)) {
+      return res.status(400).json({ error: "Unsupported logo file type" });
+    }
+    if (!contentMatchesExtension(req.file.buffer, ext)) {
+      return res.status(400).json({ error: "File content doesn't match its extension" });
+    }
+
+    const logoPath = await saveEventSponsorLogo(event.id, req.file.originalname, req.file.buffer);
+    await prisma.event.update({ where: { id: event.id }, data: { sponsorLogoPath: logoPath } });
+    res.json({ sponsor_logo_url: `/files/events/${event.id}/sponsor-logo` });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/:id/sponsor-logo", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (event.sponsorLogoPath) {
+      await deleteFileIfExists(event.sponsorLogoPath);
+      await prisma.event.update({ where: { id: event.id }, data: { sponsorLogoPath: null } });
+    }
+    res.json({ sponsor_logo_url: null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 8: studio-star a photo for the TV wall's highlights mode.
+// Moderation-adjacent but independent — pending photos stay invisible
+// everywhere until approved, highlighted or not.
+router.patch("/:id/photos/:photoId/highlight", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { highlighted } = req.body || {};
+    if (typeof highlighted !== "boolean") {
+      return res.status(400).json({ error: "highlighted must be a boolean" });
+    }
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) return res.status(404).json({ error: "Photo not found" });
+    const updated = await prisma.photo.update({
+      where: { id: photo.id },
+      data: { highlighted },
+    });
+    res.json({ photo_id: updated.id, highlighted: updated.highlighted });
   } catch (err) {
     next(err);
   }
@@ -1752,6 +1866,7 @@ router.get("/:id/photos", async (req, res, next) => {
         moderation_flagged: p.moderationFlagged,
         face_search_visible: p.faceSearchVisible,
         photo_selection_visible: p.photoSelectionVisible,
+        highlighted: p.highlighted,
         face_indexed_at: p.faceIndexedAt,
       }))
     );

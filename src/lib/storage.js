@@ -102,6 +102,31 @@ export async function saveEventCover(eventId, filename, buffer) {
   return newPath;
 }
 
+/** Sponsor logo for the live TV wall overlay — same single-file pattern
+ * as the event cover (replacing deletes the old file). Served at
+ * GET /files/events/:eventId/sponsor-logo. */
+export async function saveEventSponsorLogo(eventId, filename, buffer) {
+  const dir = await ensureEventDir(eventId);
+
+  const ext = path.extname(filename).toLowerCase();
+  const newPath = path.join(dir, `sponsor${ext}`);
+
+  let existing = [];
+  try {
+    existing = await fsp.readdir(dir);
+  } catch {
+    existing = [];
+  }
+  for (const entry of existing) {
+    if (entry.startsWith("sponsor.") && path.join(dir, entry) !== newPath) {
+      await fsp.unlink(path.join(dir, entry)).catch(() => {});
+    }
+  }
+
+  await fsp.writeFile(newPath, buffer);
+  return newPath;
+}
+
 /** Absolute directory for in-progress chunked-upload part files. */
 export function uploadPartsDir() {
   return path.join(storageRoot(), "uploads", "parts");

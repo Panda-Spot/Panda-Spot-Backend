@@ -683,6 +683,63 @@ router.get("/:slug/gallery", async (req, res, next) => {
   }
 });
 
+// Phase 8 (live TV wall): one public feed for the venue screen — event
+// meta + studio/sponsor branding, on-air settings, QR target, and the
+// current photo set (approved only, so moderation holds: pending uploads
+// never appear). tvMode "highlights" narrows to studio-starred photos;
+// videos are excluded (the wall is a photo surface). Sits behind the
+// same gallery gate as everything else here (private key / login-only
+// apply to the TV too — append ?gallery_key= for locked venues).
+router.get("/:slug/tv", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({
+      where: { guestSlug: req.params.slug },
+      include: { owner: true },
+    });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) {
+      return res.status(410).json({ error: "This event's guest access has closed." });
+    }
+    const highlightsOnly = (event.tvMode || "all") === "highlights";
+    const photos = await prisma.photo.findMany({
+      where: {
+        eventId: event.id,
+        approvalStatus: "approved",
+        archivedAt: null,
+        ...(highlightsOnly ? { highlighted: true } : {}),
+      },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    const stills = photos.filter((p) => !isVideoExtension(path.extname(p.filename || "").toLowerCase()));
+    res.json({
+      event: {
+        id: event.id,
+        name: event.name,
+        studio_name: event.owner?.studioName ?? null,
+        logo_url: event.owner?.logoPath ? `/files/branding/${event.owner.id}/logo` : null,
+        brand_color: event.owner?.brandColor ?? null,
+        watermark_text: event.owner?.studioName || event.name,
+      },
+      settings: {
+        tv_mode: event.tvMode || "all",
+        tv_transition_ms: event.tvTransitionMs || 5000,
+        tv_show_qr: event.tvShowQr !== false,
+        sponsor_name: event.sponsorName,
+        sponsor_logo_url: event.sponsorLogoPath ? `/files/events/${event.id}/sponsor-logo` : null,
+      },
+      qr_target: `/e/${event.guestSlug}`,
+      photo_count: stills.length,
+      highlights_only: highlightsOnly,
+      photos: stills.map((p) => photoResponseShape(event, p)),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Public SSE feed of "a new photo just landed" for this event — same
 // underlying bus as the owner-side stream (events.js's /:id/live/stream),
 // just scoped by guestSlug instead of requiring auth, so the slideshow

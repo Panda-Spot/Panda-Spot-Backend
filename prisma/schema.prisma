@@ -241,7 +241,14 @@ model Event {
   /// studio's access key → unlock token), "client_login" / "invite_only"
   /// (guest link closed — clients use their login instead).
   accessMode String @default("public")
-  /// bcrypt hash of the studio's private access key. Null = no key set —
+  /// Phase 8 (live TV wall): "all" rotates every approved photo,
+  /// "highlights" only studio-starred ones. Transition + QR visibility
+  /// are per-event; sponsor branding overlays the wall when set.
+  tvMode         String  @default("all")
+  tvTransitionMs Int     @default(5000)
+  tvShowQr       Boolean @default(true)
+  sponsorName    String?
+  sponsorLogoPath String?  /// bcrypt hash of the studio's private access key. Null = no key set —
   /// switching to private_key mode without one is rejected.
   accessKeyHash String?
   /// Which expiry preset the studio picked ("7_days" | "30_days" |
@@ -483,6 +490,8 @@ model Photo {
   /// Face Search, Photo Selection, both, or neither without duplicating files.
   faceSearchVisible     Boolean @default(true)
   photoSelectionVisible Boolean @default(true)
+  /// Phase 8: studio-starred for the live TV wall's highlights mode.
+  highlighted         Boolean @default(false)
 
   /// Soft per-photo archive (mirrors Studio-Verse's media archive): an
   /// archived photo is hidden from guests (search/gallery/slideshow/

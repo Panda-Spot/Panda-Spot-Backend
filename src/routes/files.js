@@ -150,6 +150,22 @@ router.get("/events/:eventId/cover", async (req, res, next) => {
     next(err);
   }
 });
+// Phase 8 (live TV wall): serves the event's sponsor logo overlay. UUID
+// trust model, like the cover route above it.
+router.get("/events/:eventId/sponsor-logo", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.eventId } });
+    if (!event || !event.sponsorLogoPath) {
+      return res.status(404).json({ error: "No sponsor logo set" });
+    }
+    if (!existsSync(event.sponsorLogoPath)) {
+      return res.status(404).json({ error: "Sponsor logo file missing on disk" });
+    }
+    res.sendFile(event.sponsorLogoPath);
+  } catch (err) {
+    next(err);
+  }
+});
 // MERGE (Album proofing, Phase 23): serves one album spread image, its
 // thumbnail, or a version's print PDF. Same UUID trust model as the photo
 // routes above — the filename is a randomUUID, not enumerable, and URLs are
