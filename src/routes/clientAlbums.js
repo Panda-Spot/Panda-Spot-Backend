@@ -132,6 +132,24 @@ router.post("/:albumId/comments", async (req, res, next) => {
   }
 });
 
+// Phase 6: clients can delete their OWN comments while the album is still
+// in review (unlocked). Top-level deletes cascade to its replies.
+router.delete("/:albumId/comments/:commentId", async (req, res, next) => {
+  try {
+    const loaded = await loadClientAlbum(req, res);
+    if (!loaded) return;
+    if (!requireReviewOpen(loaded.album, res)) return;
+    const comment = await prisma.albumComment.findFirst({
+      where: { id: req.params.commentId, version: { albumId: loaded.album.id }, authorId: req.user.id },
+    });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+    await prisma.albumComment.delete({ where: { id: comment.id } });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/:albumId/request-changes", async (req, res, next) => {
   try {
     const loaded = await loadClientAlbum(req, res);

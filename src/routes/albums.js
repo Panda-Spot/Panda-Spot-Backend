@@ -785,6 +785,7 @@ router.post("/:albumId/comments/:commentId/resolve", async (req, res, next) => {
 
     const album = await loadAlbum(event.id, req.params.albumId, res);
     if (!album) return;
+    if (!requireUnlocked(album, res)) return;
     const comment = await prisma.albumComment.findFirst({
       where: { id: req.params.commentId, version: { albumId: album.id }, parentId: null },
     });
@@ -796,6 +797,78 @@ router.post("/:albumId/comments/:commentId/resolve", async (req, res, next) => {
       data: { resolvedAt: resolved === false ? null : new Date() },
     });
     res.json({ id: updated.id, resolved_at: updated.resolvedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 6: explicit unresolve alias — reopens a resolved thread back to
+// OPEN. Same guards as resolve.
+router.post("/:albumId/comments/:commentId/unresolve", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    if (!requireUnlocked(album, res)) return;
+    const comment = await prisma.albumComment.findFirst({
+      where: { id: req.params.commentId, version: { albumId: album.id }, parentId: null },
+    });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+
+    const updated = await prisma.albumComment.update({
+      where: { id: comment.id },
+      data: { resolvedAt: null },
+    });
+    res.json({ id: updated.id, resolved_at: updated.resolvedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 6: delete a comment (top-level deletes cascade to its replies).
+// Studio side: owner or collaborator, unlocked albums only.
+router.delete("/:albumId/comments/:commentId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    if (!requireUnlocked(album, res)) return;
+    const comment = await prisma.albumComment.findFirst({
+      where: { id: req.params.commentId, version: { albumId: album.id } },
+    });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+    await prisma.albumComment.delete({ where: { id: comment.id } });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 6: flat per-revision thread list — top-level comments with
+// replies, newest-last. Revision feedback stays queryable per version
+// even after newer revisions exist.
+router.get("/:albumId/versions/:versionId/comments", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    const version = album.versions.find((v) => v.id === req.params.versionId);
+    if (!version) return res.status(404).json({ error: "Version not found" });
+    const comments = await prisma.albumComment.findMany({
+      where: { versionId: version.id, parentId: null },
+      include: { author: true, replies: { include: { author: true }, orderBy: { createdAt: "asc" } } },
+      orderBy: { createdAt: "asc" },
+    });
+    res.json(comments.map(commentShape));
   } catch (err) {
     next(err);
   }
