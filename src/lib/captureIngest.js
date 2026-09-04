@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { prisma } from "./prisma.js";
 import { detectFacesForPhoto, replacePhotoFaces } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
-import { ALLOWED_EXTENSIONS } from "./storage.js";
+import { IMAGE_EXTENSIONS } from "./storage.js";
 import { getStorageProvider } from "./storageProvider.js";
 import { contentMatchesExtension } from "./fileValidation.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetentionDays } from "./planLimits.js";
@@ -34,7 +34,8 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
     .update({ where: { id: event.id }, data: { lastShootsCaptureAt: new Date() } })
     .catch((err) => console.error(`Failed to stamp lastShootsCaptureAt for event ${event.id}:`, err));
 
-  if (!ALLOWED_EXTENSIONS.has(ext)) {
+  // PandaShoots captures are camera stills — video never arrives here.
+  if (!IMAGE_EXTENSIONS.has(ext)) {
     return skip(event.id, originalFilename, "unsupported file type");
   }
   if (!contentMatchesExtension(buffer, ext)) {

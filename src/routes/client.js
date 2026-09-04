@@ -19,7 +19,7 @@ router.use(requireAuth, requireRole("USER"));
 async function loadClientAccess(req, res) {
   const mapping = await prisma.eventUserMapping.findUnique({
     where: { eventId_userId: { eventId: req.params.id, userId: req.user.id } },
-    include: { event: { include: { owner: { select: { studioName: true, watermarkIntensity: true, brandColor: true } } } } },
+    include: { event: { include: { owner: { select: { studioName: true, watermarkIntensity: true, brandColor: true, watermarkImagePath: true } } } } },
   });
   if (!mapping) {
     res.status(404).json({ error: "You don't have access to this event" });
@@ -92,7 +92,7 @@ router.get("/events/:id", async (req, res, next) => {
     if (!mapping) return;
 
     const favouriteCount = await prisma.clientFavourite.count({
-      where: { userId: req.user.id, photo: { eventId: mapping.eventId, photoSelectionVisible: true } },
+      where: { userId: req.user.id, photo: { eventId: mapping.eventId, photoSelectionVisible: true, archivedAt: null } },
     });
 
     res.json({
@@ -112,6 +112,9 @@ router.get("/events/:id", async (req, res, next) => {
       logo_url: `/files/branding/${mapping.event.ownerId}/logo`,
       watermark_text: mapping.event.owner?.studioName || mapping.event.name,
       watermark_intensity: mapping.event.owner?.watermarkIntensity ?? 0.75,
+      watermark_image_url: mapping.event.owner?.watermarkImagePath
+        ? `/files/branding/${mapping.event.ownerId}/watermark`
+        : null,
     });
   } catch (err) {
     next(err);
@@ -124,7 +127,7 @@ router.get("/events/:id/photos", async (req, res, next) => {
     if (!mapping) return;
 
     const photos = await prisma.photo.findMany({
-      where: { eventId: mapping.eventId, approvalStatus: "approved", photoSelectionVisible: true },
+      where: { eventId: mapping.eventId, approvalStatus: "approved", photoSelectionVisible: true, archivedAt: null },
       orderBy: { createdAt: "desc" },
       include: { clientFavourites: { where: { userId: req.user.id } } },
     });
@@ -155,7 +158,7 @@ router.post("/events/:id/photos/:photoId/favourite", async (req, res, next) => {
     }
 
     const photo = await prisma.photo.findFirst({
-      where: { id: req.params.photoId, eventId: mapping.eventId, photoSelectionVisible: true },
+      where: { id: req.params.photoId, eventId: mapping.eventId, photoSelectionVisible: true, archivedAt: null },
     });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
@@ -172,7 +175,7 @@ router.post("/events/:id/photos/:photoId/favourite", async (req, res, next) => {
       }
       if (mapping.favouriteCap != null) {
         const count = await prisma.clientFavourite.count({
-          where: { userId: req.user.id, photo: { eventId: mapping.eventId, photoSelectionVisible: true } },
+          where: { userId: req.user.id, photo: { eventId: mapping.eventId, photoSelectionVisible: true, archivedAt: null } },
         });
         if (count >= mapping.favouriteCap) {
           return res.status(400).json({ error: `You can favourite up to ${mapping.favouriteCap} photos.` });
@@ -219,7 +222,7 @@ router.get("/events/:id/studio-pick-ids", async (req, res, next) => {
     if (!mapping) return;
 
     const picks = await prisma.studioFavourite.findMany({
-      where: { userId: mapping.event.ownerId, photo: { eventId: mapping.eventId } },
+      where: { userId: mapping.event.ownerId, photo: { eventId: mapping.eventId, archivedAt: null } },
       select: { photoId: true },
     });
     res.json({ photo_ids: picks.map((p) => p.photoId) });
@@ -242,7 +245,7 @@ router.post("/events/:id/download-zip", async (req, res, next) => {
     const favourites = await prisma.clientFavourite.findMany({
       where: {
         userId: req.user.id,
-        photo: { eventId: mapping.eventId, approvalStatus: "approved", photoSelectionVisible: true },
+        photo: { eventId: mapping.eventId, approvalStatus: "approved", photoSelectionVisible: true, archivedAt: null },
       },
       include: { photo: true },
       orderBy: { createdAt: "asc" },

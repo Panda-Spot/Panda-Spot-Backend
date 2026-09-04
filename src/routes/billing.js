@@ -2,7 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
-import { computeItemsTotal, computePayable, claimNextNumber } from "../lib/billingAccess.js";
+import { computeItemsTotal, computePayable, claimNextNumber, summarizeBillPayment } from "../lib/billingAccess.js";
 import { streamBillPdf, streamQuotationPdf, streamReceiptPdf } from "../lib/billingPdf.js";
 
 const router = Router();
@@ -175,7 +175,7 @@ router.get("/quotations", async (req, res, next) => {
   try {
     const quotations = await prisma.quotation.findMany({
       where: { tenantId: req.user.id },
-      include: { items: true, client: true },
+      include: { items: true, client: true, bill: { include: { items: true, payments: true } } },
       orderBy: { quotationNumber: "desc" },
     });
     res.json(quotations.map(serializeQuotation));
@@ -188,7 +188,7 @@ router.get("/quotations/:id", async (req, res, next) => {
   try {
     const quotation = await prisma.quotation.findFirst({
       where: { id: req.params.id, tenantId: req.user.id },
-      include: { items: true, client: true, bill: true },
+      include: { items: true, client: true, bill: { include: { items: true, payments: true } } },
     });
     if (!quotation) return res.status(404).json({ error: "Quotation not found" });
     res.json(serializeQuotation(quotation));
@@ -446,6 +446,10 @@ function serializeQuotation(q) {
     client: q.client ? { id: q.client.id, email: q.client.email, name: q.client.name } : undefined,
     items: items.map(serializeItem),
     has_bill: !!q.bill,
+    // Reflect the generated bill's live payment state (paid/balance/
+    // receipts) so the quotations list can show it without a second
+    // round trip — null until confirmed.
+    bill: summarizeBillPayment(q.bill),
     created_at: q.createdAt,
   };
 }
@@ -463,6 +467,7 @@ function serializeBill(b) {
     payable,
     paid,
     remaining: Math.max(0, payable - paid),
+    receipt_count: payments.length,
     client: b.client ? { id: b.client.id, email: b.client.email, name: b.client.name } : undefined,
     items: items.map(serializeItem),
     payments: payments.map((p) => ({

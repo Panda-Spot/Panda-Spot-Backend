@@ -24,18 +24,20 @@ function ensureConfigured() {
 }
 
 /**
- * Lists every image file directly inside the given public Drive folder,
- * paginating via nextPageToken. Returns [{ id, name, mimeType, size }].
- * A 403/404 from the Drive API means the folder isn't actually public —
- * surface that as a clear, specific error, not a generic failure.
+ * Lists every image AND video file directly inside the given public Drive
+ * folder, paginating via nextPageToken. Returns [{ id, name, mimeType,
+ * size }]. A 403/404 from the Drive API means the folder isn't actually
+ * public — surface that as a clear, specific error, not a generic
+ * failure. (Named listMediaFiles; the old listImageFiles name is kept as
+ * an alias for existing callers.)
  */
-export async function listImageFiles(folderId) {
+export async function listMediaFiles(folderId) {
   ensureConfigured();
   const files = [];
   let pageToken;
   do {
     const url = new URL("https://www.googleapis.com/drive/v3/files");
-    url.searchParams.set("q", `'${folderId}' in parents and mimeType contains 'image/' and trashed = false`);
+    url.searchParams.set("q", `'${folderId}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed = false`);
     url.searchParams.set("fields", "files(id,name,mimeType,size),nextPageToken");
     url.searchParams.set("key", DRIVE_API_KEY);
     url.searchParams.set("pageSize", "1000");
@@ -56,6 +58,8 @@ export async function listImageFiles(folderId) {
   } while (pageToken);
   return files;
 }
+
+export const listImageFiles = listMediaFiles;
 
 /**
  * Verifies a folder link is actually reachable before committing to a full
@@ -119,13 +123,49 @@ export async function downloadFile(fileId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+/**
+ * Downloads just the first `maxBytes` of a Drive file (HTTP Range) — for
+ * content-sniffing large videos without pulling gigabytes into memory.
+ * Falls back to a full download if the server ignores Range.
+ */
+export async function downloadPartial(fileId, maxBytes = 16384) {
+  ensureConfigured();
+  const url = new URL(`https://www.googleapis.com/drive/v3/files/${fileId}`);
+  url.searchParams.set("alt", "media");
+  url.searchParams.set("key", DRIVE_API_KEY);
+  const res = await fetch(url, { headers: { Range: `bytes=0-${maxBytes - 1}` } });
+  if (!res.ok && res.status !== 206) {
+    throw new Error(
+      `Could not download file ${fileId} from Google Drive (${res.status}) — it may have been deleted or the folder is no longer shared publicly.`
+    );
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
+
 /** Best-effort mimeType -> extension mapping, falling back to the filename's own extension. */
 export function guessExtension(mimeType, filename) {
-  const map = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp" };
+  const map = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/m4v": ".m4v",
+    "video/x-m4v": ".m4v",
+  };
   if (map[mimeType]) return map[mimeType];
   const lower = (filename || "").toLowerCase();
   if (lower.endsWith(".jpeg") || lower.endsWith(".jpg")) return ".jpg";
   if (lower.endsWith(".png")) return ".png";
   if (lower.endsWith(".webp")) return ".webp";
+  if (lower.endsWith(".mp4")) return ".mp4";
+  if (lower.endsWith(".mov")) return ".mov";
+  if (lower.endsWith(".webm")) return ".webm";
+  if (lower.endsWith(".mkv")) return ".mkv";
+  if (lower.endsWith(".avi")) return ".avi";
+  if (lower.endsWith(".m4v")) return ".m4v";
   return null;
 }

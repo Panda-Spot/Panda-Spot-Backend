@@ -89,6 +89,7 @@ export async function searchSimilarPhotos({ eventId, embedding, threshold }) {
     WHERE f."eventId" = ${eventId}
       AND p."faceSearchVisible" = true
       AND p."approvalStatus" = 'approved'
+      AND p."archivedAt" IS NULL
     GROUP BY f."photoId"
     HAVING MAX(1 - (f.embedding <=> ${vectorLiteral}::vector)) >= ${threshold}
     ORDER BY similarity DESC

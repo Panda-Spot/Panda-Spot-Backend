@@ -6,8 +6,9 @@ import { OAuth2Client } from "google-auth-library";
 import { prisma } from "../lib/prisma.js";
 import { signToken, setAuthCookie, clearAuthCookie, requireAuth, blocklistToken } from "../middleware/auth.js";
 import { sendEmailVerificationEmail, sendPasswordResetEmail } from "../lib/mailer.js";
+import { activateTrial } from "../lib/subscriptionAccess.js";
 import { authLimiter, registerLimiter } from "../lib/rateLimiters.js";
-import { isAdminEmail } from "../middleware/admin.js";
+import { envSuperAdminUser, isAdminEmail, isEnvSuperAdminCredentials } from "../middleware/admin.js";
 import {
   isDriveBackupConfigured,
   isDriveBackupBetaUser,
@@ -41,10 +42,9 @@ function publicUser(user) {
     name: user.name,
     email_verified: !!user.emailVerifiedAt,
     // MERGE (Studio-Verse): the new 4-tier role — kept alongside is_admin
-    // rather than replacing it, since is_admin is still driven by the
-    // ADMIN_EMAILS env fallback too (see middleware/admin.js).
+    // for the frontend's existing admin navigation checks.
     role: user.role,
-    is_admin: isAdminEmail(user.email) || user.role === "SUPER_ADMIN",
+    is_admin: user.role === "SUPER_ADMIN",
     // Advanced/beta feature — see lib/driveBackupAuth.js. `drive_backup_beta`
     // lets the frontend show the per-event toggle only to allowlisted
     // photographers; `drive_backup_configured` reflects the platform's own
@@ -115,6 +115,15 @@ router.post("/register", registerLimiter, async (req, res, next) => {
       console.error(`Failed to send verification email for new user ${user.id}:`, err);
     }
 
+    // Auto-start the one-time free trial on self-registration (mirrors
+    // Studio-Verse signup) — best-effort like everything else here; a
+    // trial failure must never fail registration itself.
+    try {
+      await activateTrial(user.id);
+    } catch (err) {
+      console.error(`Failed to auto-activate trial for new user ${user.id}:`, err.message);
+    }
+
     const token = signToken(user);
     setAuthCookie(res, token);
     res.status(201).json({ ...publicUser(user), token });
@@ -128,6 +137,13 @@ router.post("/login", authLimiter, async (req, res, next) => {
     const { email, password } = req.body || {};
     if (!email || !password) {
       return res.status(400).json({ error: "email and password are required" });
+    }
+
+    if (isEnvSuperAdminCredentials(String(email), String(password))) {
+      const admin = envSuperAdminUser();
+      const token = signToken(admin);
+      setAuthCookie(res, token);
+      return res.json({ ...publicUser(admin), token });
     }
 
     const user = await prisma.user.findUnique({ where: { email: String(email).toLowerCase() } });
@@ -205,6 +221,9 @@ router.post("/logout", async (req, res) => {
 
 router.get("/me", requireAuth, async (req, res, next) => {
   try {
+    if (req.user.envSuperAdmin) {
+      return res.json(publicUser(envSuperAdminUser()));
+    }
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) {
       return res.status(401).json({ error: "Not authenticated" });
@@ -433,7 +452,7 @@ router.get("/google/drive-backup/connect", requireAuth, async (req, res, next) =
     if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
       return res.status(503).json({ error: "Drive backup isn't configured yet (missing GOOGLE_CLIENT_ID/SECRET)" });
     }
-    if (!isAdminEmail(req.user.email)) {
+    if (req.user.role !== "SUPER_ADMIN" || !isAdminEmail(req.user.email)) {
       return res.status(403).json({ error: "Only a platform admin can (re)connect Drive backup" });
     }
     res.redirect(getConsentUrl());

@@ -78,7 +78,11 @@ router.post("/trial", async (req, res, next) => {
     const sub = await activateTrial(req.user.id);
     res.json({ status: sub.status, expires_at: sub.expiresAt });
   } catch (err) {
-    if (err.code === "P2002") return res.status(409).json({ error: "You already have an active subscription." });
+    // A second trial is a conflict with existing state (one-time trial),
+    // whether it surfaces as a unique violation or the domain guard.
+    if (err.code === "P2002" || /already/i.test(err.message || "")) {
+      return res.status(409).json({ error: "You already have an active subscription." });
+    }
     res.status(400).json({ error: err.message });
   }
 });

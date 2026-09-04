@@ -3,8 +3,8 @@ import { prisma } from "./prisma.js";
 import { detectFacesForPhoto, replacePhotoFaces } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
 import { deleteFileIfExists } from "./storage.js";
-import { downloadFile, guessExtension, listImageFiles } from "./googleDrive.js";
-import { contentMatchesExtension } from "./fileValidation.js";
+import { downloadFile, downloadPartial, guessExtension, listImageFiles } from "./googleDrive.js";
+import { contentMatchesExtension, isVideoExtension } from "./fileValidation.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.js";
 import { emitJobEvent } from "./jobQueue.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
@@ -31,9 +31,13 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
     return { skipped: `${file.name} (event storage limit reached)` };
   }
 
+  // Videos are verified from a 16KB ranged partial (never the whole file)
+  // and skip faces/posters entirely — the row points at Drive, and
+  // players render the first frame natively.
+  const isVideo = isVideoExtension(ext);
   let buffer;
   try {
-    buffer = await downloadFile(file.id);
+    buffer = isVideo ? await downloadPartial(file.id) : await downloadFile(file.id);
   } catch (err) {
     return { skipped: `${file.name} (${err.message})` };
   }
@@ -43,16 +47,18 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
   }
 
   let faces = [];
-  try {
-    if (event.faceSearchEnabled) {
-      faces = await detectFacesForPhoto(buffer, file.name);
-    }
-  } catch (err) {
-    return { skipped: `${file.name} (${err.isFaceEngineError ? err.message : "could not process image"})` };
-  }
-
+  let thumbnailPath = null;
   const photoId = randomUUID();
-  const thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
+  if (!isVideo) {
+    try {
+      if (event.faceSearchEnabled) {
+        faces = await detectFacesForPhoto(buffer, file.name);
+      }
+    } catch (err) {
+      return { skipped: `${file.name} (${err.isFaceEngineError ? err.message : "could not process image"})` };
+    }
+    thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
+  }
 
   const photo = await prisma.photo.create({
     data: {
@@ -65,14 +71,17 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
       faceCount: faces.length,
       fileSize,
       source: "drive_import",
-      faceSearchVisible: event.faceSearchEnabled,
+      // Videos are browsed, never face-matched (see the import branch
+      // above) — false keeps every guest face-search surface filtering
+      // them out, same as direct-uploaded video.
+      faceSearchVisible: isVideo ? false : event.faceSearchEnabled,
       // No local original to expire — full-res is always fetched from
       // Drive live on demand, see lib/googleDrive.js.
       originalExpiresAt: null,
     },
   });
 
-  if (event.faceSearchEnabled) {
+  if (event.faceSearchEnabled && !isVideo) {
     await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces });
     await consumeAiPhotoCredits(event.ownerId);
   }

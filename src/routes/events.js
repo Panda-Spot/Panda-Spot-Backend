@@ -1,4 +1,5 @@
 import { Router, raw } from "express";
+import bcrypt from "bcryptjs";
 import { randomUUID, randomBytes } from "node:crypto";
 import path from "node:path";
 import fsp from "node:fs/promises";
@@ -8,6 +9,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
 import {
   ALLOWED_EXTENSIONS,
+  IMAGE_EXTENSIONS,
   appendUploadPart,
   deleteFileIfExists,
   deleteUploadPart,
@@ -20,7 +22,9 @@ import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces } from 
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { loadAccessibleEvent } from "../lib/access.js";
 import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
-import { contentMatchesExtension } from "../lib/fileValidation.js";
+import { contentMatchesExtension, isVideoExtension, isVideoFilename } from "../lib/fileValidation.js";
+import { getEffectiveThreshold } from "../lib/threshold.js";
+import { getFaceGroups } from "../lib/faceClustering.js";
 import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter } from "../lib/rateLimiters.js";
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
 import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
@@ -251,6 +255,7 @@ router.get("/:id", async (req, res, next) => {
         approvalStatus: "approved",
         faceSearchVisible: true,
         faceIndexedAt: { not: null },
+        archivedAt: null,
       },
     });
     const storageUsedBytes = await eventStorageUsedBytes(prisma, event.id);
@@ -622,7 +627,7 @@ router.post("/:id/cover", upload.single("cover"), async (req, res, next) => {
       return res.status(400).json({ error: "No cover file uploaded (expected multipart field 'cover')" });
     }
     const ext = path.extname(req.file.originalname).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) {
+    if (!IMAGE_EXTENSIONS.has(ext)) {
       return res.status(400).json({ error: "Unsupported cover file type" });
     }
     if (!contentMatchesExtension(req.file.buffer, ext)) {
@@ -664,11 +669,43 @@ router.get("/:id/download-zip", async (req, res, next) => {
     const { event } = accessible;
 
     const photos = await prisma.photo.findMany({
-      where: { eventId: event.id, approvalStatus: "approved" },
+      where: { eventId: event.id, approvalStatus: "approved", archivedAt: null },
       orderBy: { createdAt: "asc" },
     });
     if (photos.length === 0) {
       return res.status(404).json({ error: "This event has no approved photos to download" });
+    }
+
+    const zipFilename = zipFilenameForEvent(event);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipFilename}"`);
+
+    await streamPhotosZip(photos, res);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The studio's curated picks as one zip — same streaming as the full
+// gallery zip above, scoped to StudioFavourite rows (Studio-Verse's
+// download-studio-zip, adapted: picks are per acting studio user here).
+router.get("/:id/studio-picks/download-zip", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const picks = await prisma.studioFavourite.findMany({
+      where: {
+        userId: req.user.id,
+        photo: { eventId: event.id, approvalStatus: "approved", archivedAt: null },
+      },
+      include: { photo: true },
+      orderBy: { createdAt: "asc" },
+    });
+    const photos = picks.map((s) => s.photo);
+    if (photos.length === 0) {
+      return res.status(404).json({ error: "You have no studio picks to download yet" });
     }
 
     const zipFilename = zipFilenameForEvent(event);
@@ -928,6 +965,46 @@ async function processUploadJob(jobId, event, files) {
         skipped.push(`${file.originalname} (photo quota reached)`);
       } else if (usedBytes + file.buffer.length > storageLimitBytes) {
         skipped.push(`${file.originalname} (event storage limit reached)`);
+      } else if (isVideoExtension(ext)) {
+        // Video branch (Phase 20): stored, thumbnailed-by-fallback, and
+        // delivered exactly like a photo, but never face-indexed — there
+        // are no Face rows to match, so selfie search simply never returns
+        // it, while client galleries, favourites, zips, and counts treat
+        // it as a normal gallery item. faceSearchVisible stays false so
+        // guest-facing face-search surfaces (gallery/slideshow/downloads)
+        // exclude it by their existing filters.
+        const photoId = randomUUID();
+        const storedFilename = `${photoId}${ext}`;
+        const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
+
+        const photo = await prisma.photo.create({
+          data: {
+            id: photoId,
+            eventId: event.id,
+            filename: file.originalname,
+            storagePath,
+            thumbnailPath: null,
+            faceCount: 0,
+            fileSize: file.buffer.length,
+            source: "upload",
+            faceSearchVisible: false,
+            originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
+          },
+        });
+
+        usedBytes += file.buffer.length;
+        newPhotoIds.push(photo.id);
+        await consumeQuota(event.ownerId);
+        addedPhoto = {
+          photo_id: photo.id,
+          filename: photo.filename,
+          face_count: 0,
+          createdAt: photo.createdAt,
+          url: `/files/events/${event.id}/photos/${photo.id}`,
+          thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+          source: photo.source,
+        };
+        publishLiveEvent(event.id, { type: "photo_added", ...addedPhoto });
       } else {
         let faces = [];
         try {
@@ -1533,8 +1610,19 @@ router.get("/:id/photos", async (req, res, next) => {
     if (!accessible) return;
     const { event } = accessible;
 
+    // Studio sees everything by default through ?status=all, but the
+    // gallery defaults to active-only (matching the Dashboard event
+    // filter vocabulary) — archived photos stay manageable without
+    // cluttering the working view.
+    const status = req.query.status ?? "active";
+    if (!["active", "archived", "all"].includes(status)) {
+      return res.status(400).json({ error: 'status must be "active", "archived", or "all"' });
+    }
+    const archivedFilter =
+      status === "active" ? { archivedAt: null } : status === "archived" ? { archivedAt: { not: null } } : {};
+
     const photos = await prisma.photo.findMany({
-      where: { eventId: event.id },
+      where: { eventId: event.id, ...archivedFilter },
       orderBy: { createdAt: "desc" },
     });
 
@@ -1548,6 +1636,7 @@ router.get("/:id/photos", async (req, res, next) => {
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
         source: p.source,
         approval_status: p.approvalStatus,
+        archived_at: p.archivedAt,
         moderation_flagged: p.moderationFlagged,
         face_search_visible: p.faceSearchVisible,
         photo_selection_visible: p.photoSelectionVisible,
@@ -1558,6 +1647,264 @@ router.get("/:id/photos", async (req, res, next) => {
     next(err);
   }
 });
+
+// Auto face-groups for one event (Phase 22 Faces sub-tab + group-
+// assisted guest search): greedy per-person clusters over the event's
+// searchable face embeddings at the event's own search threshold.
+// Computed on demand and cached per event (busted by face-count change);
+// no schema change, no stored state to go stale.
+router.get("/:id/face-groups", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const threshold = getEffectiveThreshold(event);
+    const result = await getFaceGroups(event.id, threshold);
+    res.json({
+      event_id: event.id,
+      threshold,
+      face_count: result.face_count,
+      group_count: result.group_count,
+      groups: result.groups,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Face boxes for one photo (Phase 22 viewer + groups): bbox is stored in
+// original-image pixels (face-engine runs on the full upload), so the
+// frontend converts to percentages against the loaded image's natural
+// size. Embeddings are deliberately never exposed. Ordered by detection
+// score, best face first.
+router.get("/:id/photos/:photoId/faces", async (req, res, next) => {  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+      select: { id: true },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    const faces = await prisma.face.findMany({
+      where: { photoId: photo.id },
+      select: { id: true, bbox: true, detScore: true },
+      orderBy: { detScore: "desc" },
+    });
+    res.json({
+      photo_id: photo.id,
+      faces: faces.map((f) => ({ id: f.id, bbox: f.bbox, det_score: f.detScore })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Soft per-photo archive/restore (mirrors the event-level pair): hides the
+// photo from guests, clients, zips, and counts without deleting anything.
+router.post("/:id/photos/:photoId/archive", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    const updated = await prisma.photo.update({
+      where: { id: photo.id },
+      data: { archivedAt: photo.archivedAt ?? new Date() },
+    });
+    res.json({ photo_id: updated.id, archived_at: updated.archivedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/photos/:photoId/restore", async (req, res, next) => {  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) {
+      return res.status(404).json({ error: "Photo not found" });
+    }
+
+    const updated = await prisma.photo.update({
+      where: { id: photo.id },
+      data: { archivedAt: null },
+    });
+    res.json({ photo_id: updated.id, archived_at: updated.archivedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Bulk zero-copy membership (Phase 21): set face_search_visible and/or
+// photo_selection_visible across an explicit id list or a server-side
+// selection ({ source?, status?, approval? }), so "select all" never needs
+// to ship hundreds of ids. Still flags-only — files are never duplicated
+// or moved. Adding to Face Search enqueues a background face-index job
+// for unindexed images (same SSE progress shape as uploads).
+router.post("/:id/photos/bulk-features", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { photo_ids: photoIds, all, face_search_visible: faceSearchVisible, photo_selection_visible: photoSelectionVisible } = req.body || {};
+    const data = {};
+    if (faceSearchVisible != null) data.faceSearchVisible = !!faceSearchVisible;
+    if (photoSelectionVisible != null) data.photoSelectionVisible = !!photoSelectionVisible;
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "No feature membership change provided." });
+    }
+
+    let targets = [];
+    const skipped = [];
+    if (Array.isArray(photoIds)) {
+      if (photoIds.length === 0) {
+        return res.status(400).json({ error: "photo_ids is empty — pass ids or an `all` selector." });
+      }
+      if (photoIds.length > 5000) {
+        return res.status(400).json({ error: "photo_ids is limited to 5000 per call — use `all` for more." });
+      }
+      const rows = await prisma.photo.findMany({
+        where: { id: { in: photoIds }, eventId: event.id },
+        select: { id: true },
+      });
+      const found = new Set(rows.map((r) => r.id));
+      targets = [...found];
+      for (const id of photoIds) {
+        if (!found.has(id)) skipped.push(`${id} (not in this event)`);
+      }
+    } else if (all && typeof all === "object") {
+      const status = all.status ?? "all";
+      if (!["active", "archived", "all"].includes(status)) {
+        return res.status(400).json({ error: 'all.status must be "active", "archived", or "all"' });
+      }
+      const approval = all.approval ?? "approved";
+      if (!["approved", "pending", "all"].includes(approval)) {
+        return res.status(400).json({ error: 'all.approval must be "approved", "pending", or "all"' });
+      }
+      const where = { eventId: event.id };
+      if (status === "active") where.archivedAt = null;
+      else if (status === "archived") where.archivedAt = { not: null };
+      if (approval === "approved") where.approvalStatus = "approved";
+      else if (approval === "pending") where.approvalStatus = "pending";
+      if (all.source) where.source = all.source;
+      const rows = await prisma.photo.findMany({ where, select: { id: true } });
+      targets = rows.map((r) => r.id);
+    } else {
+      return res.status(400).json({ error: "Provide photo_ids[] or an `all` selector." });
+    }
+
+    if (targets.length > 0) {
+      await prisma.photo.updateMany({ where: { id: { in: targets } }, data });
+    }
+
+    // Newly added-to-AI images that were never indexed need faces before
+    // selfie search can return them — index in the background so a big
+    // "select all" never blocks the response.
+    let jobId = null;
+    if (data.faceSearchVisible && event.faceSearchEnabled) {
+      const candidates = await prisma.photo.findMany({
+        where: {
+          id: { in: targets },
+          approvalStatus: "approved",
+          faceSearchVisible: true,
+          faceIndexedAt: null,
+        },
+        select: { id: true, filename: true },
+      });
+      const imageIds = candidates.filter((c) => !isVideoFilename(c.filename)).map((c) => c.id);
+      const skippedVideos = candidates.length - imageIds.length;
+      for (let i = 0; i < skippedVideos; i += 1) skipped.push("(video — browsed, never face-indexed)");
+      if (imageIds.length > 0) {
+        const job = createJob();
+        jobId = job.id;
+        processMembershipIndexJob(jobId, event, imageIds).catch((err) => {
+          console.error(`Unhandled error in membership index job ${jobId}:`, err);
+        });
+      }
+    }
+
+    res.status(202).json({ updated: targets.length, skipped, job_id: jobId });
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function processMembershipIndexJob(jobId, event, photoIds) {
+  const total = photoIds.length;
+  const skipped = [];
+  let facesFoundSoFar = 0;
+  const startedAt = Date.now();
+
+  try {
+    let completed = 0;
+    for (const photoId of photoIds) {
+      const photo = await prisma.photo.findFirst({ where: { id: photoId, eventId: event.id } });
+      if (!photo) {
+        skipped.push(`${photoId} (deleted during indexing)`);
+      } else {
+        try {
+          const count = await indexExistingPhotoFaces(photo);
+          await consumeAiPhotoCredits(event.ownerId);
+          facesFoundSoFar += count;
+        } catch (err) {
+          skipped.push(`${photo.filename} (${err.isFaceEngineError ? err.message : "could not index"})`);
+        }
+      }
+      completed += 1;
+      const elapsedSeconds = (Date.now() - startedAt) / 1000;
+      const photosPerSecond = elapsedSeconds > 0 ? completed / elapsedSeconds : 0;
+      emitJobEvent(jobId, {
+        type: "progress",
+        job_id: jobId,
+        total,
+        completed,
+        current_file: photo?.filename,
+        photos_per_second: Math.round(photosPerSecond * 100) / 100,
+        eta_seconds: photosPerSecond > 0 ? Math.round((total - completed) / photosPerSecond) : null,
+        faces_found_so_far: facesFoundSoFar,
+        skipped_so_far: skipped,
+        photo: null,
+      });
+    }
+
+    checkAndNotifyForNewPhotos(event, photoIds).catch((err) =>
+      console.error(`Guest alert check failed for membership index job ${jobId}:`, err)
+    );
+
+    emitJobEvent(jobId, {
+      type: "done",
+      job_id: jobId,
+      photos_processed: total - skipped.length,
+      faces_found: facesFoundSoFar,
+      skipped,
+    });
+  } catch (err) {
+    console.error(`Membership index job ${jobId} failed:`, err);
+    emitJobEvent(jobId, {
+      type: "error",
+      job_id: jobId,
+      message: err.message || "Unknown error while indexing photos",
+    });
+  }
+}
 
 // Zero-copy photo membership for the unified Event. The same stored photo can
 // be available to Face Search, Photo Selection, both, or neither; this updates
@@ -1584,7 +1931,9 @@ router.patch("/:id/photos/:photoId/features", async (req, res, next) => {
     }
 
     let indexedFaceCount = null;
-    if (data.faceSearchVisible && !photo.faceIndexedAt) {
+    // Videos are never face-indexed (no frames are extracted anywhere) —
+    // the flag change below still applies, it just never matches a search.
+    if (data.faceSearchVisible && !photo.faceIndexedAt && !isVideoFilename(photo.filename)) {
       try {
         indexedFaceCount = await indexExistingPhotoFaces(photo);
         await consumeAiPhotoCredits(event.ownerId);
@@ -1900,8 +2249,112 @@ router.delete("/:id/invites/:inviteId", async (req, res, next) => {
 // a routine per-event task any second shooter should be able to do, not a
 // sensitive access-control action like adding another collaborator. ---
 
-router.post("/:id/clients/invite", async (req, res, next) => {
+const GENERATED_PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+
+function generateTempPassword() {
+  let out = "";
+  for (let i = 0; i < 12; i += 1) {
+    out += GENERATED_PASSWORD_CHARS[Math.floor(Math.random() * GENERATED_PASSWORD_CHARS.length)];
+  }
+  return out;
+}
+
+// MERGE (Studio-Verse QuickAdd, Phase 19): provision a client account
+// directly — for studios onboarding clients without an email round trip
+// (in-person, on paper). Unlike /clients/invite (which emails a link the
+// client redeems), this creates the USER row + grant immediately and
+// returns a one-time password for the studio to relay. Mirrors the admin
+// create-studio flow: generated passwords are shown once, and
+// studio-provisioned accounts start email-verified.
+router.post("/:id/clients/create", async (req, res, next) => {
   try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { email, name, password, favourite_cap: favouriteCap } = req.body || {};
+    if (!email || typeof email !== "string" || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: "A valid email address is required" });
+    }
+    if (favouriteCap != null && (!Number.isInteger(favouriteCap) || favouriteCap < 1)) {
+      return res.status(400).json({ error: "favourite_cap must be a positive integer, or omitted for no cap" });
+    }
+    if (password != null && (typeof password !== "string" || password.length < 8)) {
+      return res.status(400).json({ error: "password must be at least 8 characters" });
+    }
+    const normalizedEmail = email.toLowerCase();
+
+    const existingUser = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    if (existingUser) {
+      if (existingUser.role !== "USER") {
+        return res.status(409).json({ error: "This email already has a different kind of PandaSpot account" });
+      }
+      await prisma.eventUserMapping.upsert({
+        where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
+        create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null },
+        update: {},
+      });
+      return res.json({ status: "added", email: normalizedEmail, generated_password: null });
+    }
+
+    const generated = !password;
+    const plainPassword = password || generateTempPassword();
+    const created = await prisma.user.create({
+      data: {
+        email: normalizedEmail,
+        name: (name || "").trim() || normalizedEmail.split("@")[0],
+        passwordHash: await bcrypt.hash(plainPassword, 10),
+        role: "USER",
+        emailVerifiedAt: new Date(),
+      },
+    });
+    await prisma.eventUserMapping.create({
+      data: { eventId: event.id, userId: created.id, favouriteCap: favouriteCap ?? null },
+    });
+    res.status(201).json({
+      status: "created",
+      email: normalizedEmail,
+      generated_password: generated ? plainPassword : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// MERGE (Studio-Verse duplicate check, Phase 21): advisory-only lookup
+// before inviting/provisioning — tells the studio whether this email
+// already has an account and whether it's already on this event, so
+// typos and double-invites get caught in the UI, not after sending mail.
+router.get("/:id/clients/check", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const email = (req.query.email || "").trim().toLowerCase();
+    if (!email || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: "A valid ?email= query address is required" });
+    }
+
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (!existingUser) {
+      return res.json({ exists: false, already_in_event: false });
+    }
+    const mapping = await prisma.eventUserMapping.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
+    });
+    res.json({
+      exists: true,
+      already_in_event: !!mapping,
+      name: existingUser.name,
+      role: existingUser.role,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/:id/clients/invite", async (req, res, next) => {  try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
@@ -1962,7 +2415,7 @@ router.get("/:id/clients", async (req, res, next) => {
     });
     const favouriteCounts = await prisma.clientFavourite.groupBy({
       by: ["userId"],
-      where: { photo: { eventId: event.id, photoSelectionVisible: true } },
+      where: { photo: { eventId: event.id, photoSelectionVisible: true, archivedAt: null } },
       _count: { userId: true },
     });
     const countByUser = Object.fromEntries(favouriteCounts.map((c) => [c.userId, c._count.userId]));
@@ -2176,7 +2629,7 @@ router.get("/:id/favourites", async (req, res, next) => {
       include: { user: true },
     });
     const favourites = await prisma.clientFavourite.findMany({
-      where: { photo: { eventId: event.id, photoSelectionVisible: true } },
+      where: { photo: { eventId: event.id, photoSelectionVisible: true, archivedAt: null } },
       include: {
         photo: true,
         user: true,

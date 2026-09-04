@@ -10,10 +10,9 @@ datasource db {
 /// 4-tier role model, added for the Studio-Verse merge (see MERGE_PLAN.md
 /// D2). Every row that existed before this migration is backfilled as
 /// ADMIN (a studio owner) — that's exactly what every pre-merge PandaSpot
-/// account already was. SUPER_ADMIN is the platform operator (was
-/// implicit via ADMIN_EMAILS env var before — see routes/admin.js; that
-/// check stays as a belt-and-suspenders guard, this column is now the
-/// real source of truth). USER is a studio's client (Photo Selection
+/// account already was. SUPER_ADMIN is the platform operator. Production
+/// super-admin login is env-backed via SUPER_ADMIN_EMAIL/PASSWORD, so it
+/// does not require a User row. USER is a studio's client (Photo Selection
 /// login). INVITED generalizes the old EventCollaborator/EventInvite
 /// bolt-on into a first-class scoped-access role.
 enum Role {
@@ -41,6 +40,11 @@ model User {
   /// photographer's events (not per-event — see server/README.md's branding notes).
   studioName String?
   logoPath   String?
+  /// Optional watermark overlay image (mirrors Studio-Verse's watermark
+  /// upload) — shown centered over protected client-gallery photos when
+  /// set, falling back to the studio-name text watermark otherwise.
+  /// Stored beside the logo; served publicly like it.
+  watermarkImagePath String?
   brandColor String?
   watermarkIntensity Float @default(0.75)
 
@@ -435,6 +439,13 @@ model Photo {
   /// Face Search, Photo Selection, both, or neither without duplicating files.
   faceSearchVisible     Boolean @default(true)
   photoSelectionVisible Boolean @default(true)
+
+  /// Soft per-photo archive (mirrors Studio-Verse's media archive): an
+  /// archived photo is hidden from guests (search/gallery/slideshow/
+  /// downloads), clients (gallery/favourites/zips), and counts, while the
+  /// studio keeps it visible with a restore action. Null = active.
+  /// Distinct from permanent deletion, which removes rows and files.
+  archivedAt DateTime?
 
   likes    PhotoLike[]
   comments PhotoComment[]
@@ -918,6 +929,10 @@ model QuotationItem {
   quantity        Int
   /// Flat, per-unit discount — see Quotation.discountAmount's comment.
   discountPerUnit Decimal   @default(0) @db.Decimal(10, 2)
+  /// Insertion order for PDF rendering (Phase 21 fix: the PDF routes
+  /// order items by createdAt, which didn't exist — every PDF download
+  /// crashed with a Prisma validation error).
+  createdAt       DateTime  @default(now())
 }
 
 /// MERGE: can ONLY be created from a confirmed Quotation (see
@@ -956,6 +971,8 @@ model BillItem {
   price           Decimal @db.Decimal(10, 2)
   quantity        Int
   discountPerUnit Decimal @default(0) @db.Decimal(10, 2)
+  /// Insertion order for PDF rendering — see QuotationItem.createdAt.
+  createdAt       DateTime @default(now())
 }
 
 /// MERGE: partial/split payments against one Bill — see

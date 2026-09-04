@@ -52,6 +52,7 @@ async function matchedPhotosForGuest({ eventId, guestClientId, photoIds, thresho
     WHERE f."eventId" = ${eventId} AND f."photoId" = ANY(${photoIds}::text[])
       AND p."approvalStatus" = 'approved'
       AND p."faceSearchVisible" = true
+      AND p."archivedAt" IS NULL
     GROUP BY f."photoId"
     HAVING MAX(1 - (f.embedding <=> gs.embedding)) >= ${threshold}
   `;

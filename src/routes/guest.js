@@ -8,12 +8,13 @@ import { checkModeration, detectFaces, pickLargestFace } from "../lib/faceEngine
 import { searchSimilarPhotos } from "../lib/faces.js";
 import { averageAndNormalize, insertGuestSearch, similarityForPhoto } from "../lib/guestSearches.js";
 import { getEffectiveThreshold, adjustThresholdOnFeedback } from "../lib/threshold.js";
+import { expandMatchesWithGroups } from "../lib/faceClustering.js";
 import { zipFilenameForEvent, streamPhotosZip, buildPhotosZipToDisk, zipDownloadPath } from "../lib/zip.js";
 import { sendZipReadyEmail } from "../lib/mailer.js";
-import { ALLOWED_EXTENSIONS } from "../lib/storage.js";
+import { ALLOWED_EXTENSIONS, IMAGE_EXTENSIONS } from "../lib/storage.js";
 import { getStorageProvider } from "../lib/storageProvider.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
-import { contentMatchesExtension } from "../lib/fileValidation.js";
+import { contentMatchesExtension, isVideoExtension } from "../lib/fileValidation.js";
 import {
   guestSearchLimiter,
   guestDownloadLimiter,
@@ -155,7 +156,8 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       // Skip just this one selfie if it's not a real image (extension +
       // content-sniffed magic bytes) — 1-3 are submitted, one bad file
       // shouldn't torpedo the others.
-      if (!ALLOWED_EXTENSIONS.has(ext) || !contentMatchesExtension(file.buffer, ext)) {
+      // Guest selfies are stills for face matching — video never matches.
+      if (!IMAGE_EXTENSIONS.has(ext) || !contentMatchesExtension(file.buffer, ext)) {
         continue;
       }
 
@@ -188,14 +190,33 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       threshold,
     });
 
+    // Phase 22 group-assisted recall: confident direct matches also pull
+    // in same-person sibling photos the raw query missed. Siblings carry
+    // the seed's similarity and a match_via_group flag, and still pass
+    // every photo filter below — recall goes up, nothing hidden leaks.
+    const groupExtra = await expandMatchesWithGroups(
+      event.id,
+      threshold,
+      rows.map((r) => ({ photoId: r.photoId, similarity: Number(r.similarity) }))
+    );
+    const seenPhotoIds = new Set(rows.map((r) => r.photoId));
+    const allRows = [
+      ...rows,
+      ...groupExtra.filter((g) => {
+        if (seenPhotoIds.has(g.photoId)) return false;
+        seenPhotoIds.add(g.photoId);
+        return true;
+      }),
+    ];
+
     const guestClientId = req.body?.guest_client_id || null;
 
     let matches = [];
-    if (rows.length > 0) {
+    if (allRows.length > 0) {
       const photos = await prisma.photo.findMany({
         // Pending guest uploads are never searchable — they only become
         // visible/matchable once the owner approves them.
-        where: { id: { in: rows.map((r) => r.photoId) }, approvalStatus: "approved", faceSearchVisible: true },
+        where: { id: { in: allRows.map((r) => r.photoId) }, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
       });
       const photoById = new Map(photos.map((p) => [p.id, p]));
 
@@ -204,7 +225,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
         guestClientId
       );
 
-      matches = rows
+      matches = allRows
         .map((r) => {
           const photo = photoById.get(r.photoId);
           if (!photo) return null;
@@ -212,6 +233,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
             photo_id: photo.id,
             filename: photo.filename,
             similarity: Math.round(Number(r.similarity) * 10000) / 10000,
+            match_via_group: !!r.matchViaGroup,
             url: `/files/events/${event.id}/photos/${photo.id}`,
             thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
             ...reactionShape(photo.id, reactionsByPhoto, myReactionByPhoto),
@@ -271,7 +293,7 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
 
     for (const file of files) {
       const ext = path.extname(file.originalname).toLowerCase();
-      if (!ALLOWED_EXTENSIONS.has(ext) || !contentMatchesExtension(file.buffer, ext)) continue;
+      if (!IMAGE_EXTENSIONS.has(ext) || !contentMatchesExtension(file.buffer, ext)) continue;
 
       let detection;
       try {
@@ -286,15 +308,34 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
       const embedding = pickLargestFace(faces).embedding;
       const rows = await searchSimilarPhotos({ eventId: event.id, embedding, threshold });
 
-      for (const r of rows) {
+      // Phase 22 group-assisted recall, per person: confident matches also
+      // pull in same-person siblings (flagged, same merge semantics).
+      const groupExtra = await expandMatchesWithGroups(
+        event.id,
+        threshold,
+        rows.map((r) => ({ photoId: r.photoId, similarity: Number(r.similarity) }))
+      );
+      const seenExtra = new Set(rows.map((r) => r.photoId));
+      const personRows = [
+        ...rows.map((r) => ({ photoId: r.photoId, similarity: Number(r.similarity), matchViaGroup: false })),
+        ...groupExtra.filter((g) => {
+          if (seenExtra.has(g.photoId)) return false;
+          seenExtra.add(g.photoId);
+          return true;
+        }),
+      ];
+
+      for (const r of personRows) {
         const existing = best.get(r.photoId);
         const similarity = Number(r.similarity);
         if (!existing) {
-          best.set(r.photoId, { similarity, peopleMatched: 1 });
+          best.set(r.photoId, { similarity, peopleMatched: 1, matchViaGroup: !!r.matchViaGroup });
         } else {
           best.set(r.photoId, {
             similarity: Math.max(existing.similarity, similarity),
             peopleMatched: existing.peopleMatched + 1,
+            // A direct vector hit outranks a group pull for the flag.
+            matchViaGroup: existing.matchViaGroup && !!r.matchViaGroup,
           });
         }
       }
@@ -306,7 +347,7 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
 
     const photoIds = [...best.keys()];
     const photos = await prisma.photo.findMany({
-      where: { id: { in: photoIds }, approvalStatus: "approved", faceSearchVisible: true },
+      where: { id: { in: photoIds }, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
     });
     const guestClientId = req.body?.guest_client_id || null;
     const { reactionsByPhoto, myReactionByPhoto } = await getReactionInfo(
@@ -323,6 +364,7 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
           filename: photo.filename,
           similarity: Math.round(info.similarity * 10000) / 10000,
           people_matched: info.peopleMatched,
+          match_via_group: !!info.matchViaGroup,
           url: `/files/events/${event.id}/photos/${photo.id}`,
           thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
           ...reactionShape(photo.id, reactionsByPhoto, myReactionByPhoto),
@@ -397,10 +439,14 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
       const photoId = randomUUID();
       const storedFilename = `${photoId}${ext}`;
       const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
-      const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
+      // Videos skip thumbnailing (no frame extraction — players render the
+      // first frame natively) and moderation (an image heuristic); both
+      // helpers would just burn CPU and resolve uselessly on video bytes.
+      const isVideo = isVideoExtension(ext);
+      const thumbnailPath = isVideo ? null : await generateThumbnail(file.buffer, event.id, photoId);
       // Best-effort only, guest uploads exclusively — see checkModeration's
       // own doc comment for exactly what this does and doesn't catch.
-      const moderationFlagged = await checkModeration(file.buffer, file.originalname);
+      const moderationFlagged = isVideo ? false : await checkModeration(file.buffer, file.originalname);
 
       const photo = await prisma.photo.create({
         data: {
@@ -413,7 +459,9 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
           fileSize: file.buffer.length,
           source: "guest",
           approvalStatus: "pending",
-          faceSearchVisible: event.faceSearchEnabled,
+          // Videos are browsed by clients, never face-matched by guests —
+          // false keeps every guest face-search surface filtering them out.
+          faceSearchVisible: isVideo ? false : event.faceSearchEnabled,
           moderationFlagged,
           uploadedByGuestClientId: guestClientId,
           originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
@@ -449,7 +497,7 @@ router.get("/:slug/gallery", async (req, res, next) => {
     }
 
     const photos = await prisma.photo.findMany({
-      where: { eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
+      where: { eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
       orderBy: { createdAt: "desc" },
       take: 300,
     });
@@ -519,7 +567,7 @@ router.post("/:slug/photos/:photoId/react", guestLikeLimiter, async (req, res, n
     }
 
     const photo = await prisma.photo.findFirst({
-      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
     });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
@@ -578,7 +626,7 @@ router.get("/:slug/my-reactions", async (req, res, next) => {
     if (myLikes.length === 0) return res.json({ photos: [] });
 
     const photos = await prisma.photo.findMany({
-      where: { id: { in: myLikes.map((l) => l.photoId) }, approvalStatus: "approved", faceSearchVisible: true },
+      where: { id: { in: myLikes.map((l) => l.photoId) }, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
     });
     const photoById = new Map(photos.map((p) => [p.id, p]));
 
@@ -607,7 +655,7 @@ router.get("/:slug/photos/:photoId/comments", async (req, res, next) => {
     }
 
     const photo = await prisma.photo.findFirst({
-      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
     });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
@@ -653,7 +701,7 @@ router.post("/:slug/photos/:photoId/comments", guestCommentLimiter, async (req, 
     }
 
     const photo = await prisma.photo.findFirst({
-      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
+      where: { id: req.params.photoId, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
     });
     if (!photo) {
       return res.status(404).json({ error: "Photo not found" });
@@ -827,7 +875,7 @@ router.post("/:slug/download", guestDownloadLimiter, async (req, res, next) => {
     // ever have gotten a photo_id from this event's own search results, but
     // we don't trust the client-supplied list further than that.
     const photos = await prisma.photo.findMany({
-      where: { id: { in: photoIds }, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
+      where: { id: { in: photoIds }, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
     });
     if (photos.length === 0) {
       return res.status(404).json({ error: "None of the requested photos belong to this event" });
@@ -886,7 +934,7 @@ router.post("/:slug/download/email", guestDownloadLimiter, async (req, res, next
     (async () => {
       try {
         const photos = await prisma.photo.findMany({
-          where: { id: { in: photoIds }, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true },
+          where: { id: { in: photoIds }, eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
         });
         if (photos.length === 0) {
           throw new Error("None of the requested photos belong to this event");

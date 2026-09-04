@@ -4,7 +4,20 @@ import path from "node:path";
 
 const STORAGE_DIR = process.env.STORAGE_DIR || "./storage";
 
-export const ALLOWED_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+export const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+
+/** Uploadable video containers (Phase 20 — no face indexing, gallery/
+ * delivery only; see fileValidation.js's sniffing + the faceSearchVisible
+ * convention in routes/events.js's upload job). */
+export const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"]);
+
+/** Everything a Photo row may point at (images + video). Branding, covers,
+ * camera captures, and guest selfies stay images-only via
+ * IMAGE_EXTENSIONS at their own call sites. */
+export const ALLOWED_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
+
+// fileValidation.js imports the sets above (one direction only — this
+// module never imports fileValidation, so there is no cycle).
 
 /** Resolves STORAGE_DIR to an absolute path (relative to process cwd if not absolute). */
 export function storageRoot() {
@@ -200,6 +213,34 @@ export async function saveBrandingLogo(userId, filename, buffer) {
   }
   for (const entry of existing) {
     if (entry.startsWith("logo") && path.join(dir, entry) !== newPath) {
+      await fsp.unlink(path.join(dir, entry)).catch(() => {});
+    }
+  }
+
+  await fsp.writeFile(newPath, buffer);
+  return newPath;
+}
+
+/**
+ * Saves (or overwrites) a photographer's watermark overlay image — same
+ * one-file-per-user pattern as the logo above, stored as `watermark.<ext>`
+ * beside it so lifecycle behavior matches.
+ */
+export async function saveBrandingWatermark(userId, filename, buffer) {
+  const dir = brandingDir(userId);
+  await fsp.mkdir(dir, { recursive: true });
+
+  const ext = path.extname(filename).toLowerCase();
+  const newPath = path.join(dir, `watermark${ext}`);
+
+  let existing = [];
+  try {
+    existing = await fsp.readdir(dir);
+  } catch {
+    existing = [];
+  }
+  for (const entry of existing) {
+    if (entry.startsWith("watermark.") && path.join(dir, entry) !== newPath) {
       await fsp.unlink(path.join(dir, entry)).catch(() => {});
     }
   }

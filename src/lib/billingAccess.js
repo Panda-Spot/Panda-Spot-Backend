@@ -20,6 +20,27 @@ export function computePayable(items, discountAmount) {
   return Math.max(0, itemsTotal - Number(discountAmount || 0));
 }
 
+/** Compact payment state of a bill for embedding on its parent quotation
+ * (mirrors Studio-Verse's summarizeBillPayment) — null when no bill
+ * exists yet. Uses the same clamped payable math as serializeBill. */
+export function summarizeBillPayment(bill) {
+  if (!bill) return null;
+  const items = bill.items || [];
+  const payable = computePayable(items, bill.discountAmount);
+  const payments = bill.payments || [];
+  const paid = payments.reduce((sum, p) => sum + Number(p.amount), 0);
+  return {
+    id: bill.id,
+    bill_number: bill.billNumber,
+    status: bill.status,
+    discount_amount: Number(bill.discountAmount),
+    payable,
+    paid,
+    balance_due: Math.max(0, payable - paid),
+    receipt_count: payments.length,
+  };
+}
+
 /**
  * Atomically claims the next sequential number for a document type
  * (quotation/bill/receipt), scoped per tenant. Must be called inside the

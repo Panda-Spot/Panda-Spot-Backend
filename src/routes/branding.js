@@ -3,7 +3,7 @@ import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
-import { ALLOWED_EXTENSIONS, saveBrandingLogo } from "../lib/storage.js";
+import { IMAGE_EXTENSIONS, deleteFileIfExists, saveBrandingLogo, saveBrandingWatermark } from "../lib/storage.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 
 const router = Router();
@@ -27,6 +27,7 @@ function brandingResponse(user) {
   return {
     studio_name: user.studioName ?? null,
     logo_url: user.logoPath ? `/files/branding/${user.id}/logo` : null,
+    watermark_image_url: user.watermarkImagePath ? `/files/branding/${user.id}/watermark` : null,
     brand_color: user.brandColor ?? null,
     watermark_intensity: user.watermarkIntensity ?? 0.75,
   };
@@ -44,9 +45,9 @@ router.get("/", async (req, res, next) => {
   }
 });
 
-router.post("/", upload.single("logo"), async (req, res, next) => {
+router.post("/", upload.fields([{ name: "logo", maxCount: 1 }, { name: "watermark", maxCount: 1 }]), async (req, res, next) => {
   try {
-    const { studio_name, brand_color, watermark_intensity } = req.body || {};
+    const { studio_name, brand_color, watermark_intensity, remove_watermark } = req.body || {};
 
     if (brand_color !== undefined && brand_color !== null && brand_color !== "" && !HEX_COLOR_RE.test(brand_color)) {
       return res.status(400).json({ error: "brand_color must be a hex color like #aa3bff" });
@@ -58,16 +59,36 @@ router.post("/", upload.single("logo"), async (req, res, next) => {
     if (brand_color !== undefined) data.brandColor = brand_color || null;
     if (normalizedWatermarkIntensity !== undefined) data.watermarkIntensity = normalizedWatermarkIntensity;
 
-    if (req.file) {
-      const ext = path.extname(req.file.originalname).toLowerCase();
-      if (!ALLOWED_EXTENSIONS.has(ext)) {
+    const logoFile = req.files?.logo?.[0];
+    if (logoFile) {
+      const ext = path.extname(logoFile.originalname).toLowerCase();
+      if (!IMAGE_EXTENSIONS.has(ext)) {
         return res.status(400).json({ error: "Unsupported logo file type" });
       }
-      if (!contentMatchesExtension(req.file.buffer, ext)) {
+      if (!contentMatchesExtension(logoFile.buffer, ext)) {
         return res.status(400).json({ error: "File content doesn't match its extension" });
       }
-      const logoPath = await saveBrandingLogo(req.user.id, req.file.originalname, req.file.buffer);
+      const logoPath = await saveBrandingLogo(req.user.id, logoFile.originalname, logoFile.buffer);
       data.logoPath = logoPath;
+    }
+
+    const watermarkFile = req.files?.watermark?.[0];
+    if (watermarkFile) {
+      const ext = path.extname(watermarkFile.originalname).toLowerCase();
+      if (!IMAGE_EXTENSIONS.has(ext)) {
+        return res.status(400).json({ error: "Unsupported watermark file type" });
+      }
+      if (!contentMatchesExtension(watermarkFile.buffer, ext)) {
+        return res.status(400).json({ error: "File content doesn't match its extension" });
+      }
+      const watermarkPath = await saveBrandingWatermark(req.user.id, watermarkFile.originalname, watermarkFile.buffer);
+      data.watermarkImagePath = watermarkPath;
+    } else if (remove_watermark === "true" || remove_watermark === true) {
+      const current = await prisma.user.findUnique({ where: { id: req.user.id }, select: { watermarkImagePath: true } });
+      if (current?.watermarkImagePath) {
+        await deleteFileIfExists(current.watermarkImagePath);
+      }
+      data.watermarkImagePath = null;
     }
 
     const user = await prisma.user.update({ where: { id: req.user.id }, data });

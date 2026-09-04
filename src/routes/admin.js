@@ -23,6 +23,8 @@ router.use(requireAuth, requireAdmin);
 const PAGE_SIZE_DEFAULT = 25;
 const BCRYPT_ROUNDS = 10;
 const GENERATED_PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+// Loose format check — mirrors events.js's /clients/invite regex.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function parsePage(req) {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -274,8 +276,13 @@ router.get("/users", async (req, res, next) => {
     const { page, pageSize, skip } = parsePage(req);
     const search = (req.query.search || "").trim();
     const role = ["SUPER_ADMIN", "ADMIN", "USER", "INVITED"].includes(req.query.role) ? req.query.role : undefined;
+    const status = req.query.status ?? "all";
+    if (!["active", "suspended", "all"].includes(status)) {
+      return res.status(400).json({ error: 'status must be "active", "suspended", or "all"' });
+    }
     const where = {
       ...(role ? { role } : {}),
+      ...(status === "active" ? { suspendedAt: null } : status === "suspended" ? { suspendedAt: { not: null } } : {}),
       ...(search
         ? {
             OR: [
@@ -532,6 +539,7 @@ router.get("/users/:id/photos", async (req, res, next) => {
         thumbnail_url: `/files/events/${p.eventId}/photos/${p.id}/thumb`,
         source: p.source || "upload",
         approval_status: p.approvalStatus,
+        archived_at: p.archivedAt,
         moderation_flagged: p.moderationFlagged,
         face_search_visible: p.faceSearchVisible,
         photo_selection_visible: p.photoSelectionVisible,
@@ -811,9 +819,8 @@ router.post("/users/:id/verify", async (req, res, next) => {
 
 // MERGE (Studio-Verse): Super-Admin account-recovery console — unlock a
 // lockout-frozen account and force-reset any account's password by email.
-// Deliberately gated on role === SUPER_ADMIN (stricter than this router's
-// default requireAdmin, which also admits ADMIN_EMAILS studio admins),
-// matching Studio-Verse where only Super Admin sees the Accounts tab.
+// Deliberately gated on role === SUPER_ADMIN, matching Studio-Verse where
+// only Super Admin sees the Accounts tab.
 router.post("/users/unlock-account", requireRole("SUPER_ADMIN"), async (req, res, next) => {
   try {
     const { email } = req.body || {};
@@ -1053,6 +1060,7 @@ router.get("/events/:id/photos", async (req, res, next) => {
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
         source: p.source || "upload",
         approval_status: p.approvalStatus,
+        archived_at: p.archivedAt,
         moderation_flagged: p.moderationFlagged,
         face_search_visible: p.faceSearchVisible,
         photo_selection_visible: p.photoSelectionVisible,
@@ -1236,6 +1244,9 @@ router.post("/plans", async (req, res, next) => {
     if (!planName || !["SUBSCRIPTION", "WALLET"].includes(planType) || price == null) {
       return res.status(400).json({ error: "plan_name, plan_type (SUBSCRIPTION|WALLET), and price are required" });
     }
+    if (typeof price !== "number" || !(price >= 0)) {
+      return res.status(400).json({ error: "price must be a non-negative number" });
+    }
     // MERGE (Phase 15 security/robustness review): a SUBSCRIPTION plan
     // missing duration/photoQuota, or a WALLET plan missing
     // walletCredits/walletTier, isn't a security hole but would 500 later
@@ -1244,8 +1255,17 @@ router.post("/plans", async (req, res, next) => {
     if (planType === "SUBSCRIPTION" && (!durationValue || !["DAYS", "MONTHS", "YEARS"].includes(durationUnit) || photoQuota == null)) {
       return res.status(400).json({ error: "SUBSCRIPTION plans require duration_value, duration_unit (DAYS|MONTHS|YEARS), and photo_quota" });
     }
+    if (planType === "SUBSCRIPTION" && (durationValue != null && !(durationValue > 0))) {
+      return res.status(400).json({ error: "duration_value must be positive" });
+    }
+    if (planType === "SUBSCRIPTION" && (photoQuota != null && !(photoQuota >= 0))) {
+      return res.status(400).json({ error: "photo_quota must be a non-negative number" });
+    }
     if (planType === "WALLET" && (!walletCredits || !["INITIAL", "TOPUP"].includes(walletTier))) {
       return res.status(400).json({ error: "WALLET plans require wallet_credits and wallet_tier (INITIAL|TOPUP)" });
+    }
+    if (planType === "WALLET" && (walletCredits != null && !(walletCredits >= 0))) {
+      return res.status(400).json({ error: "wallet_credits must be a non-negative number" });
     }
     const plan = await prisma.subscriptionPlan.create({
       data: {
@@ -1288,6 +1308,9 @@ router.patch("/plans/:id", async (req, res, next) => {
       is_active: isActive,
       display_order: displayOrder,
     } = req.body || {};
+    if (price !== undefined && price !== null && (typeof price !== "number" || !(price >= 0))) {
+      return res.status(400).json({ error: "price must be a non-negative number" });
+    }
     const data = {
       planName: planName ?? undefined,
       durationValue: durationValue ?? undefined,
@@ -1328,6 +1351,16 @@ router.get("/platform-settings", async (req, res, next) => {
 router.patch("/platform-settings", async (req, res, next) => {
   try {
     const { trial_duration_days, trial_photo_quota, monthly_grace_days, yearly_grace_days, free_access_enabled: freeAccessEnabled } = req.body || {};
+    for (const [key, value] of Object.entries({
+      trial_duration_days, trial_photo_quota, monthly_grace_days, yearly_grace_days,
+    })) {
+      if (value !== undefined && value !== null && (!Number.isInteger(value) || value < 1)) {
+        return res.status(400).json({ error: `${key} must be a positive integer` });
+      }
+    }
+    if (freeAccessEnabled !== undefined && freeAccessEnabled !== null && typeof freeAccessEnabled !== "boolean") {
+      return res.status(400).json({ error: "free_access_enabled must be a boolean" });
+    }
     const updated = await prisma.platformSettings.upsert({
       where: { id: "singleton" },
       update: {
