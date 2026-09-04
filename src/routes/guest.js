@@ -26,6 +26,14 @@ import {
   guestCommentLimiter,
 } from "../lib/rateLimiters.js";
 import { isExpired } from "../lib/expiry.js";
+import {
+  PRIVACY_CONSENT_VERSION,
+  effectivePrivacyNotice,
+  eraseGuestData,
+  requireSelfieConsent,
+  resolveGuestData,
+  scrubSelfieBuffers,
+} from "../lib/facePrivacy.js";
 import { subscribeGuestAlert, unsubscribeGuestAlert, isValidEmail } from "../lib/guestAlerts.js";
 import { sendWhatsAppMessage, isValidE164 } from "../lib/whatsapp.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes, effectivePhotoRetentionDays } from "../lib/planLimits.js";
@@ -118,6 +126,13 @@ router.get("/:slug", async (req, res, next) => {
       face_search_enabled: event.faceSearchEnabled,
       photo_selection_enabled: event.photoSelectionEnabled,
       guest_upload_enabled: event.guestUploadEnabled,
+      // Phase 2 (consent-first Face Search): the guest page renders the
+      // consent checkbox + privacy notice from these; old events default
+      // to consent-free search, so nothing already live changes.
+      require_face_search_consent: event.requireFaceSearchConsent,
+      privacy_notice_text: effectivePrivacyNotice(event),
+      selfie_retention_mode: event.selfieRetentionMode,
+      allow_guest_data_delete_request: event.allowGuestDataDeleteRequest,
       // When present, the frontend shows a picker instead of the search
       // form directly — a parent with sub-galleries is a pure menu, not a
       // searchable gallery of its own (see routes/events.js's create route).
@@ -129,8 +144,14 @@ router.get("/:slug", async (req, res, next) => {
 });
 
 router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), async (req, res, next) => {
+  // Declared outside try so the finally can scrub selfie buffers even on
+  // early validation returns — memory-only uploads, zeroed, never stored.
+  let uploadedSelfies = [];
   try {
-    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    const event = await prisma.event.findUnique({
+      where: { guestSlug: req.params.slug },
+      include: { owner: { select: { studioName: true } } },
+    });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
@@ -142,8 +163,21 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
     if (!event.faceSearchEnabled) {
       return res.status(403).json({ error: "Face Search isn't turned on for this event." });
     }
+    // Phase 2 (consent-first): block until the guest accepts; acceptances
+    // are audit-logged with the notice text/version they saw.
+    let consentId = null;
+    try {
+      consentId = await requireSelfieConsent(event, {
+        consented: req.body?.face_search_consent,
+        guestClientId: req.body?.guest_client_id || null,
+        req,
+      });
+    } catch (err) {
+      return res.status(err.status || 403).json({ error: err.message, code: err.code || "consent_required" });
+    }
 
     const files = req.files || [];
+    uploadedSelfies = files;
     if (files.length === 0) {
       return res.status(400).json({ error: "No selfies uploaded (expected multipart field 'selfies')" });
     }
@@ -254,10 +288,13 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
     res.json({
       search_id: searchId,
       faces_detected_in_selfie: facesDetected,
+      consent_id: consentId,
       matches,
     });
   } catch (err) {
     next(err);
+  } finally {
+    scrubSelfieBuffers(uploadedSelfies);
   }
 });
 
@@ -268,8 +305,12 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
 // merged by photo, keeping the best similarity and how many of the group
 // matched that photo.
 router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8), async (req, res, next) => {
+  let uploadedSelfies = [];
   try {
-    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    const event = await prisma.event.findUnique({
+      where: { guestSlug: req.params.slug },
+      include: { owner: { select: { studioName: true } } },
+    });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
@@ -279,8 +320,21 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
     if (!event.faceSearchEnabled) {
       return res.status(403).json({ error: "Face Search isn't turned on for this event." });
     }
+    // Phase 2 (consent-first): same gate as solo search — one checkbox
+    // covers the whole group sitting around the same phone.
+    let consentId = null;
+    try {
+      consentId = await requireSelfieConsent(event, {
+        consented: req.body?.face_search_consent,
+        guestClientId: req.body?.guest_client_id || null,
+        req,
+      });
+    } catch (err) {
+      return res.status(err.status || 403).json({ error: err.message, code: err.code || "consent_required" });
+    }
 
     const files = req.files || [];
+    uploadedSelfies = files;
     if (files.length < 2) {
       return res.status(400).json({ error: "Group search needs at least 2 selfies — one per person" });
     }
@@ -375,8 +429,82 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
 
     res.json({
       people_detected: peopleDetected,
+      consent_id: consentId,
       matches,
     });
+  } catch (err) {
+    next(err);
+  } finally {
+    scrubSelfieBuffers(uploadedSelfies);
+  }
+});
+
+// Phase 2 (guest data rights): file an export/delete request for your own
+// Face Search footprint with nothing but your guest id + an optional
+// contact. Deletion requests need the studio's opt-in flag; exports of
+// your own data are always allowed. Idempotent per (guest, type) while
+// one is still pending.
+router.post("/:slug/data-request", guestFeedbackLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    const { guest_client_id: guestClientId, contact, type } = req.body || {};
+    if (!guestClientId || typeof guestClientId !== "string") {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+    if (type !== "export" && type !== "delete") {
+      return res.status(400).json({ error: 'type must be "export" or "delete"' });
+    }
+    if (type === "delete" && !event.allowGuestDataDeleteRequest) {
+      return res.status(403).json({
+        error: "Deletion requests are turned off for this event — please contact the studio directly.",
+      });
+    }
+    if (contact != null && (typeof contact !== "string" || contact.length > 200)) {
+      return res.status(400).json({ error: "contact must be a short string" });
+    }
+    const existing = await prisma.guestDataRequest.findFirst({
+      where: { eventId: event.id, guestClientId, type, status: "pending" },
+    });
+    if (existing) {
+      return res.json({ request_id: existing.id, type: existing.type, status: existing.status });
+    }
+    const created = await prisma.guestDataRequest.create({
+      data: { eventId: event.id, guestClientId, contact: contact?.trim() || null, type },
+    });
+    res.status(201).json({ request_id: created.id, type: created.type, status: created.status });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Your own requests' statuses — so the page can show "pending review" vs
+// "completed" without the guest asking the studio.
+router.get("/:slug/data-request/status", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    const guestClientId = req.query.guest_client_id;
+    if (!guestClientId || typeof guestClientId !== "string") {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+    const requests = await prisma.guestDataRequest.findMany({
+      where: { eventId: event.id, guestClientId },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(
+      requests.map((r) => ({
+        request_id: r.id,
+        type: r.type,
+        status: r.status,
+        created_at: r.createdAt,
+        resolved_at: r.resolvedAt,
+      }))
+    );
   } catch (err) {
     next(err);
   }

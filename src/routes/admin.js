@@ -7,6 +7,7 @@ import { requireAdmin } from "../middleware/admin.js";
 import { requireRole } from "../middleware/role.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
+import { eraseGuestData, resolveGuestData } from "../lib/facePrivacy.js";
 import { deleteFileIfExists, removeEventDir } from "../lib/storage.js";
 import { zipDownloadPath } from "../lib/zip.js";
 import { deleteFileFromDrive } from "../lib/driveBackup.js";
@@ -1018,6 +1019,11 @@ router.get("/events/:id", async (req, res, next) => {
       created_at: event.createdAt,
       expires_at: event.expiresAt,
       started: !!event.startedAt,
+      require_face_search_consent: event.requireFaceSearchConsent,
+      privacy_notice_text: event.privacyNoticeText,
+      selfie_retention_mode: event.selfieRetentionMode,
+      guest_data_retention_days: event.guestDataRetentionDays,
+      allow_guest_data_delete_request: event.allowGuestDataDeleteRequest,
       drive_folder_url: event.driveFolderUrl,
       drive_sync_enabled: event.driveSyncEnabled,
       shoots_connected: !!event.ftpUsername,
@@ -1135,6 +1141,73 @@ router.post("/events/:id/albums/:albumId/status", requireRole("SUPER_ADMIN"), as
       data: { status, lockedAt: status === "APPROVED" ? album.lockedAt || new Date() : null },
     });
     res.json({ album_id: updated.id, status: updated.status, locked_at: updated.lockedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 2 (guest data rights): review queue for export/delete requests.
+// ?status=pending (default) | completed | rejected | all. Read-only;
+// resolving happens below.
+router.get("/events/:id/data-requests", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+    const status = req.query.status ?? "pending";
+    if (!["pending", "completed", "rejected", "all"].includes(status)) {
+      return res.status(400).json({ error: 'status must be "pending", "completed", "rejected" or "all"' });
+    }
+    const requests = await prisma.guestDataRequest.findMany({
+      where: { eventId: event.id, ...(status === "all" ? {} : { status }) },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(
+      requests.map((r) => ({
+        request_id: r.id,
+        guest_client_id: r.guestClientId,
+        contact: r.contact,
+        type: r.type,
+        status: r.status,
+        created_at: r.createdAt,
+        resolved_at: r.resolvedAt,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Resolve one request. complete+delete erases the guest's footprint and
+// returns the counts; complete+export returns the guest's data payload so
+// the admin can send it; reject closes without action. Pending only.
+router.post("/events/:id/data-requests/:requestId", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+    const { action } = req.body || {};
+    if (action !== "complete" && action !== "reject") {
+      return res.status(400).json({ error: 'action must be "complete" or "reject"' });
+    }
+    const request = await prisma.guestDataRequest.findFirst({
+      where: { id: req.params.requestId, eventId: event.id },
+    });
+    if (!request) return res.status(404).json({ error: "Request not found" });
+    if (request.status !== "pending") {
+      return res.status(409).json({ error: `Request is already ${request.status}` });
+    }
+    let result = null;
+    if (action === "complete") {
+      if (request.type === "delete") {
+        result = await eraseGuestData(event.id, request.guestClientId);
+      } else {
+        result = await resolveGuestData(event.id, request.guestClientId);
+      }
+    }
+    const updated = await prisma.guestDataRequest.update({
+      where: { id: request.id },
+      data: { status: action === "complete" ? "completed" : "rejected", resolvedAt: new Date() },
+    });
+    res.json({ request_id: updated.id, status: updated.status, resolved_at: updated.resolvedAt, result });
   } catch (err) {
     next(err);
   }

@@ -22,6 +22,7 @@ import { startAutoSyncScheduler } from "./lib/driveSync.js";
 import { startShootsServer } from "./lib/ftpShoots.js";
 import { startDriveBackupRetentionScheduler } from "./lib/driveBackupRetention.js";
 import { startPhotoRetentionScheduler } from "./lib/photoRetention.js";
+import { startGuestDataRetentionScheduler } from "./lib/facePrivacy.js";
 import { startTokenMaintenanceScheduler } from "./lib/tokenMaintenance.js";
 
 const app = express();
@@ -95,5 +96,6 @@ app.listen(PORT, () => {
   startShootsServer();
   startDriveBackupRetentionScheduler();
   startPhotoRetentionScheduler();
+  startGuestDataRetentionScheduler();
   startTokenMaintenanceScheduler();
 });

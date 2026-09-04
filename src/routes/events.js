@@ -299,6 +299,13 @@ router.get("/:id", async (req, res, next) => {
       published_at: event.publishedAt,
       archived_at: event.archivedAt,
       allow_download: event.allowDownload,
+      // Phase 2 (consent-first Face Search): privacy settings for the
+      // studio privacy card.
+      require_face_search_consent: event.requireFaceSearchConsent,
+      privacy_notice_text: event.privacyNoticeText,
+      selfie_retention_mode: event.selfieRetentionMode,
+      guest_data_retention_days: event.guestDataRetentionDays,
+      allow_guest_data_delete_request: event.allowGuestDataDeleteRequest,
       cover_url: event.coverPhotoPath ? `/files/events/${event.id}/cover` : null,
       event_date: event.eventDate,
       event_venue: event.eventVenue,
@@ -489,6 +496,13 @@ router.patch("/:id", async (req, res, next) => {
     const { event } = accessible;
 
     const { name, event_date: eventDate, event_venue: eventVenue, description } = req.body || {};
+    const {
+      require_face_search_consent: requireConsent,
+      privacy_notice_text: privacyNotice,
+      selfie_retention_mode: selfieRetention,
+      guest_data_retention_days: retentionDays,
+      allow_guest_data_delete_request: allowDeleteRequest,
+    } = req.body || {};
     const data = {};
     if (name !== undefined) {
       if (typeof name !== "string" || !name.trim()) {
@@ -519,6 +533,41 @@ router.patch("/:id", async (req, res, next) => {
       }
       data.description = description?.trim() ? description.trim() : null;
     }
+    // Phase 2 (consent-first Face Search): privacy settings live on the
+    // same studio PATCH as the display metadata — owner or collaborator.
+    if (requireConsent !== undefined) {
+      if (typeof requireConsent !== "boolean") {
+        return res.status(400).json({ error: "require_face_search_consent must be a boolean" });
+      }
+      data.requireFaceSearchConsent = requireConsent;
+    }
+    if (privacyNotice !== undefined) {
+      if (privacyNotice !== null && typeof privacyNotice !== "string") {
+        return res.status(400).json({ error: "privacy_notice_text must be a string, or null to clear" });
+      }
+      if (privacyNotice && privacyNotice.length > 2000) {
+        return res.status(400).json({ error: "privacy_notice_text is limited to 2000 characters" });
+      }
+      data.privacyNoticeText = privacyNotice?.trim() ? privacyNotice.trim() : null;
+    }
+    if (selfieRetention !== undefined) {
+      if (selfieRetention !== "process_only" && selfieRetention !== "retain") {
+        return res.status(400).json({ error: 'selfie_retention_mode must be "process_only" or "retain"' });
+      }
+      data.selfieRetentionMode = selfieRetention;
+    }
+    if (retentionDays !== undefined) {
+      if (retentionDays !== null && (!Number.isInteger(retentionDays) || retentionDays < 0 || retentionDays > 3650)) {
+        return res.status(400).json({ error: "guest_data_retention_days must be an integer 0-3650, or null to clear" });
+      }
+      data.guestDataRetentionDays = retentionDays;
+    }
+    if (allowDeleteRequest !== undefined) {
+      if (typeof allowDeleteRequest !== "boolean") {
+        return res.status(400).json({ error: "allow_guest_data_delete_request must be a boolean" });
+      }
+      data.allowGuestDataDeleteRequest = allowDeleteRequest;
+    }
 
     const updated = await prisma.event.update({ where: { id: event.id }, data });
     res.json({
@@ -527,6 +576,11 @@ router.patch("/:id", async (req, res, next) => {
       event_date: updated.eventDate,
       event_venue: updated.eventVenue,
       description: updated.description,
+      require_face_search_consent: updated.requireFaceSearchConsent,
+      privacy_notice_text: updated.privacyNoticeText,
+      selfie_retention_mode: updated.selfieRetentionMode,
+      guest_data_retention_days: updated.guestDataRetentionDays,
+      allow_guest_data_delete_request: updated.allowGuestDataDeleteRequest,
     });
   } catch (err) {
     next(err);

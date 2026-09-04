@@ -213,6 +213,27 @@ model Event {
   /// every event that predates this flag.
   allowDownload Boolean @default(true)
 
+  /// Phase 2 (consent-first Face Search): when true, selfie search is
+  /// blocked until the guest ticks the consent checkbox — every search
+  /// then logs a GuestConsent row. Defaults false so every existing
+  /// event keeps working exactly as before.
+  requireFaceSearchConsent Boolean @default(false)
+  /// Studio-editable privacy notice shown on the guest search page.
+  /// Null = the built-in default text (see lib/facePrivacy.js).
+  privacyNoticeText String?
+  /// How uploaded selfies are treated. Selfies arrive via in-memory
+  /// upload and are never written to disk either way; "process_only"
+  /// (default) additionally means only the match runs and the buffer is
+  /// zeroed right after, while "retain" records the studio's explicit
+  /// opt-in to keep search records longer (audit marker for the future).
+  selfieRetentionMode String @default("process_only")
+  /// Days after which GuestSearch embedding rows auto-purge (hourly
+  /// scheduler). Null = keep until the event is deleted.
+  guestDataRetentionDays Int?
+  /// Whether guests may file data-deletion requests from the event page.
+  /// Export requests (their own data) are always allowed.
+  allowGuestDataDeleteRequest Boolean @default(true)
+
   /// MERGE (Studio-Verse EventDetail depth, Phase 18E): soft archive — an
   /// archived event is hidden from guests (see lib/expiry.js, where
   /// archived counts as guest-closed) and from Photo Selection clients
@@ -241,6 +262,10 @@ model Event {
   /// Album proofing projects (Phase 23).
   albums        Album[]
   supportTickets SupportTicket[]
+  /// Consent-first Face Search (Phase 2 privacy): one row per guest
+  /// consenting to a selfie search, and per-guest data requests.
+  consents      GuestConsent[]
+  dataRequests  GuestDataRequest[]
 
   /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
   /// — a freshly-created event has no upload/import/PandaShoots UI at all
@@ -1168,4 +1193,44 @@ model AlbumComment {
   @@index([versionId])
   @@index([pageId])
   @@index([parentId])
+}
+
+/// Phase 2 (consent-first Face Search): proof that a guest accepted the
+/// selfie-search terms before matching ran. One row per accepted search
+/// (cheap, append-only audit). Kept even by the retention sweep — it's
+/// the legal record that processing was allowed, not biometric data.
+model GuestConsent {
+  id             String   @id @default(uuid())
+  eventId        String
+  event          Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  guestClientId  String
+  consentedAt    DateTime @default(now())
+  consentText    String
+  consentVersion String   @default("v1")
+  ip             String?
+  userAgent      String?
+
+  @@index([eventId])
+  @@index([guestClientId])
+}
+
+/// Phase 2: a guest's export/delete request for their own Face Search
+/// data (searches, alerts, reactions, comments), filed from the event
+/// page with their guest id + optional contact. Platform admins review
+/// and complete them (delete erases the guest's rows).
+model GuestDataRequest {
+  id            String    @id @default(uuid())
+  eventId       String
+  event         Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  guestClientId String
+  contact       String?
+  /// "export" | "delete"
+  type          String
+  /// "pending" | "completed" | "rejected"
+  status        String    @default("pending")
+  createdAt     DateTime  @default(now())
+  resolvedAt    DateTime?
+
+  @@index([eventId, status])
+  @@index([guestClientId])
 }
