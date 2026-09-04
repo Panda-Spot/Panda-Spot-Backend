@@ -171,3 +171,63 @@ export async function sendPasswordResetEmail(to, resetUrl) {
     html: `<p>Reset your password.</p><p><a href="${resetUrl}">${resetUrl}</a></p>`,
   });
 }
+
+// Phase 7 (album revision lifecycle): best-effort notifications, same
+// graceful pattern as every mailer here — no SMTP means a warn-log, and
+// callers must never let a mail failure fail the request itself.
+function albumMail(to, subject, lines, link) {
+  const t = getTransporter();
+  const text = [...lines, link ? `Open it here: ${link}` : null].filter(Boolean).join("\n");
+  if (!t) {
+    console.warn(`SMTP not configured — would have emailed ${to} (${subject}):\n${text}`);
+    return Promise.resolve();
+  }
+  return t.sendMail({
+    from: process.env.SMTP_FROM || "PandaSpot <no-reply@pandaspot.example>",
+    to,
+    subject,
+    text,
+    html: lines.map((l) => `<p>${escapeHtml(l)}</p>`).join("") + (link ? `<p><a href="${escapeHtml(link)}">${escapeHtml(link)}</a></p>` : ""),
+  });
+}
+
+export function albumReviewLink(eventId, albumId) {
+  const base = (process.env.PUBLIC_WEB_URL || "").replace(/\/$/, "");
+  if (!base) return null;
+  return `${base}/client/${eventId}/albums/${albumId}`;
+}
+
+export async function sendAlbumSentEmail(to, { eventName, albumName, versionNumber, eventId, albumId }) {
+  return albumMail(
+    to,
+    `Your album “${albumName}” is ready for review`,
+    [
+      `${eventName}: album “${albumName}” (v${versionNumber}) is ready for your review.`,
+      `Flip through the spreads, drop pins where you want changes, then approve or request changes.`,
+    ],
+    albumReviewLink(eventId, albumId)
+  );
+}
+
+export async function sendAlbumChangesRequestedEmail(to, { eventName, albumName, clientName, message, eventId, albumId }) {
+  const base = (process.env.PUBLIC_WEB_URL || "").replace(/\/$/, "");
+  return albumMail(
+    to,
+    `Changes requested on “${albumName}”`,
+    [
+      `${clientName || "The client"} requested changes on album “${albumName}” (${eventName}).`,
+      message ? `Their note: ${message}` : null,
+    ].filter(Boolean),
+    base ? `${base}/events/${eventId}/albums/${albumId}` : null
+  );
+}
+
+export async function sendAlbumApprovedEmail(to, { eventName, albumName, clientName, eventId, albumId }) {
+  const base = (process.env.PUBLIC_WEB_URL || "").replace(/\/$/, "");
+  return albumMail(
+    to,
+    `Album approved: “${albumName}”`,
+    [`${clientName || "The client"} approved album “${albumName}” (${eventName}) — it is now locked for print.`],
+    base ? `${base}/events/${eventId}/albums/${albumId}` : null
+  );
+}

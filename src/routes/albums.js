@@ -10,6 +10,10 @@ import { ALLOWED_EXTENSIONS, deleteFileIfExists, saveAlbumPage } from "../lib/st
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { streamPhotosZip, zipFilenameForEvent } from "../lib/zip.js";
+import { readFile } from "node:fs/promises";
+import { buildAlbumProofPdf } from "../lib/albumProof.js";
+import { exportFilename } from "../lib/selectionExport.js";
+import { sendAlbumSentEmail } from "../lib/mailer.js";
 
 const router = Router({ mergeParams: true });
 
@@ -233,6 +237,40 @@ router.get("/:albumId", async (req, res, next) => {
     res.json(await albumDetail(event.id, album));
   } catch (err) {
     next(err);
+  }
+});
+
+// Phase 7: album proofing PDF — title, event, reviewers, every revision
+// with its spreads/notes, and every comment with OPEN/RESOLVED status,
+// plus the approval timestamp once locked.
+router.get("/:albumId/proof.pdf", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    const detail = await albumDetail(event.id, album);
+    const mappings = await prisma.eventUserMapping.findMany({
+      where: { eventId: event.id, revokedAt: null },
+      include: { user: true },
+      orderBy: { createdAt: "asc" },
+    });
+    const pdf = await buildAlbumProofPdf({
+      event,
+      album: detail,
+      clients: mappings.map((m) => ({ name: m.user?.name, email: m.user?.email })),
+    });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${exportFilename(event.name, `${album.name}-proof`, "pdf")}"`
+    );
+    res.send(pdf);
+  } catch (err) {
+    console.error(`Album proof PDF failed (album ${req.params.albumId}):`, err);
+    if (!res.headersSent) res.status(500).json({ error: "Proof PDF failed — please try again." });
   }
 });
 
@@ -615,6 +653,77 @@ router.delete("/:albumId/versions/:versionId/pages/:pageId", async (req, res, ne
   }
 });
 
+// Phase 7: start a new revision FROM the current spreads — the new
+// version gets its own file copies (copy-on-write), so reworking or
+// replacing pages never disturbs the preserved revision. Body
+// { from_version_id? } defaults to the latest image version.
+router.post("/:albumId/versions/duplicate", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    if (!requireUnlocked(album, res)) return;
+    const { from_version_id: fromVersionId } = req.body || {};
+    const imageVersions = (album.versions || []).filter((v) => !v.printPdfPath);
+    const source = fromVersionId
+      ? imageVersions.find((v) => v.id === fromVersionId)
+      : imageVersions.reduce((a, b) => (a && a.versionNumber >= b.versionNumber ? a : b), null);
+    if (!source) {
+      return res.status(400).json({ error: "No image version to duplicate yet — upload spreads first." });
+    }
+    if (!source.pages || source.pages.length === 0) {
+      return res.status(400).json({ error: "The source version has no spreads to duplicate." });
+    }
+    const versionNumber = Math.max(...album.versions.map((v) => v.versionNumber)) + 1;
+    const version = await prisma.albumVersion.create({
+      data: {
+        albumId: album.id,
+        versionNumber,
+        note: `Duplicated from V${source.versionNumber} — replace spreads as needed`,
+      },
+    });
+    let pageNumber = 0;
+    for (const src of [...source.pages].sort((a, b) => a.pageNumber - b.pageNumber)) {
+      pageNumber += 1;
+      const ext = path.extname(src.filename || src.storagePath).toLowerCase() || ".jpg";
+      const buffer = await readFile(src.storagePath);
+      const storagePath = await saveAlbumPage(event.id, album.id, versionNumber, `${randomUUID()}${ext}`, buffer);
+      const page = await prisma.albumPage.create({
+        data: {
+          versionId: version.id,
+          pageNumber,
+          storagePath,
+          filename: src.filename,
+          fileSize: buffer.length,
+          width: src.width ?? null,
+          height: src.height ?? null,
+        },
+      });
+      try {
+        const thumbnailPath = await generateThumbnail(buffer, event.id, page.id);
+        if (thumbnailPath) {
+          await prisma.albumPage.update({ where: { id: page.id }, data: { thumbnailPath } });
+        }
+      } catch {
+        // Same nicety rule as uploads — thumbnails never fail a duplication.
+      }
+    }
+    if (album.status === "CHANGES_REQUESTED") {
+      await prisma.album.update({ where: { id: album.id }, data: { status: "SENT", sentAt: new Date() } });
+    }
+    const full = await prisma.albumVersion.findUnique({
+      where: { id: version.id },
+      include: { pages: { orderBy: { pageNumber: "asc" } } },
+    });
+    res.status(201).json(versionShape(event.id, album.id, full));
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- Review lifecycle ---
 
 router.post("/:albumId/send", async (req, res, next) => {
@@ -638,6 +747,28 @@ router.post("/:albumId/send", async (req, res, next) => {
       where: { id: album.id },
       data: { status: "SENT", sentAt: new Date() },
     });
+    // Phase 7: best-effort client notification — mail failures (or no
+    // SMTP at all) must never fail the send itself.
+    try {
+      const mappings = await prisma.eventUserMapping.findMany({
+        where: { eventId: event.id },
+        include: { user: true },
+      });
+      const latestVersion = Math.max(...album.versions.map((v) => v.versionNumber));
+      for (const m of mappings) {
+        if (m.user?.email && !m.revokedAt) {
+          await sendAlbumSentEmail(m.user.email, {
+            eventName: event.name,
+            albumName: album.name,
+            versionNumber: latestVersion,
+            eventId: event.id,
+            albumId: album.id,
+          }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error(`Album send notification failed (album ${album.id}):`, err.message);
+    }
     res.json({ status: updated.status, sent_at: updated.sentAt });
   } catch (err) {
     next(err);
@@ -669,7 +800,14 @@ router.post("/:albumId/reopen", async (req, res, next) => {
       where: { id: album.id },
       data: { status: "DRAFT", lockedAt: null },
     });
-    res.json({ status: updated.status });
+    // Phase 7: unlocking is the one destructive review action — the UI
+    // confirms with this same warning, and the API echoes it so headless
+    // callers can't miss what reopening does.
+    res.json({
+      status: updated.status,
+      warning:
+        "Album unlocked back to DRAFT: the client loses access until you send again, and the approval lock is gone. Only reopen for genuine rework.",
+    });
   } catch (err) {
     next(err);
   }

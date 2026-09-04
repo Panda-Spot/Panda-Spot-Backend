@@ -3,6 +3,21 @@ import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
 import { loadAlbum, albumDetail, commentShape, createComment } from "./albums.js";
+import { buildAlbumProofPdf } from "../lib/albumProof.js";
+import { exportFilename } from "../lib/selectionExport.js";
+import { sendAlbumApprovedEmail, sendAlbumChangesRequestedEmail } from "../lib/mailer.js";
+
+async function notifyOwner(event, album, kind, extra = {}) {
+  try {
+    const owner = await prisma.user.findUnique({ where: { id: event.ownerId }, select: { email: true } });
+    if (!owner?.email) return;
+    const base = { eventName: event.name, albumName: album.name, eventId: event.id, albumId: album.id };
+    if (kind === "approved") await sendAlbumApprovedEmail(owner.email, base).catch(() => {});
+    else await sendAlbumChangesRequestedEmail(owner.email, { ...base, ...extra }).catch(() => {});
+  } catch (err) {
+    console.error(`Album ${kind} notification failed (album ${album.id}):`, err.message);
+  }
+}
 
 const router = Router({ mergeParams: true });
 
@@ -184,6 +199,11 @@ router.post("/:albumId/request-changes", async (req, res, next) => {
       where: { id: loaded.album.id },
       data: { status: "CHANGES_REQUESTED" },
     });
+    // Phase 7: best-effort studio notification (never fails the request).
+    notifyOwner(loaded.event, loaded.album, "changes", {
+      clientName: req.user.name || req.user.email,
+      message: message && typeof message === "string" ? message.trim() : null,
+    });
     res.json({ status: updated.status });
   } catch (err) {
     next(err);
@@ -201,9 +221,38 @@ router.post("/:albumId/approve", async (req, res, next) => {
       where: { id: loaded.album.id },
       data: { status: "APPROVED", lockedAt: new Date() },
     });
+    // Phase 7: best-effort studio notification (never fails the request).
+    notifyOwner(loaded.event, loaded.album, "approved", {
+      clientName: req.user.name || req.user.email,
+    });
     res.json({ status: updated.status, locked_at: updated.lockedAt });
   } catch (err) {
     next(err);
+  }
+});
+
+// Phase 7: the client's own proofing PDF — same lifecycle record the
+// studio sees (title, event, revisions, comments with status, approval
+// timestamp). Drafts stay invisible via loadClientAlbum.
+router.get("/:albumId/proof.pdf", async (req, res, next) => {
+  try {
+    const loaded = await loadClientAlbum(req, res);
+    if (!loaded) return;
+    const detail = await albumDetail(loaded.event.id, loaded.album);
+    const pdf = await buildAlbumProofPdf({
+      event: loaded.event,
+      album: detail,
+      clients: [{ name: req.user.email, email: req.user.email }],
+    });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${exportFilename(loaded.event.name, `${loaded.album.name}-proof`, "pdf")}"`
+    );
+    res.send(pdf);
+  } catch (err) {
+    console.error(`Album proof PDF failed (client album ${req.params.albumId}):`, err);
+    if (!res.headersSent) res.status(500).json({ error: "Proof PDF failed — please try again." });
   }
 });
 
