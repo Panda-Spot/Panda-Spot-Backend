@@ -7,6 +7,7 @@ import { requireAdmin } from "../middleware/admin.js";
 import { requireRole } from "../middleware/role.js";
 import { bucketByDay } from "../lib/dailyBuckets.js";
 import { deleteEventCascade } from "../lib/eventLifecycle.js";
+import { ACCESS_MODES, setAccessKey } from "../lib/galleryAccess.js";
 import { eraseGuestData, resolveGuestData } from "../lib/facePrivacy.js";
 import { deleteFileIfExists, removeEventDir } from "../lib/storage.js";
 import { zipDownloadPath } from "../lib/zip.js";
@@ -1024,7 +1025,10 @@ router.get("/events/:id", async (req, res, next) => {
       selfie_retention_mode: event.selfieRetentionMode,
       guest_data_retention_days: event.guestDataRetentionDays,
       allow_guest_data_delete_request: event.allowGuestDataDeleteRequest,
-      drive_folder_url: event.driveFolderUrl,
+      access_mode: event.accessMode,
+      access_key_set: !!event.accessKeyHash,
+      expires_at: event.expiresAt,
+      expiry_preset: event.expiryPreset,      drive_folder_url: event.driveFolderUrl,
       drive_sync_enabled: event.driveSyncEnabled,
       shoots_connected: !!event.ftpUsername,
       drive_backup_enabled: event.driveBackupEnabled,
@@ -1235,6 +1239,65 @@ router.post("/events/:id/expiry", async (req, res, next) => {
 
     await prisma.event.update({ where: { id: event.id }, data: { expiresAt } });
     res.json({ ok: true, expires_at: expiresAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 3 (gallery access upgrade): platform-level access override —
+// mode, key (plaintext in, bcrypt hash stored), expiry date + preset.
+// Same validation as the studio PATCH; private_key still needs a key.
+router.post("/events/:id/access", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { id: req.params.id } });
+    if (!event) return res.status(404).json({ error: "Event not found" });
+    const { access_mode: accessMode, access_key: accessKey, expires_at: expiresAt, expiry_preset: expiryPreset } = req.body || {};
+    const data = {};
+    if (accessMode !== undefined) {
+      if (!ACCESS_MODES.includes(accessMode)) {
+        return res.status(400).json({ error: `access_mode must be one of ${ACCESS_MODES.join(", ")}` });
+      }
+      data.accessMode = accessMode;
+    }
+    if (expiryPreset !== undefined) {
+      if (!["7_days", "30_days", "90_days", "custom"].includes(expiryPreset)) {
+        return res.status(400).json({ error: 'expiry_preset must be "7_days", "30_days", "90_days" or "custom"' });
+      }
+      data.expiryPreset = expiryPreset;
+    }
+    if (expiresAt !== undefined) {
+      const d = new Date(expiresAt);
+      if (Number.isNaN(d.getTime())) {
+        return res.status(400).json({ error: "expires_at must be a valid date" });
+      }
+      data.expiresAt = d;
+    }
+    let keyHash = event.accessKeyHash;
+    if (accessKey !== undefined) {
+      if (accessKey === null || accessKey === "") {
+        data.accessKeyHash = null;
+        keyHash = null;
+      } else {
+        try {
+          await setAccessKey(event.id, accessKey);
+          keyHash = true;
+        } catch (err) {
+          return res.status(err.status || 400).json({ error: err.message });
+        }
+      }
+    }
+    const finalMode = data.accessMode ?? event.accessMode ?? "public";
+    if (finalMode === "private_key" && !keyHash) {
+      return res.status(400).json({ error: "Set an access key before switching to private-key mode." });
+    }
+    const updated = await prisma.event.update({ where: { id: event.id }, data });
+    res.json({
+      ok: true,
+      access_mode: updated.accessMode,
+      access_key_set: !!updated.accessKeyHash,
+      expires_at: updated.expiresAt,
+      expiry_preset: updated.expiryPreset,
+    });
   } catch (err) {
     next(err);
   }

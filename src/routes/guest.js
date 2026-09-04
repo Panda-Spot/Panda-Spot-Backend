@@ -26,6 +26,7 @@ import {
   guestCommentLimiter,
 } from "../lib/rateLimiters.js";
 import { isExpired } from "../lib/expiry.js";
+import { checkGalleryAccess, checkAccessKey, galleryAccessFlags, signGalleryToken } from "../lib/galleryAccess.js";
 import {
   PRIVACY_CONSENT_VERSION,
   effectivePrivacyNotice,
@@ -137,7 +138,53 @@ router.get("/:slug", async (req, res, next) => {
       // form directly — a parent with sub-galleries is a pure menu, not a
       // searchable gallery of its own (see routes/events.js's create route).
       sub_galleries: event.subGalleries.map((s) => ({ name: s.name, slug: s.guestSlug })),
+      // Phase 3 (gallery access upgrade): branded prompt/login/expired
+      // screens render from these + the studio branding above. Old events
+      // are accessMode "public", so nothing already live changes.
+      ...galleryAccessFlags(event),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 3: trade the studio's private access key for a gallery unlock
+// token (12h JWT, sent back as x-gallery-key / ?gallery_key= on later
+// calls). Public by necessity — this IS the locked door. Brute-force
+// throttled by bcrypt cost plus the search limiter.
+router.post("/:slug/unlock", guestSearchLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if ((event.accessMode || "public") !== "private_key") {
+      return res.status(400).json({ error: "This gallery doesn't need an access key." });
+    }
+    const { access_key: key } = req.body || {};
+    if (!(await checkAccessKey(event, key))) {
+      return res.status(401).json({ error: "That access key didn't match — check with your photographer.", code: "locked" });
+    }
+    res.json({ gallery_token: signGalleryToken({ eventId: event.id, slug: event.guestSlug }), expires_in: Number(process.env.GALLERY_TOKEN_TTL_SECONDS || 12 * 60 * 60) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 3 gate: every guest JSON route below this line requires gallery
+// access (private_key → unlock token, client_login/invite_only → closed
+// with a login prompt). Expired/archived events fall through so each
+// route's own 410 stays authoritative.
+router.use("/:slug", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    if (isExpired(event)) return next();
+    const denied = checkGalleryAccess(event, req);
+    if (denied) return res.status(denied.status).json(denied.body);
+    next();
   } catch (err) {
     next(err);
   }

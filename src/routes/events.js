@@ -21,6 +21,7 @@ import { getStorageProvider } from "../lib/storageProvider.js";
 import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { loadAccessibleEvent } from "../lib/access.js";
+import { ACCESS_MODES, setAccessKey } from "../lib/galleryAccess.js";
 import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension, isVideoExtension, isVideoFilename } from "../lib/fileValidation.js";
 import { getEffectiveThreshold } from "../lib/threshold.js";
@@ -299,6 +300,12 @@ router.get("/:id", async (req, res, next) => {
       published_at: event.publishedAt,
       archived_at: event.archivedAt,
       allow_download: event.allowDownload,
+      // Phase 3 (gallery access upgrade): settings panel source of truth
+      // (key itself never leaves the server — only whether one is set).
+      access_mode: event.accessMode,
+      access_key_set: !!event.accessKeyHash,
+      expires_at: event.expiresAt,
+      expiry_preset: event.expiryPreset,
       // Phase 2 (consent-first Face Search): privacy settings for the
       // studio privacy card.
       require_face_search_consent: event.requireFaceSearchConsent,
@@ -502,6 +509,10 @@ router.patch("/:id", async (req, res, next) => {
       selfie_retention_mode: selfieRetention,
       guest_data_retention_days: retentionDays,
       allow_guest_data_delete_request: allowDeleteRequest,
+      access_mode: accessMode,
+      access_key: accessKey,
+      expires_at: expiresAt,
+      expiry_preset: expiryPreset,
     } = req.body || {};
     const data = {};
     if (name !== undefined) {
@@ -568,6 +579,49 @@ router.patch("/:id", async (req, res, next) => {
       }
       data.allowGuestDataDeleteRequest = allowDeleteRequest;
     }
+    // Phase 3 (gallery access upgrade): mode + key + expiry presets on
+    // the same studio PATCH — owner or collaborator.
+    if (accessMode !== undefined) {
+      if (!ACCESS_MODES.includes(accessMode)) {
+        return res.status(400).json({ error: `access_mode must be one of ${ACCESS_MODES.join(", ")}` });
+      }
+      data.accessMode = accessMode;
+    }
+    if (expiryPreset !== undefined) {
+      if (!["7_days", "30_days", "90_days", "custom"].includes(expiryPreset)) {
+        return res.status(400).json({ error: 'expiry_preset must be "7_days", "30_days", "90_days" or "custom"' });
+      }
+      data.expiryPreset = expiryPreset;
+    }
+    if (expiresAt !== undefined) {
+      const d = new Date(expiresAt);
+      if (Number.isNaN(d.getTime())) {
+        return res.status(400).json({ error: "expires_at must be a valid date" });
+      }
+      data.expiresAt = d;
+    }
+
+    // Private key lifecycle: a plaintext access_key sets a fresh bcrypt
+    // hash, null/"" clears it (back to a keyless gallery). Locking an
+    // event without any key — new or stored — is rejected.
+    let keyHash = event.accessKeyHash;
+    if (accessKey !== undefined) {
+      if (accessKey === null || accessKey === "") {
+        await prisma.event.update({ where: { id: event.id }, data: { accessKeyHash: null } });
+        keyHash = null;
+      } else {
+        try {
+          await setAccessKey(event.id, accessKey);
+          keyHash = true;
+        } catch (err) {
+          return res.status(err.status || 400).json({ error: err.message });
+        }
+      }
+    }
+    const finalMode = data.accessMode ?? event.accessMode ?? "public";
+    if (finalMode === "private_key" && !keyHash) {
+      return res.status(400).json({ error: "Set an access key before switching to private-key mode." });
+    }
 
     const updated = await prisma.event.update({ where: { id: event.id }, data });
     res.json({
@@ -581,6 +635,10 @@ router.patch("/:id", async (req, res, next) => {
       selfie_retention_mode: updated.selfieRetentionMode,
       guest_data_retention_days: updated.guestDataRetentionDays,
       allow_guest_data_delete_request: updated.allowGuestDataDeleteRequest,
+      access_mode: updated.accessMode,
+      access_key_set: !!updated.accessKeyHash,
+      expires_at: updated.expiresAt,
+      expiry_preset: updated.expiryPreset,
     });
   } catch (err) {
     next(err);

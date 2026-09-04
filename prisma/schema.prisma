@@ -234,6 +234,19 @@ model Event {
   /// Export requests (their own data) are always allowed.
   allowGuestDataDeleteRequest Boolean @default(true)
 
+  /// Phase 3 (gallery access upgrade): who the public guest link serves.
+  /// "public" (anyone with the link, as today), "private_key" (needs the
+  /// studio's access key → unlock token), "client_login" / "invite_only"
+  /// (guest link closed — clients use their login instead).
+  accessMode String @default("public")
+  /// bcrypt hash of the studio's private access key. Null = no key set —
+  /// switching to private_key mode without one is rejected.
+  accessKeyHash String?
+  /// Which expiry preset the studio picked ("7_days" | "30_days" |
+  /// "90_days" | "custom") — display/memory aid; expiresAt stays the
+  /// enforcement source. Defaults to 90 to match computeExpiresAt.
+  expiryPreset String @default("90_days")
+
   /// MERGE (Studio-Verse EventDetail depth, Phase 18E): soft archive — an
   /// archived event is hidden from guests (see lib/expiry.js, where
   /// archived counts as guest-closed) and from Photo Selection clients
