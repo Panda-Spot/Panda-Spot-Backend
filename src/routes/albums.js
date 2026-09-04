@@ -2,6 +2,7 @@ import { Router } from "express";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { prisma } from "../lib/prisma.js";
+import sharp from "sharp";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
 import { loadAccessibleEvent } from "../lib/access.js";
@@ -32,6 +33,8 @@ function pageShape(eventId, albumId, p) {
     page_number: p.pageNumber,
     filename: p.filename,
     file_size: p.fileSize,
+    width: p.width ?? null,
+    height: p.height ?? null,
     file_url: `/files/events/${eventId}/albums/${albumId}/files/${path.basename(p.storagePath)}`,
     thumbnail_url: p.thumbnailPath
       ? `/files/events/${eventId}/albums/${albumId}/files/${path.basename(p.thumbnailPath)}`
@@ -85,6 +88,7 @@ async function loadAlbum(eventId, albumId, res) {
     include: {
       versions: { include: { pages: true }, orderBy: { versionNumber: "asc" } },
       sources: { include: { photo: true }, orderBy: { createdAt: "asc" } },
+      createdBy: true,
     },
   });
   if (!album) {
@@ -110,6 +114,8 @@ async function albumDetail(eventId, album) {
     status: album.status,
     locked_at: album.lockedAt,
     created_at: album.createdAt,
+    created_by: authorShape(album.createdBy),
+    sent_at: album.sentAt,
     open_pins: openPins,
     versions: album.versions.map((v) => versionShape(eventId, album.id, v)),
     sources: album.sources.map((s) => ({
@@ -144,7 +150,7 @@ router.post("/", async (req, res, next) => {
       return res.status(400).json({ error: "name is required" });
     }
     const album = await prisma.album.create({
-      data: { eventId: event.id, name: name.trim().slice(0, 120) },
+      data: { eventId: event.id, name: name.trim().slice(0, 120), createdById: req.user.id },
     });
     // One-tap staging from Photo Selection: every event photo at least one
     // client favourited becomes a zero-cost source ref. Idempotent by the
@@ -170,6 +176,7 @@ router.post("/", async (req, res, next) => {
       name: album.name,
       status: album.status,
       created_at: album.createdAt,
+      created_by: authorShape({ id: req.user.id, name: req.user.name, email: req.user.email, role: req.user.role }),
       source_count: staged,
     });
   } catch (err) {
@@ -188,6 +195,7 @@ router.get("/", async (req, res, next) => {
       include: {
         versions: { select: { id: true, versionNumber: true, createdAt: true } },
         _count: { select: { sources: true } },
+        createdBy: true,
       },
       orderBy: { createdAt: "desc" },
     });
@@ -198,6 +206,8 @@ router.get("/", async (req, res, next) => {
         status: a.status,
         locked_at: a.lockedAt,
         created_at: a.createdAt,
+        created_by: authorShape(a.createdBy),
+        sent_at: a.sentAt,
         source_count: a._count.sources,
         version_count: a.versions.length,
         latest_version: a.versions.length ? Math.max(...a.versions.map((v) => v.versionNumber)) : null,
@@ -257,6 +267,8 @@ router.delete("/:albumId", async (req, res, next) => {
     const album = await loadAlbum(event.id, req.params.albumId, res);
     if (!album) return;
     if (!requireUnlocked(album, res)) return;
+    // Phase 4: deleting a whole project is owner-only.
+    if (!requireOwner(accessible, res)) return;
     await prisma.album.delete({ where: { id: album.id } });
     res.status(204).end();
   } catch (err) {
@@ -422,7 +434,7 @@ router.post("/:albumId/versions", versionUpload, async (req, res, next) => {
         },
       });
       if (album.status === "CHANGES_REQUESTED") {
-        await prisma.album.update({ where: { id: album.id }, data: { status: "SENT" } });
+        await prisma.album.update({ where: { id: album.id }, data: { status: "SENT", sentAt: new Date() } });
       }
       const full = await prisma.albumVersion.findUnique({
         where: { id: version.id },
@@ -450,6 +462,19 @@ router.post("/:albumId/versions", versionUpload, async (req, res, next) => {
       pageNumber += 1;
       const ext = path.extname(file.originalname).toLowerCase();
       const storagePath = await saveAlbumPage(event.id, album.id, versionNumber, `${randomUUID()}${ext}`, file.buffer);
+      // Phase 4: capture spread dimensions when detectable — best effort,
+      // never fatal to the upload.
+      let width = null;
+      let height = null;
+      try {
+        const meta = await sharp(file.buffer).metadata();
+        if (meta?.width && meta?.height) {
+          width = meta.width;
+          height = meta.height;
+        }
+      } catch {
+        // Unreadable pixels still make a valid page; dimensions stay null.
+      }
       const page = await prisma.albumPage.create({
         data: {
           versionId: version.id,
@@ -457,6 +482,8 @@ router.post("/:albumId/versions", versionUpload, async (req, res, next) => {
           storagePath,
           filename: file.originalname,
           fileSize: file.buffer.length,
+          width,
+          height,
         },
       });
       try {
@@ -471,7 +498,7 @@ router.post("/:albumId/versions", versionUpload, async (req, res, next) => {
     }
 
     if (album.status === "CHANGES_REQUESTED") {
-      await prisma.album.update({ where: { id: album.id }, data: { status: "SENT" } });
+      await prisma.album.update({ where: { id: album.id }, data: { status: "SENT", sentAt: new Date() } });
     }
     const full = await prisma.albumVersion.findUnique({
       where: { id: version.id },
@@ -514,6 +541,80 @@ router.delete("/:albumId/versions/:versionId", async (req, res, next) => {
   }
 });
 
+// Phase 4: reorder spreads inside one version. Body { order: [pageId…] }
+// must contain exactly the version's pages — positions are reassigned
+// 1..N in that order. Pins ride along (they're keyed by page id).
+router.patch("/:albumId/versions/:versionId/pages/reorder", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    if (!requireUnlocked(album, res)) return;
+    const version = album.versions.find((v) => v.id === req.params.versionId);
+    if (!version) return res.status(404).json({ error: "Version not found" });
+    if (version.printPdfPath) {
+      return res.status(400).json({ error: "Print-PDF versions have no spreads to reorder." });
+    }
+    const { order } = req.body || {};
+    const currentIds = new Set((version.pages || []).map((p) => p.id));
+    if (!Array.isArray(order) || order.length !== currentIds.size || !order.every((id) => currentIds.has(id))) {
+      return res.status(400).json({ error: "order must list exactly this version's page ids" });
+    }
+    // Two-phase (temp high numbers first): pageNumber is @@unique per
+    // version, so direct swaps would transiently collide mid-transaction.
+    await prisma.$transaction([
+      ...order.map((id, i) => prisma.albumPage.update({ where: { id }, data: { pageNumber: 100000 + i } })),
+      ...order.map((id, i) => prisma.albumPage.update({ where: { id }, data: { pageNumber: i + 1 } })),
+    ]);
+    const full = await prisma.albumVersion.findUnique({
+      where: { id: version.id },
+      include: { pages: { orderBy: { pageNumber: "asc" } } },
+    });
+    res.json(versionShape(event.id, album.id, full));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Phase 4: delete one spread. Its pins go with it (DB cascade); the rest
+// renumber to keep 1..N contiguous for the flipbook.
+router.delete("/:albumId/versions/:versionId/pages/:pageId", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    if (!requireUnlocked(album, res)) return;
+    const version = album.versions.find((v) => v.id === req.params.versionId);
+    if (!version) return res.status(404).json({ error: "Version not found" });
+    const page = (version.pages || []).find((p) => p.id === req.params.pageId);
+    if (!page) return res.status(404).json({ error: "Page not found" });
+    if ((version.pages || []).length <= 1) {
+      return res.status(409).json({ error: "A version needs at least one spread — delete the version instead." });
+    }
+    await deleteFileIfExists(page.storagePath);
+    if (page.thumbnailPath) await deleteFileIfExists(page.thumbnailPath);
+    await prisma.albumPage.delete({ where: { id: page.id } });
+    const remaining = await prisma.albumPage.findMany({
+      where: { versionId: version.id },
+      orderBy: { pageNumber: "asc" },
+      select: { id: true },
+    });
+    await prisma.$transaction([
+      ...remaining.map((p, i) => prisma.albumPage.update({ where: { id: p.id }, data: { pageNumber: 100000 + i } })),
+      ...remaining.map((p, i) => prisma.albumPage.update({ where: { id: p.id }, data: { pageNumber: i + 1 } })),
+    ]);
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- Review lifecycle ---
 
 router.post("/:albumId/send", async (req, res, next) => {
@@ -533,18 +634,31 @@ router.post("/:albumId/send", async (req, res, next) => {
     if (!hasContent) {
       return res.status(400).json({ error: "Upload at least one version with spreads before sending." });
     }
-    const updated = await prisma.album.update({ where: { id: album.id }, data: { status: "SENT" } });
-    res.json({ status: updated.status });
+    const updated = await prisma.album.update({
+      where: { id: album.id },
+      data: { status: "SENT", sentAt: new Date() },
+    });
+    res.json({ status: updated.status, sent_at: updated.sentAt });
   } catch (err) {
     next(err);
   }
 });
+
+function requireOwner(accessible, res) {
+  if (accessible.role !== "owner") {
+    res.status(403).json({ error: "Only the event owner can do that — collaborators have review powers, not destructive ones." });
+    return false;
+  }
+  return true;
+}
 
 router.post("/:albumId/reopen", async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
+    // Phase 4: unlocking an approved album is owner-only.
+    if (!requireOwner(accessible, res)) return;
 
     const album = await loadAlbum(event.id, req.params.albumId, res);
     if (!album) return;

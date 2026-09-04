@@ -58,6 +58,8 @@ model User {
   studioFavourites  StudioFavourite[]
   /// Album proofing authorship (pins + replies, Phase 23).
   albumComments     AlbumComment[]
+  /// Album projects created by this user (Phase 4 audit).
+  albumsCreated     Album[]
 
   /// MERGE (Studio-Verse Billing & Subscriptions): this ADMIN-role user
   /// acting as the studio ("tenant" in Studio-Verse's terms — this merge
@@ -1119,6 +1121,11 @@ model Album {
   lockedAt  DateTime?
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
+  /// Phase 4: who created the project (SetNull — the album survives its
+  /// creator) and when it was last sent for review. Null on pre-Phase-4 rows.
+  createdById String?
+  createdBy   User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  sentAt      DateTime?
 
   sources  AlbumSource[]
   versions AlbumVersion[]
@@ -1170,6 +1177,10 @@ model AlbumPage {
   thumbnailPath String?
   filename     String
   fileSize     Int          @default(0)
+  /// Phase 4: spread pixel dimensions when detectable at upload
+  /// (sharp metadata; null for PDFs/unreadable files).
+  width        Int?
+  height       Int?
   createdAt    DateTime     @default(now())
 
   comments AlbumComment[]
