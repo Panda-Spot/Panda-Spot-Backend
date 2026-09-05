@@ -362,4 +362,180 @@ router.post("/events/:id/download-zip", async (req, res, next) => {
   }
 });
 
+// --- Studio suite: contracts + questionnaires (Phase 12) ---
+// Assignment matching is by email OR user id — whichever the studio set.
+
+function clientContractVisible(contract, user) {
+  if (!contract) return false;
+  if (contract.clientUserId && contract.clientUserId === user.id) return true;
+  if (contract.clientEmail && contract.clientEmail.toLowerCase() === (user.email || "").toLowerCase()) return true;
+  return false;
+}
+
+router.get("/contracts", async (req, res, next) => {
+  try {
+    const email = (req.user.email || "").toLowerCase();
+    const rows = await prisma.clientContract.findMany({
+      where: { OR: [{ clientUserId: req.user.id }, ...(email ? [{ clientEmail: email }] : [])] },
+      include: { template: { select: { name: true } }, event: { select: { id: true, name: true } } },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(
+      rows.map((c) => ({
+        id: c.id,
+        template_name: c.template?.name || null,
+        event: c.event,
+        status: c.status,
+        signature_name: c.signatureName,
+        accepted_at: c.acceptedAt,
+        created_at: c.createdAt,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/contracts/:id", async (req, res, next) => {
+  try {
+    const contract = await prisma.clientContract.findUnique({
+      where: { id: req.params.id },
+      include: { template: { select: { name: true } }, event: { select: { id: true, name: true } } },
+    });
+    if (!contract || !clientContractVisible(contract, req.user)) {
+      return res.status(404).json({ error: "Contract not found" });
+    }
+    res.json({
+      id: contract.id,
+      template_name: contract.template?.name || null,
+      event: contract.event,
+      status: contract.status,
+      signature_name: contract.signatureName,
+      accepted_at: contract.acceptedAt,
+      created_at: contract.createdAt,
+      file_url: contract.templateId ? `/client/contracts/${contract.id}/file` : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/contracts/:id/file", async (req, res, next) => {
+  try {
+    const contract = await prisma.clientContract.findUnique({
+      where: { id: req.params.id },
+      include: { template: true },
+    });
+    if (!contract || !clientContractVisible(contract, req.user)) {
+      return res.status(404).json({ error: "Contract not found" });
+    }
+    if (!contract.template?.filePath) {
+      return res.status(404).json({ error: "Contract file not available" });
+    }
+    const { existsSync } = await import("../lib/storage.js");
+    if (!existsSync(contract.template.filePath)) {
+      return res.status(404).json({ error: "Contract file missing" });
+    }
+    res.setHeader("Content-Type", "application/pdf");
+    res.sendFile(contract.template.filePath);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Checkbox foundation for signing: name + timestamp. E-signature
+// providers slot in later without changing this contract.
+router.post("/contracts/:id/accept", async (req, res, next) => {
+  try {
+    const contract = await prisma.clientContract.findUnique({ where: { id: req.params.id } });
+    if (!contract || !clientContractVisible(contract, req.user)) {
+      return res.status(404).json({ error: "Contract not found" });
+    }
+    if (contract.status === "signed") {
+      return res.json({ id: contract.id, status: contract.status, accepted_at: contract.acceptedAt });
+    }
+    const { name } = req.body || {};
+    if (!name || typeof name !== "string" || !name.trim() || name.length > 120) {
+      return res.status(400).json({ error: "Please type your full name to accept" });
+    }
+    const updated = await prisma.clientContract.update({
+      where: { id: contract.id },
+      data: { status: "signed", signatureName: name.trim(), acceptedAt: new Date() },
+    });
+    res.json({ id: updated.id, status: updated.status, accepted_at: updated.acceptedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/questionnaires", async (req, res, next) => {
+  try {
+    const email = (req.user.email || "").toLowerCase();
+    const rows = await prisma.questionnaireAssignment.findMany({
+      where: {
+        OR: [{ clientUserId: req.user.id }, ...(email ? [{ clientEmail: email }] : [])],
+      },
+      include: {
+        questionnaire: true,
+        event: { select: { id: true, name: true } },
+        response: true,
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(
+      rows.map((a) => ({
+        assignment_id: a.id,
+        questionnaire: { id: a.questionnaire.id, title: a.questionnaire.title, questions: a.questionnaire.questions },
+        event: a.event,
+        submitted: !!a.response,
+        submitted_at: a.response?.submittedAt || null,
+        answers: a.response?.answers || null,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/questionnaires/:assignmentId/respond", async (req, res, next) => {
+  try {
+    const assignment = await prisma.questionnaireAssignment.findUnique({
+      where: { id: req.params.assignmentId },
+      include: { questionnaire: true },
+    });
+    if (!assignment) return res.status(404).json({ error: "Questionnaire not found" });
+    const email = (req.user.email || "").toLowerCase();
+    const mine =
+      (assignment.clientUserId && assignment.clientUserId === req.user.id) ||
+      (assignment.clientEmail && assignment.clientEmail.toLowerCase() === email);
+    if (!mine) return res.status(404).json({ error: "Questionnaire not found" });
+    if (!assignment.questionnaire.active) {
+      return res.status(409).json({ error: "This questionnaire is closed." });
+    }
+    const { answers } = req.body || {};
+    if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+      return res.status(400).json({ error: "answers must be an object keyed by question id" });
+    }
+    const questions = Array.isArray(assignment.questionnaire.questions) ? assignment.questionnaire.questions : [];
+    const ids = new Set(questions.map((q) => q.id));
+    for (const [qid, answer] of Object.entries(answers)) {
+      if (!ids.has(qid)) return res.status(400).json({ error: `Unknown question: ${qid}` });
+      if (answer !== null && typeof answer !== "string" && !Array.isArray(answer)) {
+        return res.status(400).json({ error: `Answer for ${qid} must be text or a list` });
+      }
+      if (typeof answer === "string" && answer.length > 5000) {
+        return res.status(400).json({ error: `Answer for ${qid} is too long` });
+      }
+    }
+    const saved = await prisma.questionnaireResponse.upsert({
+      where: { assignmentId: assignment.id },
+      create: { assignmentId: assignment.id, answers },
+      update: { answers, submittedAt: new Date() },
+    });
+    res.status(201).json({ submitted_at: saved.submittedAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;

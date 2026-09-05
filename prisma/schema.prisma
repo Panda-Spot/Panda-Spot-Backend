@@ -70,6 +70,14 @@ model User {
   /// Phase 11 (branded galleries): own themes + claimed hosts.
   galleryThemes     GalleryTheme[]
   studioDomains     StudioDomain[]
+  /// Phase 12 (studio management): tenant-owned pipeline rows.
+  bookingInquiries  BookingInquiry[]
+  studioPackages    StudioPackage[]
+  contractTemplates ContractTemplate[]
+  clientContracts   ClientContract[]
+  questionnaires    Questionnaire[]
+  bookings          Booking[]
+  expenses          Expense[]
 
   /// MERGE (Studio-Verse Billing & Subscriptions): this ADMIN-role user
   /// acting as the studio ("tenant" in Studio-Verse's terms — this merge
@@ -306,6 +314,11 @@ model Event {
   /// Phase 10 (lead capture): contact rows + activity trail per guest.
   leads         GuestLead[]
   activities    GuestActivity[]
+  /// Phase 12: contracts, questionnaires, bookings, expenses per event.
+  clientContracts ClientContract[]
+  questionnaireAssignments QuestionnaireAssignment[]
+  bookings        Booking[]
+  expenses        Expense[]
   /// Phase 11 (branded galleries): per-event theme override (null =
   /// studio default, then built-in default).
   galleryThemeId String?
@@ -1352,6 +1365,10 @@ model GuestActivity {
   @@index([guestClientId])
 }
 
+/// Phase 12 (business studio management): suite models. Everything is
+/// tenant-scoped (ADMIN User IS the tenant) so studios only ever see
+/// their own pipeline. Amounts are Decimal(10,2) like the billing module.
+
 /// Phase 11 (branded galleries): a gallery theme. ownerId null = one of
 /// the built-in presets (wedding, corporate, birthday, minimal,
 /// premium); otherwise a studio's own customization. All styling is
@@ -1408,4 +1425,163 @@ model StudioDomain {
   updatedAt DateTime @updatedAt
 
   @@index([ownerId])
+}
+
+/// Public booking inquiry for one studio (filed via /inquire/:slug).
+/// Converts into an Event + client invite + Booking via the convert route.
+model BookingInquiry {
+  id               String    @id @default(uuid())
+  tenantId         String
+  tenant           User      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name             String
+  phone            String?
+  email            String
+  eventType        String?
+  eventDate        DateTime?
+  message          String?
+  /// new | contacted | converted | lost
+  status           String    @default("new")
+  convertedEventId String?
+  createdAt        DateTime  @default(now())
+
+  @@index([tenantId, status])
+}
+
+/// A sellable package: name, price, deliverables, and included counts.
+model StudioPackage {
+  id             String   @id @default(uuid())
+  tenantId       String
+  tenant         User     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name           String
+  price          Decimal  @db.Decimal(10, 2)
+  deliverables   String[]
+  includedPhotos Int      @default(0)
+  includedAlbums Int      @default(0)
+  includedEvents Int      @default(1)
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+/// An uploaded contract template (PDF) the studio assigns to clients.
+model ContractTemplate {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    User     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  filePath  String
+  fileSize  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  contracts ClientContract[]
+
+  @@index([tenantId])
+}
+
+/// A contract assigned to one client (optionally tied to an event).
+/// Checkbox foundation: accepted + signatureName + acceptedAt; full
+/// e-signature integration slots in later without schema churn.
+model ClientContract {
+  id            String    @id @default(uuid())
+  tenantId      String
+  tenant        User      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  templateId    String?
+  template      ContractTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  eventId       String?
+  event         Event?    @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  clientEmail   String
+  clientUserId  String?
+  /// sent | signed
+  status        String    @default("sent")
+  signatureName String?
+  acceptedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([tenantId, status])
+  @@index([clientEmail])
+}
+
+/// A reusable client questionnaire: ordered questions as JSON
+/// [{ id, label, type: text|choice|date, options?: string[] }].
+model Questionnaire {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    User     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  title     String
+  questions Json     @default("[]")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  assignments QuestionnaireAssignment[]
+
+  @@index([tenantId])
+}
+
+model QuestionnaireAssignment {
+  id              String   @id @default(uuid())
+  questionnaireId String
+  questionnaire   Questionnaire @relation(fields: [questionnaireId], references: [id], onDelete: Cascade)
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  clientEmail     String?
+  clientUserId    String?
+  createdAt       DateTime @default(now())
+
+  response QuestionnaireResponse?
+
+  @@index([questionnaireId])
+  @@index([eventId])
+}
+
+model QuestionnaireResponse {
+  id           String   @id @default(uuid())
+  assignmentId String   @unique
+  assignment   QuestionnaireAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  /// { [questionId]: answer }
+  answers      Json
+  submittedAt  DateTime @default(now())
+}
+
+/// A booking: the money side of an event. billId optionally links the
+/// billing module's Bill (advance/balance derive from its payments);
+/// agreedAmount is the fallback when no bill exists yet.
+model Booking {
+  id            String    @id @default(uuid())
+  tenantId      String
+  tenant        User      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  inquiryId     String?
+  clientName    String
+  clientEmail   String?
+  clientPhone   String?
+  eventType     String?
+  eventDate     DateTime?
+  packageId     String?
+  eventId       String?
+  event         Event?    @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  agreedAmount  Decimal?  @db.Decimal(10, 2)
+  billId        String?
+  /// inquiry | confirmed | completed | cancelled
+  status        String    @default("inquiry")
+  notes         String?
+  createdAt     DateTime  @default(now())
+
+  @@index([tenantId, status])
+}
+
+model Expense {
+  id        String    @id @default(uuid())
+  tenantId  String
+  tenant    User      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  eventId   String?
+  event     Event?    @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  category  String
+  amount    Decimal   @db.Decimal(10, 2)
+  vendor    String?
+  notes     String?
+  spentAt   DateTime  @default(now())
+  createdAt DateTime  @default(now())
+
+  @@index([tenantId])
+  @@index([eventId])
 }

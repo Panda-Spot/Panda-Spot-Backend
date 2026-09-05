@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 const STORAGE_DIR = process.env.STORAGE_DIR || "./storage";
 
@@ -213,6 +214,22 @@ export async function removeEventDir(eventId) {
 /** Absolute directory for a given user's branding assets. */
 export function brandingDir(userId) {
   return path.join(storageRoot(), "branding", userId);
+}
+
+/** Tenant-scoped directory for uploaded contract templates (Phase 12). */
+export function contractsDir(tenantId) {
+  return path.join(storageRoot(), "contracts", tenantId);
+}
+
+/** Saves a contract template PDF under a uuid filename (original name
+ * kept on the DB row for display). */
+export async function saveContractTemplate(tenantId, filename, buffer) {
+  const dir = contractsDir(tenantId);
+  await fsp.mkdir(dir, { recursive: true });
+  const ext = path.extname(filename).toLowerCase() || ".pdf";
+  const fullPath = path.join(dir, `${randomUUID()}${ext}`);
+  await fsp.writeFile(fullPath, buffer);
+  return fullPath;
 }
 
 /**
