@@ -26,7 +26,7 @@ import {
   guestCommentLimiter,
 } from "../lib/rateLimiters.js";
 import { isExpired } from "../lib/expiry.js";
-import { checkGalleryAccess, checkAccessKey, galleryAccessFlags, signGalleryToken } from "../lib/galleryAccess.js";
+import { checkGalleryAccess, checkAccessKey, galleryAccessFlags, signGalleryToken, brandContext } from "../lib/galleryAccess.js";
 import { resolveHost, resolveThemeForEvent } from "../lib/studioBranding.js";
 import { isLeadComplete, leadConsentText, logActivity, requireLeadFor, touchLead } from "../lib/guestLeads.js";
 import {
@@ -107,6 +107,14 @@ function photoResponseShape(event, photo) {
   };
 }
 
+// Branded expiry denial (audit gap fix): the 410 carries studio branding
+// + event name so guest/TV surfaces render a branded closed screen
+// without an extra metadata round-trip.
+async function expiredDenied(event, res) {
+  const brand = await brandContext(event.id);
+  return res.status(410).json({ error: "This event's guest access has closed.", code: "expired", ...brand });
+}
+
 router.get("/:slug", async (req, res, next) => {
   try {
     const event = await prisma.event.findUnique({
@@ -177,7 +185,8 @@ router.post("/:slug/unlock", guestSearchLimiter, async (req, res, next) => {
     }
     const { access_key: key } = req.body || {};
     if (!(await checkAccessKey(event, key))) {
-      return res.status(401).json({ error: "That access key didn't match — check with your photographer.", code: "locked" });
+      const brand = await brandContext(event.id);
+      return res.status(401).json({ error: "That access key didn't match — check with your photographer.", code: "locked", ...brand });
     }
     res.json({ gallery_token: signGalleryToken({ eventId: event.id, slug: event.guestSlug }), expires_in: Number(process.env.GALLERY_TOKEN_TTL_SECONDS || 12 * 60 * 60) });
   } catch (err) {
@@ -197,7 +206,10 @@ router.use("/:slug", async (req, res, next) => {
     }
     if (isExpired(event)) return next();
     const denied = checkGalleryAccess(event, req);
-    if (denied) return res.status(denied.status).json(denied.body);
+    if (denied) {
+      const brand = await brandContext(event.id);
+      return res.status(denied.status).json({ ...denied.body, ...brand });
+    }
     next();
   } catch (err) {
     next(err);
@@ -217,7 +229,7 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       return res.status(404).json({ error: "Event not found" });
     }
     if (isExpired(event)) {
-      return res.status(410).json({ error: "This event's guest access has closed." });
+      return expiredDenied(event, res);
     }
     // MERGE (Studio-Verse): the studio has this feature off — see
     // MERGE_PLAN.md D6. Independent of Photo Selection's own state.
@@ -387,7 +399,7 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
       return res.status(404).json({ error: "Event not found" });
     }
     if (isExpired(event)) {
-      return res.status(410).json({ error: "This event's guest access has closed." });
+      return expiredDenied(event, res);
     }
     if (!event.faceSearchEnabled) {
       return res.status(403).json({ error: "Face Search isn't turned on for this event." });
@@ -795,7 +807,7 @@ router.get("/:slug/gallery", async (req, res, next) => {
       return res.status(404).json({ error: "Event not found" });
     }
     if (isExpired(event)) {
-      return res.status(410).json({ error: "This event's guest access has closed." });
+      return expiredDenied(event, res);
     }
     // Phase 10: first-sight lead row + gallery-open activity (best-effort,
     // guest id is optional on this read-only route).
@@ -831,7 +843,7 @@ router.get("/:slug/tv", async (req, res, next) => {
       return res.status(404).json({ error: "Event not found" });
     }
     if (isExpired(event)) {
-      return res.status(410).json({ error: "This event's guest access has closed." });
+      return expiredDenied(event, res);
     }
     const highlightsOnly = (event.tvMode || "all") === "highlights";
     const photos = await prisma.photo.findMany({

@@ -103,3 +103,26 @@ export function galleryAccessFlags(event) {
     login_required: mode === "client_login" || mode === "invite_only",
   };
 }
+
+/// Brand context for denial bodies (audit gap fix): locked / login-only
+/// / expired JSON responses carry the studio branding + event name so API
+/// consumers (and the TV wall) can render a branded screen without an
+/// extra metadata round-trip. Best-effort — failures yield {} rather than
+/// breaking the denial itself.
+export async function brandContext(eventId) {
+  try {
+    const event = await prisma.event.findUnique({
+      where: { id: eventId },
+      include: { owner: true },
+    });
+    if (!event) return {};
+    return {
+      event_name: event.name,
+      studio_name: event.owner?.studioName ?? null,
+      logo_url: event.owner?.logoPath ? `/files/branding/${event.owner.id}/logo` : null,
+      brand_color: event.owner?.brandColor ?? null,
+    };
+  } catch {
+    return {};
+  }
+}

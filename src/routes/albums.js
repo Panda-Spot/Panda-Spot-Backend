@@ -660,6 +660,76 @@ router.delete("/:albumId/versions/:versionId/pages/:pageId", async (req, res, ne
   }
 });
 
+// Gap fix (audit): in-place single-spread file replacement — swap one
+// spread's pixels without touching page order, pins, or the revision.
+// Multipart field `image`; unlocked image versions only.
+router.put("/:albumId/versions/:versionId/pages/:pageId/file", upload.single("image"), async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const album = await loadAlbum(event.id, req.params.albumId, res);
+    if (!album) return;
+    if (!requireUnlocked(album, res)) return;
+    const version = album.versions.find((v) => v.id === req.params.versionId);
+    if (!version) return res.status(404).json({ error: "Version not found" });
+    if (version.printPdfPath) {
+      return res.status(400).json({ error: "Print-PDF versions have no spreads to replace." });
+    }
+    const page = (version.pages || []).find((p) => p.id === req.params.pageId);
+    if (!page) return res.status(404).json({ error: "Page not found" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No image uploaded (expected multipart field 'image')" });
+    }
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext) || ext === ".pdf") {
+      return res.status(415).json({ error: `Unsupported spread file type: ${req.file.originalname}` });
+    }
+    if (!contentMatchesExtension(req.file.buffer, ext)) {
+      return res.status(415).json({ error: `File content doesn't match its extension: ${req.file.originalname}` });
+    }
+    let width = null;
+    let height = null;
+    try {
+      const meta = await sharp(req.file.buffer).metadata();
+      if (meta?.width && meta?.height) {
+        width = meta.width;
+        height = meta.height;
+      }
+    } catch {
+      // Unreadable pixels still replace the file; dimensions stay null.
+    }
+    const storagePath = await saveAlbumPage(event.id, album.id, version.versionNumber, `${randomUUID()}${ext}`, req.file.buffer);
+    await deleteFileIfExists(page.storagePath);
+    if (page.thumbnailPath) await deleteFileIfExists(page.thumbnailPath);
+    let thumbnailPath = null;
+    try {
+      thumbnailPath = await generateThumbnail(req.file.buffer, event.id, page.id);
+    } catch {
+      // Flipbook falls back to the full file.
+    }
+    await prisma.albumPage.update({
+      where: { id: page.id },
+      data: {
+        storagePath,
+        thumbnailPath,
+        filename: req.file.originalname,
+        fileSize: req.file.buffer.length,
+        width,
+        height,
+      },
+    });
+    const full = await prisma.albumVersion.findUnique({
+      where: { id: version.id },
+      include: { pages: { orderBy: { pageNumber: "asc" } } },
+    });
+    res.json(versionShape(event.id, album.id, full));
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Phase 7: start a new revision FROM the current spreads — the new
 // version gets its own file copies (copy-on-write), so reworking or
 // replacing pages never disturbs the preserved revision. Body

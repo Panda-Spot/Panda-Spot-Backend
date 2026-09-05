@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { loadAccessibleEvent } from "../lib/access.js";
-import { streamPhotosZip, zipFilenameForEvent } from "../lib/zip.js";
+import { streamPhotosZip } from "../lib/zip.js";
 import {
   buildProofingPdf,
   buildSelectionCsv,
@@ -20,6 +20,9 @@ const router = Router({ mergeParams: true });
 /// no finer permission flags — membership IS event media access, same as
 /// every other studio route including the existing gallery zips); the
 /// client self-service counterparts live in routes/client.js.
+/// NOTE (spec §5 audit): allow_download gates CLIENT exports only — the
+/// studio's own exports intentionally ignore it (its own data; same rule
+/// as the full-gallery studio zip in routes/events.js).
 router.use(requireAuth);
 
 function scopeOf(req) {
@@ -119,9 +122,13 @@ router.get("/download-zip", async (req, res, next) => {
   if (!selection) return;
   try {
     const label = labelFor(selection);
-    const base = zipFilenameForEvent(selection.event).replace(/-photos\.zip$/, "");
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="${base}-${label}-selection.zip"`);
+    // Same slugged naming as the CSV/TXT/PDF exports (raw client names
+    // must never reach Content-Disposition unescaped).
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${exportFilename(selection.event.name, `${label}-selection`, "zip")}"`
+    );
     await streamPhotosZip(selection.photos, res);
   } catch (err) {
     console.error(`Selection export failed (zip event=${req.params.id} q=${JSON.stringify(req.query)}):`, err);
