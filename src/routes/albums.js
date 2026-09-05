@@ -10,6 +10,7 @@ import { ALLOWED_EXTENSIONS, deleteFileIfExists, saveAlbumPage } from "../lib/st
 import { contentMatchesExtension } from "../lib/fileValidation.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { streamPhotosZip, zipFilenameForEvent } from "../lib/zip.js";
+import { resolveThemeForEvent } from "../lib/studioBranding.js";
 import { readFile } from "node:fs/promises";
 import { buildAlbumProofPdf } from "../lib/albumProof.js";
 import { exportFilename } from "../lib/selectionExport.js";
@@ -112,6 +113,11 @@ async function albumDetail(eventId, album) {
     orderBy: { createdAt: "asc" },
   });
   const openPins = comments.filter((c) => !c.parentId && c.pinNumber != null && !c.resolvedAt).length;
+  // Phase 11: the review pages theme themselves like the galleries.
+  const fullEvent = await prisma.event.findUnique({
+    where: { id: eventId },
+    include: { owner: { include: { defaultGalleryTheme: true } }, galleryTheme: true },
+  }).catch(() => null);
   return {
     id: album.id,
     name: album.name,
@@ -121,6 +127,7 @@ async function albumDetail(eventId, album) {
     created_by: authorShape(album.createdBy),
     sent_at: album.sentAt,
     open_pins: openPins,
+    theme: resolveThemeForEvent(fullEvent),
     versions: album.versions.map((v) => versionShape(eventId, album.id, v)),
     sources: album.sources.map((s) => ({
       photo_id: s.photo.id,

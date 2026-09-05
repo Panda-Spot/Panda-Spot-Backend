@@ -27,6 +27,7 @@ import {
 } from "../lib/rateLimiters.js";
 import { isExpired } from "../lib/expiry.js";
 import { checkGalleryAccess, checkAccessKey, galleryAccessFlags, signGalleryToken } from "../lib/galleryAccess.js";
+import { resolveHost, resolveThemeForEvent } from "../lib/studioBranding.js";
 import { isLeadComplete, leadConsentText, logActivity, requireLeadFor, touchLead } from "../lib/guestLeads.js";
 import {
   PRIVACY_CONSENT_VERSION,
@@ -110,11 +111,18 @@ router.get("/:slug", async (req, res, next) => {
   try {
     const event = await prisma.event.findUnique({
       where: { guestSlug: req.params.slug },
-      include: { owner: true, subGalleries: { orderBy: { createdAt: "asc" } } },
+      include: {
+        owner: { include: { defaultGalleryTheme: true } },
+        galleryTheme: true,
+        subGalleries: { orderBy: { createdAt: "asc" } },
+      },
     });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
+    // Phase 11: host-aware theme — event override, studio default, then
+    // built-in default. Unknown hosts just get the default theme.
+    const host = await resolveHost(req.get("x-forwarded-host") || req.get("host")).catch(() => ({ ownerId: null, via: null }));
     res.json({
       id: event.id,
       name: event.name,
@@ -145,6 +153,9 @@ router.get("/:slug", async (req, res, next) => {
       ...galleryAccessFlags(event),
       // Phase 10 (lead capture): the guest form + gates render from this.
       lead_capture_mode: event.leadCaptureMode || "disabled",
+      // Phase 11: resolved gallery theme + host context.
+      theme: resolveThemeForEvent(event),
+      host: host.via ? { matched: true, via: host.via } : { matched: false },
     });
   } catch (err) {
     next(err);
@@ -814,7 +825,7 @@ router.get("/:slug/tv", async (req, res, next) => {
   try {
     const event = await prisma.event.findUnique({
       where: { guestSlug: req.params.slug },
-      include: { owner: true },
+      include: { owner: { include: { defaultGalleryTheme: true } }, galleryTheme: true },
     });
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
@@ -851,6 +862,7 @@ router.get("/:slug/tv", async (req, res, next) => {
         sponsor_logo_url: event.sponsorLogoPath ? `/files/events/${event.id}/sponsor-logo` : null,
       },
       qr_target: `/e/${event.guestSlug}`,
+      theme: resolveThemeForEvent(event),
       photo_count: stills.length,
       highlights_only: highlightsOnly,
       photos: stills.map((p) => photoResponseShape(event, p)),

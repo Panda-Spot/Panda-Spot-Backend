@@ -40,6 +40,13 @@ model User {
   /// photographer's events (not per-event — see server/README.md's branding notes).
   studioName String?
   logoPath   String?
+  /// Phase 11 (branded galleries): per-studio subdomain slug for
+  /// <slug>.<base-domain> URLs (e.g. abcstudio.pandaspot.in). Claimed
+  /// first-come from the themes page; null until claimed.
+  studioSlug String?  @unique
+  /// Phase 11: studio-wide default gallery theme (events may override).
+  defaultGalleryThemeId String?
+  defaultGalleryTheme   GalleryTheme? @relation("UserDefaultTheme", fields: [defaultGalleryThemeId], references: [id], onDelete: SetNull)
   /// Optional watermark overlay image (mirrors Studio-Verse's watermark
   /// upload) — shown centered over protected client-gallery photos when
   /// set, falling back to the studio-name text watermark otherwise.
@@ -60,6 +67,9 @@ model User {
   albumComments     AlbumComment[]
   /// Album projects created by this user (Phase 4 audit).
   albumsCreated     Album[]
+  /// Phase 11 (branded galleries): own themes + claimed hosts.
+  galleryThemes     GalleryTheme[]
+  studioDomains     StudioDomain[]
 
   /// MERGE (Studio-Verse Billing & Subscriptions): this ADMIN-role user
   /// acting as the studio ("tenant" in Studio-Verse's terms — this merge
@@ -296,6 +306,10 @@ model Event {
   /// Phase 10 (lead capture): contact rows + activity trail per guest.
   leads         GuestLead[]
   activities    GuestActivity[]
+  /// Phase 11 (branded galleries): per-event theme override (null =
+  /// studio default, then built-in default).
+  galleryThemeId String?
+  galleryTheme   GalleryTheme? @relation(fields: [galleryThemeId], references: [id], onDelete: SetNull)
 
   /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
   /// — a freshly-created event has no upload/import/PandaShoots UI at all
@@ -1336,4 +1350,62 @@ model GuestActivity {
 
   @@index([eventId, createdAt])
   @@index([guestClientId])
+}
+
+/// Phase 11 (branded galleries): a gallery theme. ownerId null = one of
+/// the built-in presets (wedding, corporate, birthday, minimal,
+/// premium); otherwise a studio's own customization. All styling is
+/// validated tokens (hex colors, allowlisted fonts/enums) — never raw
+/// CSS — so applying a theme can't inject styles or scripts.
+model GalleryTheme {
+  id          String   @id @default(uuid())
+  ownerId     String?
+  owner       User?    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  /// wedding | corporate | birthday | minimal | premium | custom
+  preset      String   @default("custom")
+  primaryColor   String @default("#D4AF37")
+  accentColor    String @default("#D4AF37")
+  backgroundColor String @default("#0A0A0B")
+  textColor      String @default("#F5F1E8")
+  /// serif | sans | script-accent — rendered from bundled stacks only.
+  fontFamily  String   @default("sans")
+  /// rounded | pill | square
+  buttonStyle String   @default("rounded")
+  /// grid | masonry | cinematic
+  galleryLayout String @default("grid")
+  /// text | logo | none
+  watermarkStyle String @default("text")
+  /// Premium controls: hide "Powered by PandaSpot", and use the
+  /// studio-styled share card.
+  hidePandaSpotBrand Boolean @default(false)
+  customShareCard    Boolean @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  defaultForUsers User[]  @relation("UserDefaultTheme")
+  events          Event[]
+
+  @@index([ownerId])
+}
+
+/// Phase 11: a hostname pointing at a studio — either a
+/// <slug>.<base-domain> PandaSubdomain (auto-verified, we own the DNS)
+/// or a studio-owned CUSTOM_DOMAIN (verified via CNAME/TXT proof).
+model StudioDomain {
+  id        String   @id @default(uuid())
+  host      String   @unique
+  /// PANDA_SUBDOMAIN | CUSTOM_DOMAIN
+  type      String
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  /// pending | dns_ready | verified | failed
+  status    String   @default("pending")
+  /// Expected TXT value proving control (pandaspot-verify=<token>).
+  verificationToken String?
+  verifiedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
 }

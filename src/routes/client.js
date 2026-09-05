@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
 import { signMediaToken } from "../lib/mediaTokens.js";
+import { resolveThemeForEvent } from "../lib/studioBranding.js";
 import { streamPhotosZip, zipFilenameForEvent } from "../lib/zip.js";
 import {
   buildProofingPdf,
@@ -26,7 +27,22 @@ router.use(requireAuth, requireRole("USER"));
 async function loadClientAccess(req, res) {
   const mapping = await prisma.eventUserMapping.findUnique({
     where: { eventId_userId: { eventId: req.params.id, userId: req.user.id } },
-    include: { event: { include: { owner: { select: { studioName: true, watermarkIntensity: true, brandColor: true, watermarkImagePath: true } } } } },
+    include: {
+      event: {
+        include: {
+          owner: {
+            select: {
+              studioName: true,
+              watermarkIntensity: true,
+              brandColor: true,
+              watermarkImagePath: true,
+              defaultGalleryTheme: true,
+            },
+          },
+          galleryTheme: true,
+        },
+      },
+    },
   });
   if (!mapping) {
     res.status(404).json({ error: "You don't have access to this event" });
@@ -122,6 +138,8 @@ router.get("/events/:id", async (req, res, next) => {
       watermark_image_url: mapping.event.owner?.watermarkImagePath
         ? `/files/branding/${mapping.event.ownerId}/watermark`
         : null,
+      // Phase 11: same theme resolution as the public gallery.
+      theme: resolveThemeForEvent(mapping.event),
     });
   } catch (err) {
     next(err);

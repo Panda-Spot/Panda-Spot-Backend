@@ -308,6 +308,8 @@ router.get("/:id", async (req, res, next) => {
       tv_show_qr: event.tvShowQr,
       sponsor_name: event.sponsorName,
       sponsor_logo_url: event.sponsorLogoPath ? `/files/events/${event.id}/sponsor-logo` : null,
+      // Phase 11: assigned theme id (null = studio default).
+      gallery_theme_id: event.galleryThemeId,
       // Phase 3 (gallery access upgrade): settings panel source of truth
       // (key itself never leaves the server — only whether one is set).
       access_mode: event.accessMode,
@@ -650,6 +652,22 @@ router.patch("/:id", async (req, res, next) => {
         return res.status(400).json({ error: 'lead_capture_mode must be "disabled", "optional", "required_search" or "required_download"' });
       }
       data.leadCaptureMode = mode;
+    }
+    // Phase 11 (branded galleries): per-event theme override — own theme
+    // or null to fall back to the studio default. (Built-in presets live
+    // client-side; customizing one saves a studio-owned copy first.)
+    if (req.body?.gallery_theme_id !== undefined) {
+      const themeId = req.body.gallery_theme_id;
+      if (themeId !== null) {
+        if (typeof themeId !== "string") {
+          return res.status(400).json({ error: "gallery_theme_id must be a theme id, or null to clear" });
+        }
+        const theme = await prisma.galleryTheme.findFirst({
+          where: { id: themeId, OR: [{ ownerId: req.user.id }, { ownerId: null }] },
+        });
+        if (!theme) return res.status(404).json({ error: "Theme not found" });
+      }
+      data.galleryThemeId = themeId;
     }
 
     // Private key lifecycle: a plaintext access_key sets a fresh bcrypt

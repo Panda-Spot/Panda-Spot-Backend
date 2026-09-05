@@ -5,6 +5,19 @@ import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
 import { IMAGE_EXTENSIONS, deleteFileIfExists, saveBrandingLogo, saveBrandingWatermark } from "../lib/storage.js";
 import { contentMatchesExtension } from "../lib/fileValidation.js";
+import {
+  PRESET_THEMES,
+  THEME_PRESETS,
+  baseDomain,
+  galleryCnameTarget,
+  newVerificationToken,
+  resolveHost,
+  resolveThemeForEvent,
+  sanitizeThemeInput,
+  slugifyStudio,
+  themeShape,
+  verifyDomainDns,
+} from "../lib/studioBranding.js";
 
 const router = Router();
 
@@ -151,6 +164,254 @@ router.patch("/profile", async (req, res, next) => {
       update: data,
     });
     res.json(profileResponse(row));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Gallery themes (Phase 11) ---
+// Own themes plus the built-in preset catalog. Theme styling is
+// validated tokens only (see lib/studioBranding.js) — never raw CSS.
+
+router.get("/themes", async (req, res, next) => {
+  try {
+    const themes = await prisma.galleryTheme.findMany({
+      where: { ownerId: req.user.id },
+      orderBy: { createdAt: "desc" },
+    });
+    const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { defaultGalleryThemeId: true } });
+    res.json({
+      presets: PRESET_THEMES,
+      default_theme_id: user?.defaultGalleryThemeId || null,
+      themes: themes.map(themeShape),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Create from scratch or from a preset name (tokens prefilled, then
+// overridable in the same call).
+router.post("/themes", async (req, res, next) => {
+  try {
+    const { preset, ...rest } = req.body || {};
+    let seed = {};
+    if (preset !== undefined) {
+      if (!THEME_PRESETS.includes(preset) || preset === "custom") {
+        return res.status(400).json({ error: `preset must be one of ${THEME_PRESETS.filter((p) => p !== "custom").join(", ")}` });
+      }
+      seed = { ...PRESET_THEMES[preset], preset };
+    }
+    let data;
+    try {
+      data = sanitizeThemeInput({ name: rest.name || seed.name || "Untitled theme", ...seed, ...rest });
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
+    if (!data.name) return res.status(400).json({ error: "name is required" });
+    const theme = await prisma.galleryTheme.create({ data: { ...data, ownerId: req.user.id } });
+    res.status(201).json(themeShape(theme));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch("/themes/:id", async (req, res, next) => {
+  try {
+    const theme = await prisma.galleryTheme.findFirst({ where: { id: req.params.id, ownerId: req.user.id } });
+    if (!theme) return res.status(404).json({ error: "Theme not found" });
+    let data;
+    try {
+      data = sanitizeThemeInput(req.body || {});
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "No theme change provided." });
+    }
+    const updated = await prisma.galleryTheme.update({ where: { id: theme.id }, data });
+    res.json(themeShape(updated));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/themes/:id", async (req, res, next) => {
+  try {
+    const theme = await prisma.galleryTheme.findFirst({ where: { id: req.params.id, ownerId: req.user.id } });
+    if (!theme) return res.status(404).json({ error: "Theme not found" });
+    // Events using it fall back via SetNull; clear the studio default too.
+    await prisma.user.updateMany({ where: { id: req.user.id, defaultGalleryThemeId: theme.id }, data: { defaultGalleryThemeId: null } });
+    await prisma.galleryTheme.delete({ where: { id: theme.id } });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Studio-wide default (or null to go back to built-in). Must be own theme.
+router.post("/themes/default", async (req, res, next) => {
+  try {
+    const { theme_id: themeId } = req.body || {};
+    if (themeId !== null && typeof themeId !== "string") {
+      return res.status(400).json({ error: "theme_id must be a theme id, or null to clear" });
+    }
+    if (themeId) {
+      const theme = await prisma.galleryTheme.findFirst({ where: { id: themeId, ownerId: req.user.id } });
+      if (!theme) return res.status(404).json({ error: "Theme not found" });
+    }
+    await prisma.user.update({ where: { id: req.user.id }, data: { defaultGalleryThemeId: themeId } });
+    res.json({ default_theme_id: themeId });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Subdomain + custom domains (Phase 11) ---
+
+function domainShape(d) {
+  return {
+    id: d.id,
+    host: d.host,
+    type: d.type,
+    status: d.status,
+    verified_at: d.verifiedAt,
+    created_at: d.createdAt,
+  };
+}
+
+router.get("/domains", async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    const domains = await prisma.studioDomain.findMany({
+      where: { ownerId: req.user.id },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json({
+      base_domain: baseDomain(),
+      studio_slug: user?.studioSlug || null,
+      studio_url: user?.studioSlug ? `https://${user.studioSlug}.${baseDomain()}` : null,
+      domains: domains.map(domainShape),
+      dns_help: {
+        cname_target: galleryCnameTarget(),
+        txt_name: "@ (root) or as shown by your DNS provider",
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Claim <slug>.<base-domain>. One active slug per studio — reclaiming
+// replaces the old host. Instantly verified: we own the wildcard DNS.
+router.post("/subdomain", async (req, res, next) => {
+  try {
+    const { slug } = req.body || {};
+    if (typeof slug !== "string") {
+      return res.status(400).json({ error: "slug is required" });
+    }
+    const clean = slugifyStudio(slug);
+    if (clean.length < 3 || !/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(clean)) {
+      return res.status(400).json({ error: "slug must be 3+ characters: letters, numbers, dashes" });
+    }
+    const host = `${clean}.${baseDomain()}`;
+    const taken = await prisma.user.findFirst({ where: { studioSlug: clean, id: { not: req.user.id } } });
+    if (taken) return res.status(409).json({ error: "That studio address is already taken." });
+    const hostTaken = await prisma.studioDomain.findFirst({ where: { host, ownerId: { not: req.user.id } } });
+    if (hostTaken) return res.status(409).json({ error: "That studio address is already taken." });
+    await prisma.studioDomain.deleteMany({ where: { ownerId: req.user.id, type: "PANDA_SUBDOMAIN" } });
+    const domain = await prisma.studioDomain.create({
+      data: { host, type: "PANDA_SUBDOMAIN", ownerId: req.user.id, status: "verified", verifiedAt: new Date() },
+    });
+    await prisma.user.update({ where: { id: req.user.id }, data: { studioSlug: clean } });
+    res.status(201).json({ ...domainShape(domain), studio_url: `https://${host}` });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Register a studio-owned custom domain. Verification happens via
+// POST /branding/domains/:id/verify once DNS is pointed.
+router.post("/domains", async (req, res, next) => {
+  try {
+    const { host } = req.body || {};
+    if (typeof host !== "string" || !host.trim()) {
+      return res.status(400).json({ error: "host is required" });
+    }
+    let clean = host.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+    if (!/^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(clean) || clean.length > 253) {
+      return res.status(400).json({ error: "host must be a valid domain like gallery.yourstudio.com" });
+    }
+    if (clean === baseDomain() || clean.endsWith(`.${baseDomain()}`)) {
+      return res.status(400).json({ error: "PandaSpot subdomains use the studio-address flow instead." });
+    }
+    const taken = await prisma.studioDomain.findFirst({ where: { host: clean } });
+    if (taken) {
+      return res.status(taken.ownerId === req.user.id ? 200 : 409).json(
+        taken.ownerId === req.user.id
+          ? domainShape(taken)
+          : { error: "That domain is already registered." }
+      );
+    }
+    const domain = await prisma.studioDomain.create({
+      data: {
+        host: clean,
+        type: "CUSTOM_DOMAIN",
+        ownerId: req.user.id,
+        status: "pending",
+        verificationToken: newVerificationToken(),
+      },
+    });
+    res.status(201).json({
+      ...domainShape(domain),
+      verification_token: domain.verificationToken,
+      dns_help: {
+        cname: { host: clean, points_to: galleryCnameTarget() },
+        txt: { host: clean, value: `pandaspot-verify=${domain.verificationToken}` },
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/domains/:id/verify", async (req, res, next) => {
+  try {
+    const domain = await prisma.studioDomain.findFirst({ where: { id: req.params.id, ownerId: req.user.id } });
+    if (!domain) return res.status(404).json({ error: "Domain not found" });
+    if (domain.type !== "CUSTOM_DOMAIN") {
+      return res.status(400).json({ error: "PandaSpot subdomains are verified automatically." });
+    }
+    const result = await verifyDomainDns(domain);
+    const data = { status: result.status };
+    if (result.status === "verified") data.verifiedAt = new Date();
+    const updated = await prisma.studioDomain.update({ where: { id: domain.id }, data });
+    res.json({ ...domainShape(updated), detail: result.detail });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/domains/:id", async (req, res, next) => {
+  try {
+    const domain = await prisma.studioDomain.findFirst({ where: { id: req.params.id, ownerId: req.user.id } });
+    if (!domain) return res.status(404).json({ error: "Domain not found" });
+    if (domain.type === "PANDA_SUBDOMAIN") {
+      await prisma.user.update({ where: { id: req.user.id }, data: { studioSlug: null } });
+    }
+    await prisma.studioDomain.delete({ where: { id: domain.id } });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Debug/introspection for the studio: which host the platform sees for
+// them (proxies may rewrite it — see x-forwarded-host support).
+router.get("/resolve-host", async (req, res, next) => {
+  try {
+    const host = req.get("x-forwarded-host") || req.get("host");
+    res.json(await resolveHost(host));
   } catch (err) {
     next(err);
   }
