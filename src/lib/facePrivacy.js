@@ -67,13 +67,16 @@ export function scrubSelfieBuffers(files) {
 /// Everything the platform holds for one guest id on one event — the
 /// payload behind both the guest's export request and the admin's review.
 export async function resolveGuestData(eventId, guestClientId) {
-  const [searches, alerts, reactions, comments, consents, requests] = await Promise.all([
+  const [searches, alerts, reactions, comments, consents, requests, lead, activities] = await Promise.all([
     prisma.guestSearch.findMany({ where: { eventId, guestClientId }, orderBy: { createdAt: "asc" } }),
     prisma.guestAlertSubscription.findMany({ where: { eventId, guestClientId } }),
     prisma.photoLike.findMany({ where: { eventId, guestClientId } }),
     prisma.photoComment.findMany({ where: { eventId, guestClientId }, orderBy: { createdAt: "asc" } }),
     prisma.guestConsent.findMany({ where: { eventId, guestClientId }, orderBy: { consentedAt: "asc" } }),
     prisma.guestDataRequest.findMany({ where: { eventId, guestClientId }, orderBy: { createdAt: "asc" } }),
+    // Phase 10: the guest's lead row + activity trail join the export.
+    prisma.guestLead.findUnique({ where: { eventId_guestClientId: { eventId, guestClientId } } }),
+    prisma.guestActivity.findMany({ where: { eventId, guestClientId }, orderBy: { createdAt: "asc" } }),
   ]);
   return {
     searches: searches.map((s) => ({
@@ -92,6 +95,19 @@ export async function resolveGuestData(eventId, guestClientId) {
     comments: comments.map((c) => ({ photo_id: c.photoId, name: c.guestName, text: c.text, created_at: c.createdAt })),
     consents: consents.map((c) => ({ consented_at: c.consentedAt, version: c.consentVersion })),
     requests: requests.map((r) => ({ type: r.type, status: r.status, created_at: r.createdAt, resolved_at: r.resolvedAt })),
+    lead: lead
+      ? {
+          name: lead.name,
+          phone: lead.phone,
+          email: lead.email,
+          guest_type: lead.guestType,
+          consent_given: lead.consentGiven,
+          source: lead.source,
+          first_seen_at: lead.firstSeenAt,
+          last_seen_at: lead.lastSeenAt,
+        }
+      : null,
+    activities: activities.map((a) => ({ action: a.action, meta: a.meta, created_at: a.createdAt })),
   };
 }
 
@@ -106,11 +122,14 @@ export async function eraseGuestData(eventId, guestClientId) {
   const feedback = searchIds.length
     ? await prisma.matchFeedback.deleteMany({ where: { searchId: { in: searchIds } } })
     : { count: 0 };
-  const [searches, alerts, reactions, comments] = await Promise.all([
+  const [searches, alerts, reactions, comments, leads, activities] = await Promise.all([
     prisma.guestSearch.deleteMany({ where: { eventId, guestClientId } }),
     prisma.guestAlertSubscription.deleteMany({ where: { eventId, guestClientId } }),
     prisma.photoLike.deleteMany({ where: { eventId, guestClientId } }),
     prisma.photoComment.deleteMany({ where: { eventId, guestClientId } }),
+    // Phase 10: the lead row + activity trail are the guest's data too.
+    prisma.guestLead.deleteMany({ where: { eventId, guestClientId } }),
+    prisma.guestActivity.deleteMany({ where: { eventId, guestClientId } }),
   ]);
   return {
     searches: searches.count,
@@ -118,6 +137,8 @@ export async function eraseGuestData(eventId, guestClientId) {
     alert_subscriptions: alerts.count,
     reactions: reactions.count,
     comments: comments.count,
+    leads: leads.count,
+    activities: activities.count,
   };
 }
 

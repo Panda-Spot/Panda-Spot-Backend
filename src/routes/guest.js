@@ -27,6 +27,7 @@ import {
 } from "../lib/rateLimiters.js";
 import { isExpired } from "../lib/expiry.js";
 import { checkGalleryAccess, checkAccessKey, galleryAccessFlags, signGalleryToken } from "../lib/galleryAccess.js";
+import { isLeadComplete, leadConsentText, logActivity, requireLeadFor, touchLead } from "../lib/guestLeads.js";
 import {
   PRIVACY_CONSENT_VERSION,
   effectivePrivacyNotice,
@@ -142,6 +143,8 @@ router.get("/:slug", async (req, res, next) => {
       // screens render from these + the studio branding above. Old events
       // are accessMode "public", so nothing already live changes.
       ...galleryAccessFlags(event),
+      // Phase 10 (lead capture): the guest form + gates render from this.
+      lead_capture_mode: event.leadCaptureMode || "disabled",
     });
   } catch (err) {
     next(err);
@@ -209,6 +212,13 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
     // MERGE_PLAN.md D6. Independent of Photo Selection's own state.
     if (!event.faceSearchEnabled) {
       return res.status(403).json({ error: "Face Search isn't turned on for this event." });
+    }
+    // Phase 10 (lead capture): required_search mode blocks until the
+    // guest's lead is captured (name + contact + consent).
+    try {
+      await requireLeadFor(event, "search", req.body?.guest_client_id || null);
+    } catch (err) {
+      return res.status(err.status || 403).json({ error: err.message, code: err.code || "lead_required" });
     }
     // Phase 2 (consent-first): block until the guest accepts; acceptances
     // are audit-logged with the notice text/version they saw.
@@ -332,6 +342,10 @@ router.post("/:slug/search", guestSearchLimiter, upload.array("selfies", 3), asy
       guestClientId,
     });
 
+    // Phase 10: first-sight lead row + search activity (best-effort).
+    await touchLead({ eventId: event.id, guestClientId, source: "search" });
+    void logActivity({ eventId: event.id, guestClientId, action: "selfie_search", meta: `${matches.length} matches` });
+
     res.json({
       search_id: searchId,
       faces_detected_in_selfie: facesDetected,
@@ -369,6 +383,12 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
     }
     // Phase 2 (consent-first): same gate as solo search — one checkbox
     // covers the whole group sitting around the same phone.
+    // Phase 10 (lead capture) gates first, same as solo search.
+    try {
+      await requireLeadFor(event, "search", req.body?.guest_client_id || null);
+    } catch (err) {
+      return res.status(err.status || 403).json({ error: err.message, code: err.code || "lead_required" });
+    }
     let consentId = null;
     try {
       consentId = await requireSelfieConsent(event, {
@@ -479,10 +499,106 @@ router.post("/:slug/search/group", guestSearchLimiter, upload.array("selfies", 8
       consent_id: consentId,
       matches,
     });
+    // Phase 10: first-sight lead row + search activity (best-effort).
+    await touchLead({ eventId: event.id, guestClientId: req.body?.guest_client_id || null, source: "search" });
+    void logActivity({ eventId: event.id, guestClientId: req.body?.guest_client_id || null, action: "selfie_search", meta: `${matches.length} matches` });
   } catch (err) {
     next(err);
   } finally {
     scrubSelfieBuffers(uploadedSelfies);
+  }
+});
+
+// Phase 10 (lead capture): share name/phone/email + guest type with
+// consent. Upserts by guest id — safe to call on every visit; only
+// explicit fields are ever stored. Returns whether the lead now counts
+// as captured (name + a contact + consent).
+router.post("/:slug/lead", guestFeedbackLimiter, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    const { guest_client_id: guestClientId, name, phone, email, guest_type: guestType, consent, source } = req.body || {};
+    if (!guestClientId || typeof guestClientId !== "string") {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+    if (name !== undefined && (typeof name !== "string" || name.length > 120)) {
+      return res.status(400).json({ error: "name must be a short string" });
+    }
+    if (phone !== undefined && phone !== null && phone !== "" && (typeof phone !== "string" || phone.length > 40)) {
+      return res.status(400).json({ error: "phone must be a short string" });
+    }
+    if (email !== undefined && email !== null && email !== "" && (typeof email !== "string" || email.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+      return res.status(400).json({ error: "email must be a valid address" });
+    }
+    if (guestType !== undefined && !["guest", "family", "friend", "vendor", "other"].includes(guestType)) {
+      return res.status(400).json({ error: 'guest_type must be one of guest, family, friend, vendor, other' });
+    }
+    if (consent !== undefined && typeof consent !== "boolean") {
+      return res.status(400).json({ error: "consent must be a boolean" });
+    }
+    const data = { lastSeenAt: new Date() };
+    if (name !== undefined) data.name = name.trim() || null;
+    if (phone !== undefined) data.phone = phone?.trim() || null;
+    if (email !== undefined) data.email = email?.trim().toLowerCase() || null;
+    if (guestType !== undefined) data.guestType = guestType;
+    if (consent !== undefined) {
+      data.consentGiven = consent;
+      if (consent) {
+        data.consentText = leadConsentText(event);
+        data.consentVersion = "v1";
+      }
+    }
+    if (source && typeof source === "string" && source.length <= 40) {
+      const existing = await prisma.guestLead.findUnique({
+        where: { eventId_guestClientId: { eventId: event.id, guestClientId } },
+      });
+      if (!existing) data.source = source;
+    }
+    const lead = await prisma.guestLead.upsert({
+      where: { eventId_guestClientId: { eventId: event.id, guestClientId } },
+      create: { eventId: event.id, guestClientId, ...data },
+      update: data,
+    });
+    res.json({
+      captured: isLeadComplete(lead),
+      lead: {
+        name: lead.name,
+        phone: lead.phone,
+        email: lead.email,
+        guest_type: lead.guestType,
+        consent_given: lead.consentGiven,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Whether this guest's lead counts as captured (drives the UI gates).
+router.get("/:slug/lead/status", async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({ where: { guestSlug: req.params.slug } });
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+    const guestClientId = req.query.guest_client_id;
+    if (!guestClientId || typeof guestClientId !== "string") {
+      return res.status(400).json({ error: "guest_client_id is required" });
+    }
+    const lead = await prisma.guestLead.findUnique({
+      where: { eventId_guestClientId: { eventId: event.id, guestClientId } },
+    });
+    res.json({
+      captured: isLeadComplete(lead),
+      lead_capture_mode: event.leadCaptureMode || "disabled",
+      lead: lead
+        ? { name: lead.name, phone: lead.phone, email: lead.email, guest_type: lead.guestType, consent_given: lead.consentGiven }
+        : null,
+    });
+  } catch (err) {
+    next(err);
   }
 });
 
@@ -670,6 +786,10 @@ router.get("/:slug/gallery", async (req, res, next) => {
     if (isExpired(event)) {
       return res.status(410).json({ error: "This event's guest access has closed." });
     }
+    // Phase 10: first-sight lead row + gallery-open activity (best-effort,
+    // guest id is optional on this read-only route).
+    await touchLead({ eventId: event.id, guestClientId: req.query.guest_client_id || null, source: "gallery" });
+    void logActivity({ eventId: event.id, guestClientId: req.query.guest_client_id || null, action: "gallery_open" });
 
     const photos = await prisma.photo.findMany({
       where: { eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
@@ -1037,6 +1157,8 @@ router.post("/:slug/whatsapp/send-link", guestWhatsAppLinkLimiter, async (req, r
 
     const galleryUrl = `${process.env.PUBLIC_WEB_URL || "http://localhost:5173"}/e/${event.guestSlug}`;
     await sendWhatsAppMessage(phone, `Here's your PandaSpot gallery for "${event.name}": ${galleryUrl}`);
+    // Phase 10: share activity when the guest id rides along (best-effort).
+    void logActivity({ eventId: event.id, guestClientId: req.body?.guest_client_id || null, action: "share", meta: "whatsapp link" });
     res.json({ ok: true });
   } catch (err) {
     next(err);
@@ -1076,6 +1198,8 @@ router.post("/:slug/feedback", guestFeedbackLimiter, async (req, res, next) => {
         similarity,
       },
     });
+    // Phase 10: feedback activity rides on the search's guest id.
+    void logActivity({ eventId: event.id, guestClientId: search.guestClientId, action: "feedback" });
 
     res.json({ ok: true, new_threshold: newThreshold });
   } catch (err) {
@@ -1097,6 +1221,13 @@ router.post("/:slug/download", guestDownloadLimiter, async (req, res, next) => {
     if (!event.allowDownload) {
       return res.status(403).json({ error: "Downloads are disabled for this event by the studio." });
     }
+    // Phase 10 (lead capture): required_download mode blocks until the
+    // guest's lead is captured.
+    try {
+      await requireLeadFor(event, "download", req.body?.guest_client_id || null);
+    } catch (err) {
+      return res.status(err.status || 403).json({ error: err.message, code: err.code || "lead_required" });
+    }
 
     const photoIds = req.body?.photo_ids;
     if (!Array.isArray(photoIds) || photoIds.length === 0) {
@@ -1112,6 +1243,10 @@ router.post("/:slug/download", guestDownloadLimiter, async (req, res, next) => {
     if (photos.length === 0) {
       return res.status(404).json({ error: "None of the requested photos belong to this event" });
     }
+
+    // Phase 10: download activity (best-effort, before streaming).
+    await touchLead({ eventId: event.id, guestClientId: req.body?.guest_client_id || null, source: "download" });
+    void logActivity({ eventId: event.id, guestClientId: req.body?.guest_client_id || null, action: "download", meta: `${photos.length} photos` });
 
     const zipFilename = zipFilenameForEvent(event);
     res.setHeader("Content-Type", "application/zip");
@@ -1147,6 +1282,12 @@ router.post("/:slug/download/email", guestDownloadLimiter, async (req, res, next
     if (!email || typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: "A valid email address is required" });
     }
+    // Phase 10 (lead capture): same download gate as the instant zip.
+    try {
+      await requireLeadFor(event, "download", req.body?.guest_client_id || null);
+    } catch (err) {
+      return res.status(err.status || 403).json({ error: err.message, code: err.code || "lead_required" });
+    }
 
     const zipDownload = await prisma.zipDownload.create({
       data: {
@@ -1157,6 +1298,10 @@ router.post("/:slug/download/email", guestDownloadLimiter, async (req, res, next
         status: "pending",
       },
     });
+
+    // Phase 10: download activity (best-effort).
+    await touchLead({ eventId: event.id, guestClientId: req.body?.guest_client_id || null, source: "download" });
+    void logActivity({ eventId: event.id, guestClientId: req.body?.guest_client_id || null, action: "download", meta: `${photoIds.length} photos (email)` });
 
     res.json({ ok: true });
 

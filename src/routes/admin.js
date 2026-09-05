@@ -1026,6 +1026,7 @@ router.get("/events/:id", async (req, res, next) => {
       selfie_retention_mode: event.selfieRetentionMode,
       guest_data_retention_days: event.guestDataRetentionDays,
       allow_guest_data_delete_request: event.allowGuestDataDeleteRequest,
+      lead_capture_mode: event.leadCaptureMode,
       access_mode: event.accessMode,
       access_key_set: !!event.accessKeyHash,
       expires_at: event.expiresAt,

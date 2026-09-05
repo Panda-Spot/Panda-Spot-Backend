@@ -311,7 +311,8 @@ router.get("/:id", async (req, res, next) => {
       // Phase 3 (gallery access upgrade): settings panel source of truth
       // (key itself never leaves the server — only whether one is set).
       access_mode: event.accessMode,
-      access_key_set: !!event.accessKeyHash,
+      // Phase 10 (lead capture): dashboard + settings source of truth.
+      lead_capture_mode: event.leadCaptureMode,      access_key_set: !!event.accessKeyHash,
       expires_at: event.expiresAt,
       expiry_preset: event.expiryPreset,
       // Phase 2 (consent-first Face Search): privacy settings for the
@@ -640,6 +641,16 @@ router.patch("/:id", async (req, res, next) => {
       }
       data.sponsorName = sponsorName?.trim() ? sponsorName.trim() : null;
     }
+    // Phase 10 (lead capture): disabled | optional | required_search |
+    // required_download. Safe to flip anytime — required modes only gate
+    // future searches/downloads, never retroactively hide anything.
+    if (req.body?.lead_capture_mode !== undefined) {
+      const mode = req.body.lead_capture_mode;
+      if (!["disabled", "optional", "required_search", "required_download"].includes(mode)) {
+        return res.status(400).json({ error: 'lead_capture_mode must be "disabled", "optional", "required_search" or "required_download"' });
+      }
+      data.leadCaptureMode = mode;
+    }
 
     // Private key lifecycle: a plaintext access_key sets a fresh bcrypt
     // hash, null/"" clears it (back to a keyless gallery). Locking an
@@ -684,6 +695,7 @@ router.patch("/:id", async (req, res, next) => {
       tv_show_qr: updated.tvShowQr,
       sponsor_name: updated.sponsorName,
       sponsor_logo_url: updated.sponsorLogoPath ? `/files/events/${event.id}/sponsor-logo` : null,
+      lead_capture_mode: updated.leadCaptureMode,
     });
   } catch (err) {
     next(err);
@@ -1188,6 +1200,136 @@ router.post("/:id/cover/from-photo", async (req, res, next) => {
     res.json({ cover_url: `/files/events/${event.id}/cover` });
   } catch (err) {
     next(err);
+  }
+});
+
+// --- Attendee dashboard (Phase 10) ---
+// Leads with per-action activity counts. Filters: ?from= & ?to= (ISO,
+// on lastSeenAt), ?action= (leads having at least one such activity),
+// ?search= (name/email/phone substring). Capped for sanity.
+router.get("/:id/leads", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { from, to, action, search } = req.query || {};
+    const where = { eventId: event.id };
+    if (from || to) {
+      where.lastSeenAt = {};
+      if (from) {
+        const d = new Date(from);
+        if (Number.isNaN(d.getTime())) return res.status(400).json({ error: "from must be a valid date" });
+        where.lastSeenAt.gte = d;
+      }
+      if (to) {
+        const d = new Date(to);
+        if (Number.isNaN(d.getTime())) return res.status(400).json({ error: "to must be a valid date" });
+        where.lastSeenAt.lte = d;
+      }
+    }
+    if (search && typeof search === "string" && search.trim()) {
+      const q = search.trim();
+      where.OR = [
+        { name: { contains: q, mode: "insensitive" } },
+        { email: { contains: q, mode: "insensitive" } },
+        { phone: { contains: q, mode: "insensitive" } },
+      ];
+    }
+    const leads = await prisma.guestLead.findMany({
+      where,
+      orderBy: { lastSeenAt: "desc" },
+      take: 500,
+    });
+    const activities = await prisma.guestActivity.findMany({
+      where: { eventId: event.id },
+      orderBy: { createdAt: "desc" },
+      take: 5000,
+    });
+    const byGuest = new Map();
+    for (const a of activities) {
+      if (!byGuest.has(a.guestClientId)) byGuest.set(a.guestClientId, []);
+      byGuest.get(a.guestClientId).push(a);
+    }
+    let rows = leads.map((l) => {
+      const acts = byGuest.get(l.guestClientId) || [];
+      const counts = {};
+      for (const a of acts) counts[a.action] = (counts[a.action] || 0) + 1;
+      return {
+        guest_client_id: l.guestClientId,
+        name: l.name,
+        phone: l.phone,
+        email: l.email,
+        guest_type: l.guestType,
+        consent_given: l.consentGiven,
+        source: l.source,
+        first_seen_at: l.firstSeenAt,
+        last_seen_at: l.lastSeenAt,
+        total_actions: acts.length,
+        last_action: acts[0]?.action || null,
+        last_action_at: acts[0]?.createdAt || null,
+        activity_counts: counts,
+      };
+    });
+    if (action && typeof action === "string") {
+      if (!["gallery_open", "selfie_search", "download", "share", "feedback"].includes(action)) {
+        return res.status(400).json({ error: "action must be a valid activity type" });
+      }
+      rows = rows.filter((r) => (r.activity_counts[action] || 0) > 0);
+    }
+    res.json({ lead_capture_mode: event.leadCaptureMode, total: rows.length, leads: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Same dashboard as a spreadsheet-clean CSV (RFC 4180 quoting).
+router.get("/:id/leads/export.csv", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const leads = await prisma.guestLead.findMany({
+      where: { eventId: event.id },
+      orderBy: { lastSeenAt: "desc" },
+      take: 2000,
+    });
+    const activities = await prisma.guestActivity.findMany({
+      where: { eventId: event.id },
+      take: 20000,
+    });
+    const countsByGuest = new Map();
+    for (const a of activities) {
+      if (!countsByGuest.has(a.guestClientId)) {
+        countsByGuest.set(a.guestClientId, { gallery_open: 0, selfie_search: 0, download: 0, share: 0, feedback: 0, total: 0 });
+      }
+      const c = countsByGuest.get(a.guestClientId);
+      if (c[a.action] !== undefined) c[a.action] += 1;
+      c.total += 1;
+    }
+    const cell = (v) => {
+      if (v == null) return "";
+      const s = v instanceof Date ? v.toISOString() : String(v);
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines = [
+      "name,phone,email,guest_type,consent_given,source,first_seen_at,last_seen_at,gallery_open,selfie_search,download,share,feedback,total_actions",
+    ];
+    for (const l of leads) {
+      const c = countsByGuest.get(l.guestClientId) || { gallery_open: 0, selfie_search: 0, download: 0, share: 0, feedback: 0, total: 0 };
+      lines.push(
+        [l.name, l.phone, l.email, l.guestType, l.consentGiven ? "yes" : "no", l.source, l.firstSeenAt, l.lastSeenAt,
+          c.gallery_open, c.selfie_search, c.download, c.share, c.feedback, c.total].map(cell).join(",")
+      );
+    }
+    const safeEvent = event.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "event";
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${safeEvent}-attendees.csv"`);
+    res.send(lines.join("\r\n") + "\r\n");
+  } catch (err) {
+    console.error(`Attendee CSV export failed (event ${req.params.id}):`, err);
+    if (!res.headersSent) res.status(500).json({ error: "Export failed — please try again." });
   }
 });
 

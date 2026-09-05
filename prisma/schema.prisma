@@ -241,6 +241,11 @@ model Event {
   /// studio's access key → unlock token), "client_login" / "invite_only"
   /// (guest link closed — clients use their login instead).
   accessMode String @default("public")
+  /// Phase 10 (lead capture): "disabled" (no form, search/download flow
+  /// untouched), "optional" (form offered, never blocks), "required_search"
+  /// (selfie search blocked until captured), "required_download"
+  /// (downloads blocked until captured).
+  leadCaptureMode String @default("disabled")
   /// Phase 8 (live TV wall): "all" rotates every approved photo,
   /// "highlights" only studio-starred ones. Transition + QR visibility
   /// are per-event; sponsor branding overlays the wall when set.
@@ -288,6 +293,9 @@ model Event {
   /// consenting to a selfie search, and per-guest data requests.
   consents      GuestConsent[]
   dataRequests  GuestDataRequest[]
+  /// Phase 10 (lead capture): contact rows + activity trail per guest.
+  leads         GuestLead[]
+  activities    GuestActivity[]
 
   /// Null until the owner clicks "Start Event" (see POST /events/:id/start)
   /// — a freshly-created event has no upload/import/PandaShoots UI at all
@@ -1283,5 +1291,49 @@ model GuestDataRequest {
   resolvedAt    DateTime?
 
   @@index([eventId, status])
+  @@index([guestClientId])
+}
+
+/// Phase 10 (lead capture): one contact row per guest per event.
+/// Created implicitly on first sight (source route noted) and filled in
+/// when the guest shares details + consent. Contact fields stay null
+/// until the guest provides them — never inferred or scraped.
+model GuestLead {
+  id            String   @id @default(uuid())
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  guestClientId String
+  name          String?
+  phone         String?
+  email         String?
+  /// "guest" | "family" | "friend" | "vendor" | "other"
+  guestType     String   @default("guest")
+  consentGiven  Boolean  @default(false)
+  consentText   String?
+  consentVersion String  @default("v1")
+  /// First route that saw this guest: gallery | search | download | share.
+  source        String?
+  firstSeenAt   DateTime @default(now())
+  lastSeenAt    DateTime @default(now())
+
+  @@unique([eventId, guestClientId])
+  @@index([eventId])
+  @@index([guestClientId])
+}
+
+/// Phase 10: append-only per-guest activity trail powering the studio's
+/// attendee dashboard (gallery_open, selfie_search, download, share,
+/// feedback). Purged with everything else on a data-deletion request.
+model GuestActivity {
+  id            String   @id @default(uuid())
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  guestClientId String
+  /// "gallery_open" | "selfie_search" | "download" | "share" | "feedback"
+  action        String
+  meta          String?
+  createdAt     DateTime @default(now())
+
+  @@index([eventId, createdAt])
   @@index([guestClientId])
 }
