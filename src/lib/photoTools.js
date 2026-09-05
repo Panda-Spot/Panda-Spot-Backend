@@ -21,6 +21,96 @@ export function sha256Hex(buffer) {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
+/// 64-bit difference hash (dHash) as 16 hex chars: 9x8 greyscale, one
+/// bit per horizontal neighbor comparison. Look-alike photos (bursts,
+/// re-exports, light retouches) land within a few bits of each other
+/// while different scenes scatter. Null when unreadable.
+export async function differenceHash(buffer) {
+  try {
+    const { data, info } = await sharp(buffer)
+      .greyscale()
+      .resize(9, 8, { fit: "fill" })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    if (info.width !== 9 || info.height !== 8) return null;
+    let hash = 0n;
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) {
+        hash = (hash << 1n) | (data[y * 9 + x] > data[y * 9 + x + 1] ? 1n : 0n);
+      }
+    }
+    return hash.toString(16).padStart(16, "0");
+  } catch {
+    return null;
+  }
+}
+
+/// Hamming distance between two 16-hex-char dHashes (0-64).
+export function hashDistance(a, b) {
+  if (!a || !b || a.length !== 16 || b.length !== 16) return 64;
+  let x = BigInt(`0x${a}`) ^ BigInt(`0x${b}`);
+  let dist = 0;
+  while (x) {
+    dist += Number(x & 1n);
+    x >>= 1n;
+  }
+  return dist;
+}
+
+/// Near-duplicate groups by union-find over pairwise dHash distances —
+/// O(n^2) on 64-bit ints, trivially fast for event-sized sets. Photos
+/// without a hash never group. Returns [{ key, max_distance, photos }]
+/// with photos newest-first; exact duplicates (distance 0) group too.
+export function groupNearDuplicates(items, threshold = 10) {
+  const usable = items.filter((p) => p.phash && p.phash.length === 16);
+  const parent = new Map(usable.map((p) => [p.id, p.id]));
+  const find = (id) => {
+    let root = id;
+    while (parent.get(root) !== root) root = parent.get(root);
+    let node = id;
+    while (parent.get(node) !== root) {
+      const next = parent.get(node);
+      parent.set(node, root);
+      node = next;
+    }
+    return root;
+  };
+  for (let i = 0; i < usable.length; i++) {
+    for (let j = i + 1; j < usable.length; j++) {
+      if (hashDistance(usable[i].phash, usable[j].phash) <= threshold) {
+        const ri = find(usable[i].id);
+        const rj = find(usable[j].id);
+        if (ri !== rj) parent.set(ri, rj);
+      }
+    }
+  }
+  const clusters = new Map();
+  for (const p of usable) {
+    const root = find(p.id);
+    if (!clusters.has(root)) clusters.set(root, []);
+    clusters.get(root).push(p);
+  }
+  const groups = [];
+  for (const members of clusters.values()) {
+    if (members.length < 2) continue;
+    let maxDist = 0;
+    for (let i = 0; i < members.length; i++) {
+      for (let j = i + 1; j < members.length; j++) {
+        maxDist = Math.max(maxDist, hashDistance(members[i].phash, members[j].phash));
+      }
+    }
+    members.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    groups.push({
+      key: members[0].phash,
+      max_distance: maxDist,
+      count: members.length,
+      photos: members.map((p) => ({ photo_id: p.id, filename: p.filename })),
+    });
+  }
+  groups.sort((a, b) => b.count - a.count);
+  return groups;
+}
+
 /// Laplacian-variance sharpness on a 320px greyscale thumbnail — higher
 /// means sharper. Null when unmeasurable (videos, tiny/corrupt files).
 export async function blurScore(buffer) {
@@ -103,6 +193,7 @@ export async function analyzePhoto(photo) {
   const data = { fileHash: sha256Hex(buffer) };
   if (!isVideoExtension(path.extname(photo.filename || "").toLowerCase())) {
     data.sharpness = await blurScore(buffer);
+    data.phash = await differenceHash(buffer);
     const exif = await readExif(buffer);
     if (exif) {
       data.exifCamera = exif.camera;

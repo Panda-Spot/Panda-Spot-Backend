@@ -498,6 +498,9 @@ model Photo {
   /// EXIF snapshot (null when absent — e.g. screenshots, PNG exports),
   /// Lightroom-style color tag + 0-5 star rating.
   fileHash       String?
+  /// Phase 9 (near-duplicates): 64-bit dHash as 16 hex chars — photos
+  /// that look alike cluster by Hamming distance, even when bytes differ.
+  phash          String?
   sharpness      Float?
   exifCamera     String?
   exifLens       String?

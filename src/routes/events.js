@@ -21,7 +21,7 @@ import {
 import { getStorageProvider } from "../lib/storageProvider.js";
 import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
-import { loadPhotoBytes, renderVariant, startAnalyzeJob, suggestCovers } from "../lib/photoTools.js";
+import { groupNearDuplicates, loadPhotoBytes, renderVariant, startAnalyzeJob, suggestCovers } from "../lib/photoTools.js";
 import { loadAccessibleEvent } from "../lib/access.js";
 import { ACCESS_MODES, setAccessKey } from "../lib/galleryAccess.js";
 import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
@@ -973,14 +973,32 @@ router.get("/:id/tools/analyze/:jobId/stream", async (req, res, next) => {
   }
 });
 
-// Exact-duplicate groups: photos sharing a sha256, newest-first inside
-// each group. Only analyzed photos can match — unanalyzed ones simply
-// don't appear. Near-duplicates stay future work (documented).
+// Duplicate groups: ?mode=exact (default, byte-identical sha256) or
+// ?mode=near (look-alikes by perceptual-hash distance, ?threshold=0-64
+// default 10 — bursts and re-exports cluster, different scenes don't).
+// Only analyzed photos can match — unanalyzed ones simply don't appear.
 router.get("/:id/tools/duplicates", async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
     const { event } = accessible;
+
+    const mode = req.query.mode || "exact";
+    if (mode !== "exact" && mode !== "near") {
+      return res.status(400).json({ error: 'mode must be "exact" or "near"' });
+    }
+    if (mode === "near") {
+      const threshold = req.query.threshold === undefined ? 10 : Number(req.query.threshold);
+      if (!Number.isInteger(threshold) || threshold < 0 || threshold > 64) {
+        return res.status(400).json({ error: "threshold must be an integer 0-64" });
+      }
+      const candidates = await prisma.photo.findMany({
+        where: { eventId: event.id, phash: { not: null } },
+        select: { id: true, filename: true, phash: true, createdAt: true },
+        orderBy: { createdAt: "desc" },
+      });
+      return res.json({ mode: "near", threshold, groups: groupNearDuplicates(candidates, threshold) });
+    }
 
     const hashed = await prisma.photo.findMany({
       where: { eventId: event.id, fileHash: { not: null } },
@@ -992,11 +1010,12 @@ router.get("/:id/tools/duplicates", async (req, res, next) => {
       if (!groups.has(p.fileHash)) groups.set(p.fileHash, []);
       groups.get(p.fileHash).push({ photo_id: p.id, filename: p.filename });
     }
-    res.json(
-      [...groups.entries()]
+    res.json({
+      mode: "exact",
+      groups: [...groups.entries()]
         .filter(([, photos]) => photos.length > 1)
-        .map(([file_hash, photos]) => ({ file_hash, count: photos.length, photos }))
-    );
+        .map(([file_hash, photos]) => ({ key: file_hash, file_hash, max_distance: 0, count: photos.length, photos })),
+    });
   } catch (err) {
     next(err);
   }
