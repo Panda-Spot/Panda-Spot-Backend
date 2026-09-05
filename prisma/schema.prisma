@@ -492,6 +492,21 @@ model Photo {
   photoSelectionVisible Boolean @default(true)
   /// Phase 8: studio-starred for the live TV wall's highlights mode.
   highlighted         Boolean @default(false)
+  /// Phase 9 (photography tools pack): sha256 of the file bytes for
+  /// exact-duplicate detection (null until analyzed), Laplacian-variance
+  /// sharpness (higher = sharper; null until analyzed/unmeasurable),
+  /// EXIF snapshot (null when absent — e.g. screenshots, PNG exports),
+  /// Lightroom-style color tag + 0-5 star rating.
+  fileHash       String?
+  sharpness      Float?
+  exifCamera     String?
+  exifLens       String?
+  exifIso        Int?
+  exifShutter    String?
+  exifAperture   String?
+  exifCapturedAt DateTime?
+  colorTag       String?
+  rating         Int      @default(0)
 
   /// Soft per-photo archive (mirrors Studio-Verse's media archive): an
   /// archived photo is hidden from guests (search/gallery/slideshow/

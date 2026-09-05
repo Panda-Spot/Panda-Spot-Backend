@@ -21,6 +21,7 @@ import {
 import { getStorageProvider } from "../lib/storageProvider.js";
 import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
+import { loadPhotoBytes, renderVariant, startAnalyzeJob, suggestCovers } from "../lib/photoTools.js";
 import { loadAccessibleEvent } from "../lib/access.js";
 import { ACCESS_MODES, setAccessKey } from "../lib/galleryAccess.js";
 import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
@@ -879,6 +880,293 @@ router.patch("/:id/photos/:photoId/highlight", async (req, res, next) => {
       data: { highlighted },
     });
     res.json({ photo_id: updated.id, highlighted: updated.highlighted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Photography tools pack (Phase 9) ---
+// Heavy analysis (hashing, blur scoring, EXIF) runs as a background job
+// with SSE progress — uploads never wait for it. Everything here is
+// owner-or-collaborator, like the rest of event settings.
+
+// Kick off analysis for an explicit id list or the whole event (cap
+// 2000). 202 + job_id immediately; watch
+// GET /:id/tools/analyze/:jobId/stream for progress.
+router.post("/:id/tools/analyze", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { photo_ids: photoIds, all } = req.body || {};
+    let ids;
+    if (Array.isArray(photoIds) && photoIds.length > 0) {
+      if (photoIds.length > 2000) {
+        return res.status(400).json({ error: "photo_ids is limited to 2000 per job" });
+      }
+      ids = [...new Set(photoIds.filter((id) => typeof id === "string"))];
+    } else if (all) {
+      const rows = await prisma.photo.findMany({
+        where: { eventId: event.id },
+        select: { id: true },
+        take: 2000,
+      });
+      ids = rows.map((r) => r.id);
+    } else {
+      return res.status(400).json({ error: "Provide photo_ids or { all: true }" });
+    }
+    if (ids.length === 0) {
+      return res.status(404).json({ error: "No photos to analyze" });
+    }
+    const jobId = startAnalyzeJob(event, ids);
+    res.status(202).json({ job_id: jobId, total: ids.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// SSE progress for one analyze job — same shape as the upload stream
+// (progress events, terminal done/error), including the
+// already-finished fast path.
+router.get("/:id/tools/analyze/:jobId/stream", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+
+    const job = getJob(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Analyze job not found" });
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    if (job.state.done) {
+      res.write(`data: ${JSON.stringify(job.state.lastEvent)}\n\n`);
+      return res.end();
+    }
+
+    const onEvent = (jobEvent) => {
+      res.write(`data: ${JSON.stringify(jobEvent)}\n\n`);
+      if (jobEvent.type === "done" || jobEvent.type === "error") {
+        cleanup();
+        res.end();
+      }
+    };
+
+    const heartbeat = setInterval(() => {
+      res.write(": heartbeat\n\n");
+    }, 15000);
+
+    function cleanup() {
+      clearInterval(heartbeat);
+      job.emitter.off("event", onEvent);
+    }
+
+    job.emitter.on("event", onEvent);
+    req.on("close", cleanup);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Exact-duplicate groups: photos sharing a sha256, newest-first inside
+// each group. Only analyzed photos can match — unanalyzed ones simply
+// don't appear. Near-duplicates stay future work (documented).
+router.get("/:id/tools/duplicates", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const hashed = await prisma.photo.findMany({
+      where: { eventId: event.id, fileHash: { not: null } },
+      select: { id: true, filename: true, fileHash: true, createdAt: true },
+      orderBy: { createdAt: "desc" },
+    });
+    const groups = new Map();
+    for (const p of hashed) {
+      if (!groups.has(p.fileHash)) groups.set(p.fileHash, []);
+      groups.get(p.fileHash).push({ photo_id: p.id, filename: p.filename });
+    }
+    res.json(
+      [...groups.entries()]
+        .filter(([, photos]) => photos.length > 1)
+        .map(([file_hash, photos]) => ({ file_hash, count: photos.length, photos }))
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Smart cover shortlist: faces, sharpness, orientation, rating.
+router.get("/:id/tools/cover-suggestions", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    res.json({ suggestions: await suggestCovers(event.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 0-5 star rating for delivery triage + filters.
+router.patch("/:id/photos/:photoId/rating", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { rating } = req.body || {};
+    if (!Number.isInteger(rating) || rating < 0 || rating > 5) {
+      return res.status(400).json({ error: "rating must be an integer 0-5" });
+    }
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) return res.status(404).json({ error: "Photo not found" });
+    const updated = await prisma.photo.update({ where: { id: photo.id }, data: { rating } });
+    res.json({ photo_id: updated.id, rating: updated.rating });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const COLOR_TAGS = ["red", "orange", "yellow", "green", "blue", "purple"];
+
+// Lightroom-style color tag for triage + filters. Null clears.
+router.patch("/:id/photos/:photoId/color-tag", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { color_tag: colorTag } = req.body || {};
+    if (colorTag !== null && !COLOR_TAGS.includes(colorTag)) {
+      return res.status(400).json({ error: `color_tag must be one of ${COLOR_TAGS.join(", ")}, or null to clear` });
+    }
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) return res.status(404).json({ error: "Photo not found" });
+    const updated = await prisma.photo.update({ where: { id: photo.id }, data: { colorTag } });
+    res.json({ photo_id: updated.id, color_tag: updated.colorTag });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Batch rename display filenames. Extensions must stay identical per
+// photo (renaming never changes the file type); cap 200 per call.
+router.post("/:id/photos/rename", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { renames } = req.body || {};
+    if (!Array.isArray(renames) || renames.length === 0 || renames.length > 200) {
+      return res.status(400).json({ error: "renames must be a non-empty array (max 200)" });
+    }
+    const results = [];
+    for (const item of renames) {
+      const photoId = item?.photo_id;
+      const filename = item?.filename;
+      if (typeof photoId !== "string" || typeof filename !== "string" || !filename.trim() || filename.length > 255) {
+        results.push({ photo_id: photoId || null, ok: false, error: "filename must be a non-empty string (max 255)" });
+        continue;
+      }
+      const photo = await prisma.photo.findFirst({ where: { id: photoId, eventId: event.id } });
+      if (!photo) {
+        results.push({ photo_id: photoId, ok: false, error: "Photo not found" });
+        continue;
+      }
+      if (path.extname(filename).toLowerCase() !== path.extname(photo.filename).toLowerCase()) {
+        results.push({ photo_id: photoId, ok: false, error: "Extension must stay the same" });
+        continue;
+      }
+      if (filename.includes("/") || filename.includes("\\")) {
+        results.push({ photo_id: photoId, ok: false, error: "Filename must not contain path separators" });
+        continue;
+      }
+      await prisma.photo.update({ where: { id: photo.id }, data: { filename: filename.trim() } });
+      results.push({ photo_id: photoId, ok: true, filename: filename.trim() });
+    }
+    res.json({ results });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Delivery download in a compression preset: web / proof / whatsapp
+// re-encode (never enlarge); full (default) is the untouched original.
+// Videos always serve the original regardless of preset.
+router.get("/:id/photos/:photoId/download", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const photo = await prisma.photo.findFirst({
+      where: { id: req.params.photoId, eventId: event.id },
+    });
+    if (!photo) return res.status(404).json({ error: "Photo not found" });
+    const preset = req.query.preset || "full";
+    if (!["full", "web", "proof", "whatsapp"].includes(preset)) {
+      return res.status(400).json({ error: 'preset must be "full", "web", "proof" or "whatsapp"' });
+    }
+
+    const buffer = await loadPhotoBytes(photo);
+    if (!buffer) {
+      return res.status(404).json({ error: "This photo's original is no longer available." });
+    }
+    if (preset === "full") {
+      const ext = path.extname(photo.filename || "").toLowerCase();
+      const types = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
+      res.setHeader("Content-Type", types[ext] || "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename="${photo.filename.replace(/"/g, "")}"`);
+      return res.send(buffer);
+    }
+    const variant = await renderVariant(photo, buffer, preset);
+    if (!variant) {
+      return res.status(404).json({ error: "This preset isn't available for this file." });
+    }
+    res.setHeader("Content-Type", variant.contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${variant.filename}"`);
+    res.send(variant.buffer);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Set the event cover from an existing photo (the picker's "use this"
+// action) — same single-file semantics as uploading a cover.
+router.post("/:id/cover/from-photo", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { photo_id: photoId } = req.body || {};
+    if (typeof photoId !== "string") {
+      return res.status(400).json({ error: "photo_id is required" });
+    }
+    const photo = await prisma.photo.findFirst({
+      where: { id: photoId, eventId: event.id },
+    });
+    if (!photo) return res.status(404).json({ error: "Photo not found" });
+    const buffer = await loadPhotoBytes(photo);
+    if (!buffer) {
+      return res.status(404).json({ error: "This photo's original is no longer available." });
+    }
+    const coverPath = await saveEventCover(event.id, photo.filename, buffer);
+    await prisma.event.update({ where: { id: event.id }, data: { coverPhotoPath: coverPath } });
+    res.json({ cover_url: `/files/events/${event.id}/cover` });
   } catch (err) {
     next(err);
   }
@@ -1867,6 +2155,18 @@ router.get("/:id/photos", async (req, res, next) => {
         face_search_visible: p.faceSearchVisible,
         photo_selection_visible: p.photoSelectionVisible,
         highlighted: p.highlighted,
+        // Phase 9 (tools pack): analysis + curation fields for filters,
+        // metadata view, duplicates, and cover scoring.
+        file_hash: p.fileHash,
+        sharpness: p.sharpness,
+        color_tag: p.colorTag,
+        rating: p.rating,
+        exif_camera: p.exifCamera,
+        exif_lens: p.exifLens,
+        exif_iso: p.exifIso,
+        exif_shutter: p.exifShutter,
+        exif_aperture: p.exifAperture,
+        exif_captured_at: p.exifCapturedAt,
         face_indexed_at: p.faceIndexedAt,
       }))
     );
