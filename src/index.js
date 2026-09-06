@@ -56,10 +56,12 @@ const corsOptions = {
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
   maxAge: 86400,
+  // Some browsers/devices stall TypedArray... legacy clients hang on 200
+  // with empty body — 204 ends the preflight immediately.
+  optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
 app.use(cookieParser());
 app.use(express.json());
 

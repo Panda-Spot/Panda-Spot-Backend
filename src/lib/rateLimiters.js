@@ -11,6 +11,9 @@ function makeLimiter({ windowMs, limit }) {
     limit,
     standardHeaders: true,
     legacyHeaders: false,
+    // CORS preflights must never count against (or wait on) a limiter —
+    // browsers fire one before the real call and stall the page if it 429s.
+    skip: (req) => req.method === "OPTIONS",
     handler: (req, res, next, options) => {
       res.status(429).json({ error: "Too many requests — please try again later." });
     },
