@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
+import { notify } from "../lib/notify.js";
 
 const router = Router();
 
@@ -141,6 +142,17 @@ router.post("/:token/accept", requireAuth, async (req, res, next) => {
       data: { acceptedAt: new Date() },
     });
 
+    // Notify the event owner that their invite was accepted.
+    const event = await prisma.event.findUnique({ where: { id: invite.eventId }, select: { ownerId: true, name: true } });
+    if (event) {
+      await notify(event.ownerId, {
+        type: "invite_accepted",
+        title: "Collaboration accepted",
+        message: `${actor.email} accepted your invite to "${event.name}"`,
+        eventId: invite.eventId,
+      });
+    }
+
     res.json({ ok: true, event_id: invite.eventId, accepted_at: updated.acceptedAt });
   } catch (err) {
     next(err);
@@ -165,6 +177,17 @@ router.post("/:token/decline", requireAuth, async (req, res, next) => {
       where: { id: invite.id },
       data: { declinedAt: new Date() },
     });
+
+    // Notify the event owner that their invite was declined.
+    const event = await prisma.event.findUnique({ where: { id: invite.eventId }, select: { ownerId: true, name: true } });
+    if (event) {
+      await notify(event.ownerId, {
+        type: "invite_declined",
+        title: "Collaboration declined",
+        message: `${actor.email} declined your invite to "${event.name}"`,
+        eventId: invite.eventId,
+      });
+    }
 
     res.json({ ok: true, event_id: invite.eventId, declined_at: updated.declinedAt });
   } catch (err) {

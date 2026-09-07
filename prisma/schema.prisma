@@ -143,6 +143,8 @@ model User {
   /// defense.
   failedLoginAttempts Int       @default(0)
   lockedUntil         DateTime?
+
+  notifications       Notification[]
 }
 
 /// MERGE (Studio-Verse): a specific JWT (by its `jti` claim), blocked
@@ -195,6 +197,10 @@ model Event {
   createdAt DateTime @default(now())
   photos    Photo[]
 
+  /// Optional event type tag (e.g. "wedding", "corporate", "birthday").
+  /// Set at creation from a preset; used for filtering on the events list.
+  eventType String?
+
   /// Per-event override of the global FACE_MATCH_THRESHOLD env default —
   /// null until a guest's "not me" feedback nudges it. See lib/threshold.js.
   matchThreshold Float?
@@ -210,6 +216,7 @@ model Event {
   collaborators EventCollaborator[]
   invites       EventInvite[]
   alertSubscriptions GuestAlertSubscription[]
+  notifications      Notification[]
 
   /// MERGE (Studio-Verse): independent feature toggles so an event can run
   /// Face Search and/or Photo Selection at the same time — see
@@ -1585,4 +1592,26 @@ model Expense {
 
   @@index([tenantId])
   @@index([eventId])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// collaborator_invite | invite_accepted | invite_declined |
+  /// admin_alert | event_created | event_deleting_soon |
+  /// quota_50 | quota_90 | quota_100 |
+  /// album_approved | favourites_submitted | album_correction | album_proofing |
+  /// client_approved
+  type      String
+  title     String
+  message   String?
+  /// Optional linked event for deep-linking
+  eventId   String?
+  event     Event?   @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt(sort: Desc)])
 }

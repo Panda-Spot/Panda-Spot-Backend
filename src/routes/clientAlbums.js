@@ -6,6 +6,7 @@ import { loadAlbum, albumDetail, commentShape, createComment } from "./albums.js
 import { buildAlbumProofPdf } from "../lib/albumProof.js";
 import { exportFilename } from "../lib/selectionExport.js";
 import { sendAlbumApprovedEmail, sendAlbumChangesRequestedEmail } from "../lib/mailer.js";
+import { notify } from "../lib/notify.js";
 
 async function notifyOwner(event, album, kind, extra = {}) {
   try {
@@ -224,6 +225,13 @@ router.post("/:albumId/approve", async (req, res, next) => {
     // Phase 7: best-effort studio notification (never fails the request).
     notifyOwner(loaded.event, loaded.album, "approved", {
       clientName: req.user.name || req.user.email,
+    });
+    // In-app notification to the event owner.
+    await notify(loaded.event.ownerId, {
+      type: "album_approved",
+      title: "Album approved",
+      message: `${req.user.name || req.user.email} approved "${loaded.album.name}"`,
+      eventId: loaded.event.id,
     });
     res.json({ status: updated.status, locked_at: updated.lockedAt });
   } catch (err) {

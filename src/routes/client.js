@@ -12,6 +12,7 @@ import {
   exportFilename,
   resolveSelection,
 } from "../lib/selectionExport.js";
+import { notify } from "../lib/notify.js";
 
 const router = Router();
 
@@ -231,6 +232,16 @@ router.post("/events/:id/submit", async (req, res, next) => {
       where: { id: mapping.id },
       data: { submittedAt: new Date() },
     });
+    // In-app notification to the event owner that favourites were submitted.
+    const event = await prisma.event.findUnique({ where: { id: mapping.eventId }, select: { ownerId: true, name: true } });
+    if (event) {
+      await notify(event.ownerId, {
+        type: "favourites_submitted",
+        title: "Favourites submitted",
+        message: `${req.user.name || req.user.email} submitted their photo selection for "${event.name}"`,
+        eventId: mapping.eventId,
+      });
+    }
     res.json({ submitted_at: updated.submittedAt });
   } catch (err) {
     next(err);

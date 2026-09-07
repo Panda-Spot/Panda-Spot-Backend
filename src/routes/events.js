@@ -31,6 +31,7 @@ import { getFaceGroups } from "../lib/faceClustering.js";
 import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter, collabInviteLimiter } from "../lib/rateLimiters.js";
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
 import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
+import { notify } from "../lib/notify.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
 import { extractFolderId, listImageFiles, testFolderAccess } from "../lib/googleDrive.js";
 import { processDriveImportJob, processDriveSyncJob } from "../lib/driveSync.js";
@@ -70,7 +71,7 @@ async function generateUniqueSlug() {
 
 router.post("/", async (req, res, next) => {
   try {
-    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt, event_date: eventDate } = req.body || {};
+    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt, event_date: eventDate, event_type: eventType } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
     }
@@ -104,6 +105,7 @@ router.post("/", async (req, res, next) => {
         ...(typeof faceSearchOpt === "boolean" ? { faceSearchEnabled: faceSearchOpt } : {}),
         ...(typeof photoSelectionOpt === "boolean" ? { photoSelectionEnabled: photoSelectionOpt } : {}),
         ...(parsedEventDate ? { eventDate: parsedEventDate } : {}),
+        ...(eventType && typeof eventType === "string" ? { eventType: eventType.trim() } : {}),
       },
     });
 
@@ -163,7 +165,10 @@ router.get("/", async (req, res, next) => {
         role: e.role,
         face_search_enabled: e.faceSearchEnabled,
         photo_selection_enabled: e.photoSelectionEnabled,
+        guest_upload_enabled: e.guestUploadEnabled,
+        shoots_connected: !!e.ftpUsername,
         event_date: e.eventDate,
+        event_type: e.eventType,
       }))
     );
   } catch (err) {
@@ -2926,6 +2931,16 @@ router.post("/:id/collaborators", collabInviteLimiter, async (req, res, next) =>
 
     const inviteUrl = `${PUBLIC_WEB_URL}/invites/${invite.token}`;
     await sendCollaboratorInviteEmail(normalizedEmail, event.name, inviteUrl);
+
+    // Notify the invited user (if they have an account).
+    if (existingUser) {
+      await notify(existingUser.id, {
+        type: "collaborator_invite",
+        title: "You've been invited to collaborate",
+        message: `${owner?.name || "A studio"} invited you to "${event.name}"`,
+        eventId: event.id,
+      });
+    }
 
     res.json({ status: "invited", email: normalizedEmail });
   } catch (err) {

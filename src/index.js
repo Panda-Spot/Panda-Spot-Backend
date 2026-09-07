@@ -19,6 +19,7 @@ import subscriptionsRoutes from "./routes/subscriptions.js";
 import billingRoutes from "./routes/billing.js";
 import supportRoutes from "./routes/support.js";
 import adminRoutes from "./routes/admin.js";
+import notificationRoutes from "./routes/notifications.js";
 import { startAutoSyncScheduler } from "./lib/driveSync.js";
 import { startShootsServer } from "./lib/ftpShoots.js";
 import { startDriveBackupRetentionScheduler } from "./lib/driveBackupRetention.js";
@@ -85,6 +86,7 @@ app.use("/subscriptions", subscriptionsRoutes);
 app.use("/billing", billingRoutes);
 app.use("/support", supportRoutes);
 app.use("/admin", adminRoutes);
+app.use("/notifications", notificationRoutes);
 
 // Multer file-size/type errors and anything passed to next(err) lands here.
 app.use((err, _req, res, _next) => {
