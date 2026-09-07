@@ -2,6 +2,7 @@ import { Router } from "express";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
+import { generateReadableSlug } from "../lib/slugWords.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireRole } from "../middleware/role.js";
 import { upload } from "../middleware/upload.js";
@@ -92,12 +93,7 @@ function asDate(value, field) {
 }
 
 async function generateGuestSlug() {
-  for (let i = 0; i < 5; i++) {
-    const slug = randomBytes(6).toString("base64url");
-    const existing = await prisma.event.findUnique({ where: { guestSlug: slug } });
-    if (!existing) return slug;
-  }
-  throw Object.assign(new Error("Could not generate a unique link — try again"), { status: 500 });
+  return generateReadableSlug(prisma);
 }
 
 // --- Inquiries ---

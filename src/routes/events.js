@@ -389,6 +389,21 @@ router.post("/:id/start", async (req, res, next) => {
       return res.json({ started: true, started_at: event.startedAt });
     }
     const updated = await prisma.event.update({ where: { id: event.id }, data: { startedAt: new Date() } });
+
+    // Notify all collaborators that the event has started.
+    const collabs = await prisma.eventCollaborator.findMany({
+      where: { eventId: event.id },
+      select: { userId: true },
+    });
+    for (const c of collabs) {
+      await notify(c.userId, {
+        type: "event_started",
+        title: "Event has started",
+        message: `"${event.name}" has been started by the owner. You can now access all event features.`,
+        eventId: event.id,
+      });
+    }
+
     res.json({ started: true, started_at: updated.startedAt });
   } catch (err) {
     next(err);
