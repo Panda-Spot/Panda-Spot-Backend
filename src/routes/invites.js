@@ -4,15 +4,28 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
+// Resolves who is acting on an invite.
+// The env-backed SUPER_ADMIN has no User row in the database, so it can
+// never be looked up by id — use its verified env email instead. Everyone
+// else resolves through their User row (401 when the account is gone).
+async function resolveInviteActor(req) {
+  if (req.user?.envSuperAdmin) {
+    return { userId: null, email: req.user.email, envSuperAdmin: true };
+  }
+  const me = await prisma.user.findUnique({ where: { id: req.user.id } });
+  if (!me) return null;
+  return { userId: me.id, email: me.email, envSuperAdmin: false };
+}
+
 // My invitations — logged-in user lists invites sent to their own email.
 // Used by the separate "My Invitations" page (manual Accept/Reject).
 router.get("/mine", requireAuth, async (req, res, next) => {
   try {
-    const me = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (!me) return res.status(401).json({ error: "Account not found" });
+    const actor = await resolveInviteActor(req);
+    if (!actor) return res.status(401).json({ error: "Account not found" });
     const rows = await prisma.eventInvite.findMany({
       where: {
-        email: { equals: me.email, mode: "insensitive" },
+        email: { equals: actor.email, mode: "insensitive" },
         acceptedAt: null,
         declinedAt: null,
       },
@@ -101,16 +114,21 @@ router.post("/:token/accept", requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: "Invite not found" });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (!user || user.email.toLowerCase() !== invite.email.toLowerCase()) {
+    const actor = await resolveInviteActor(req);
+    if (!actor) return res.status(401).json({ error: "Account not found" });
+    if (actor.email.toLowerCase() !== invite.email.toLowerCase()) {
       return res.status(403).json({ error: "This invite was sent to a different email address" });
     }
 
-    await prisma.eventCollaborator.upsert({
-      where: { eventId_userId: { eventId: invite.eventId, userId: user.id } },
-      create: { eventId: invite.eventId, userId: user.id },
-      update: {},
-    });
+    // Env SUPER_ADMIN already bypasses event access checks server-side, so
+    // there is no collaborator row to create — just record the acceptance.
+    if (!actor.envSuperAdmin) {
+      await prisma.eventCollaborator.upsert({
+        where: { eventId_userId: { eventId: invite.eventId, userId: actor.userId } },
+        create: { eventId: invite.eventId, userId: actor.userId },
+        update: {},
+      });
+    }
 
     const updated = await prisma.eventInvite.update({
       where: { id: invite.id },
@@ -131,8 +149,9 @@ router.post("/:token/decline", requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: "Invite not found" });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (!user || user.email.toLowerCase() !== invite.email.toLowerCase()) {
+    const actor = await resolveInviteActor(req);
+    if (!actor) return res.status(401).json({ error: "Account not found" });
+    if (actor.email.toLowerCase() !== invite.email.toLowerCase()) {
       return res.status(403).json({ error: "This invite was sent to a different email address" });
     }
 

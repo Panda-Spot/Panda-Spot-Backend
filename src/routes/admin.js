@@ -1009,6 +1009,13 @@ router.get("/events/:id", async (req, res, next) => {
       photoSourceCounts[row.source] = row._count;
     }
 
+    // Full invite audit log for this event (pending / accepted / declined
+    // with timestamps) — super-admin visibility into who was invited when.
+    const inviteRows = await prisma.eventInvite.findMany({
+      where: { eventId: event.id },
+      orderBy: { createdAt: "desc" },
+    });
+
     res.json({
       id: event.id,
       name: event.name,
@@ -1039,6 +1046,14 @@ router.get("/events/:id", async (req, res, next) => {
       shoots_connected: !!event.ftpUsername,
       drive_backup_enabled: event.driveBackupEnabled,
       collaborators: event.collaborators.map((c) => ({ id: c.user.id, name: c.user.name, email: c.user.email })),
+      invites: inviteRows.map((i) => ({
+        invite_id: i.id,
+        email: i.email,
+        status: i.acceptedAt ? "accepted" : i.declinedAt ? "declined" : "pending",
+        invited_at: i.createdAt,
+        accepted_at: i.acceptedAt,
+        declined_at: i.declinedAt || null,
+      })),
     });
   } catch (err) {
     next(err);
