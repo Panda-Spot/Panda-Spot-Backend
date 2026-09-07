@@ -5,6 +5,7 @@ import path from "node:path";
 import fsp from "node:fs/promises";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
+import { generateReadableSlug } from "../lib/slugWords.js";
 import { requireAuth } from "../middleware/auth.js";
 import { upload } from "../middleware/upload.js";
 import {
@@ -59,14 +60,7 @@ function guestLinkPath(slug) {
 }
 
 async function generateUniqueSlug() {
-  // A handful of URL-safe random chars; collision chance is negligible at
-  // this length, but we check anyway since it costs one cheap query.
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const slug = randomBytes(6).toString("base64url");
-    const existing = await prisma.event.findUnique({ where: { guestSlug: slug } });
-    if (!existing) return slug;
-  }
-  throw new Error("Could not generate a unique guest slug, please retry");
+  return generateReadableSlug(prisma);
 }
 
 router.post("/", async (req, res, next) => {
