@@ -70,9 +70,16 @@ async function generateUniqueSlug() {
 
 router.post("/", async (req, res, next) => {
   try {
-    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt } = req.body || {};
+    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt, event_date: eventDate } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
+    }
+    let parsedEventDate = null;
+    if (eventDate) {
+      parsedEventDate = new Date(eventDate);
+      if (Number.isNaN(parsedEventDate.getTime())) {
+        return res.status(400).json({ error: "event_date must be a valid date" });
+      }
     }
 
     const owner = await prisma.user.findUnique({ where: { id: req.user.id } });
@@ -96,6 +103,7 @@ router.post("/", async (req, res, next) => {
         // photo selection off), e.g. for inquiry-converted events.
         ...(typeof faceSearchOpt === "boolean" ? { faceSearchEnabled: faceSearchOpt } : {}),
         ...(typeof photoSelectionOpt === "boolean" ? { photoSelectionEnabled: photoSelectionOpt } : {}),
+        ...(parsedEventDate ? { eventDate: parsedEventDate } : {}),
       },
     });
 
@@ -155,6 +163,7 @@ router.get("/", async (req, res, next) => {
         role: e.role,
         face_search_enabled: e.faceSearchEnabled,
         photo_selection_enabled: e.photoSelectionEnabled,
+        event_date: e.eventDate,
       }))
     );
   } catch (err) {
@@ -1630,6 +1639,10 @@ router.delete("/:id", async (req, res, next) => {
   try {
     const event = await loadOwnedEvent(req, res);
     if (!event) return;
+
+    if (!event.archivedAt) {
+      return res.status(400).json({ error: "Archive the event before permanently deleting it." });
+    }
 
     await deleteEventCascade(event);
 
