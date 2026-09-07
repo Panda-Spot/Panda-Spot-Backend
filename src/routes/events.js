@@ -153,6 +153,8 @@ router.get("/", async (req, res, next) => {
         cover_url: e.coverPhotoPath ? `/files/events/${e.id}/cover` : null,
         photo_count: e._count.photos,
         role: e.role,
+        face_search_enabled: e.faceSearchEnabled,
+        photo_selection_enabled: e.photoSelectionEnabled,
       }))
     );
   } catch (err) {
