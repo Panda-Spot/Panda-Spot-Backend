@@ -8,7 +8,7 @@ import { signToken, setAuthCookie, clearAuthCookie, requireAuth, blocklistToken 
 import { sendEmailVerificationEmail, sendPasswordResetEmail } from "../lib/mailer.js";
 import { activateTrial } from "../lib/subscriptionAccess.js";
 import { authLimiter, registerLimiter } from "../lib/rateLimiters.js";
-import { envSuperAdminUser, isAdminEmail, isEnvSuperAdminCredentials } from "../middleware/admin.js";
+import { envSuperAdminUser, isAdminEmail, isEnvSuperAdminCredentials, isEnvSuperAdminEmail } from "../middleware/admin.js";
 import {
   isDriveBackupConfigured,
   isDriveBackupBetaUser,
@@ -385,6 +385,19 @@ router.post("/google", async (req, res, next) => {
     const email = (payload.email || "").toLowerCase();
     if (!email) {
       return res.status(400).json({ error: "Google account has no email" });
+    }
+
+    // Env super-admin via Google: same elevation as password login — if the
+    // Google-verified email matches SUPER_ADMIN_EMAIL (or ADMIN_EMAIL
+    // fallback), issue the env SUPER_ADMIN session instead of a studio User
+    // session. No User row needed, suspension N/A (env account).
+    if (isEnvSuperAdminEmail(email)) {
+      const admin = envSuperAdminUser();
+      if (admin) {
+        const token = signToken(admin);
+        setAuthCookie(res, token);
+        return res.json({ ...publicUser(admin), token });
+      }
     }
 
     let user = await prisma.user.findUnique({ where: { googleId } });
