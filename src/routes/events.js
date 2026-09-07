@@ -70,7 +70,7 @@ async function generateUniqueSlug() {
 
 router.post("/", async (req, res, next) => {
   try {
-    const { name } = req.body || {};
+    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
     }
@@ -86,7 +86,17 @@ router.post("/", async (req, res, next) => {
 
     const guestSlug = await generateUniqueSlug();
     const event = await prisma.event.create({
-      data: { name: name.trim(), ownerId: req.user.id, guestSlug, expiresAt: computeExpiresAt() },
+      data: {
+        name: name.trim(),
+        ownerId: req.user.id,
+        guestSlug,
+        expiresAt: computeExpiresAt(),
+        // Feature choice at creation (mandatory in the UI — pick at least
+        // one). Omitted here falls back to schema defaults (face search on,
+        // photo selection off), e.g. for inquiry-converted events.
+        ...(typeof faceSearchOpt === "boolean" ? { faceSearchEnabled: faceSearchOpt } : {}),
+        ...(typeof photoSelectionOpt === "boolean" ? { photoSelectionEnabled: photoSelectionOpt } : {}),
+      },
     });
 
     res.status(201).json({ ...event, guestLink: guestLinkPath(event.guestSlug) });

@@ -29,7 +29,7 @@ router.get("/mine", requireAuth, async (req, res, next) => {
         acceptedAt: null,
         declinedAt: null,
       },
-      include: { event: true },
+      include: { event: { include: { owner: { select: { name: true, email: true, studioName: true } } } } },
       orderBy: { createdAt: "desc" },
     });
     res.json({
@@ -40,6 +40,9 @@ router.get("/mine", requireAuth, async (req, res, next) => {
         event_id: i.eventId,
         event_name: i.event?.name || "Event",
         invited_at: i.createdAt,
+        inviter_name: i.event?.owner?.name || null,
+        inviter_email: i.event?.owner?.email || null,
+        studio_name: i.event?.owner?.studioName || null,
       })),
     });
   } catch (err) {
@@ -87,7 +90,7 @@ router.get("/:token", async (req, res, next) => {
   try {
     const invite = await prisma.eventInvite.findUnique({
       where: { token: req.params.token },
-      include: { event: true },
+      include: { event: { include: { owner: { select: { name: true, email: true, studioName: true } } } } },
     });
     // Consumed or declined invites are no longer previewable.
     if (!invite || invite.acceptedAt || invite.declinedAt) {
@@ -99,6 +102,9 @@ router.get("/:token", async (req, res, next) => {
       event_name: invite.event.name,
       email: invite.email,
       invited_at: invite.createdAt,
+      inviter_name: invite.event?.owner?.name || null,
+      inviter_email: invite.event?.owner?.email || null,
+      studio_name: invite.event?.owner?.studioName || null,
     });
   } catch (err) {
     next(err);
