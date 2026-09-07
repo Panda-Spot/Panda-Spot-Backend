@@ -28,7 +28,7 @@ import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/maile
 import { contentMatchesExtension, isVideoExtension, isVideoFilename } from "../lib/fileValidation.js";
 import { getEffectiveThreshold } from "../lib/threshold.js";
 import { getFaceGroups } from "../lib/faceClustering.js";
-import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter } from "../lib/rateLimiters.js";
+import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter, collabInviteLimiter } from "../lib/rateLimiters.js";
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
 import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
 import { generateThumbnail } from "../lib/thumbnails.js";
@@ -2855,7 +2855,7 @@ router.get("/:id/analytics", async (req, res, next) => {
 // to manage other collaborators, so these use loadOwnedEvent, not
 // loadAccessibleEvent). ---
 
-router.post("/:id/collaborators", async (req, res, next) => {
+router.post("/:id/collaborators", collabInviteLimiter, async (req, res, next) => {
   try {
     const event = await loadOwnedEvent(req, res);
     if (!event) return;
@@ -2871,39 +2871,53 @@ router.post("/:id/collaborators", async (req, res, next) => {
       return res.status(400).json({ error: "You can't invite yourself" });
     }
 
+    // Verify the invited user exists in the system and their account is active.
     const existingUser = await prisma.user.findUnique({ where: { email: normalizedEmail } });
-
-    // Manual approval only: even if the account already exists, do NOT add
-    // them directly — always go through an invite they must Accept.
-    if (existingUser) {
-      const already = await prisma.eventCollaborator.findUnique({
-        where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
-      });
-      if (already) {
-        return res.status(400).json({ error: "That user is already a collaborator on this event" });
-      }
+    if (!existingUser) {
+      return res.status(400).json({ error: "No account found for this email. They need to sign up first." });
+    }
+    if (existingUser.status === "SUSPENDED" || existingUser.status === "DEACTIVATED") {
+      return res.status(400).json({ error: "That account is inactive and cannot be invited." });
     }
 
-    // No account yet (or existing account, manual flow) — reuse an existing
-    // pending invite for this event+email if there is one, instead of
-    // creating a duplicate row. A previously declined invite is re-opened.
+    // Already a collaborator on this event?
+    const alreadyCollab = await prisma.eventCollaborator.findUnique({
+      where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
+    });
+    if (alreadyCollab) {
+      return res.status(400).json({ error: "That user is already a collaborator on this event" });
+    }
+
+    // Reject duplicate pending invitation for the same email on this event.
+    const existingPending = await prisma.eventInvite.findFirst({
+      where: {
+        eventId: event.id,
+        email: { equals: normalizedEmail, mode: "insensitive" },
+        acceptedAt: null,
+        declinedAt: null,
+      },
+    });
+    if (existingPending) {
+      return res.status(400).json({ error: "An invitation is already pending for this email." });
+    }
+
+    // A previously declined invite is re-opened; otherwise create fresh.
     let invite = await prisma.eventInvite.findFirst({
       where: {
         eventId: event.id,
-        acceptedAt: null,
         email: { equals: normalizedEmail, mode: "insensitive" },
+        acceptedAt: null,
+        declinedAt: { not: null },
       },
       orderBy: { createdAt: "desc" },
     });
 
-    if (invite?.declinedAt) {
+    if (invite) {
       invite = await prisma.eventInvite.update({
         where: { id: invite.id },
         data: { declinedAt: null },
       });
-    }
-
-    if (!invite) {
+    } else {
       const token = randomBytes(24).toString("base64url");
       invite = await prisma.eventInvite.create({
         data: { eventId: event.id, email: normalizedEmail, token },

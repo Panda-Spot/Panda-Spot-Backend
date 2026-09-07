@@ -40,3 +40,4 @@ export const guestCommentLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit
 // /auth/register, which already has registerLimiter. This was a real gap
 // (added in Phase 7, no limiter applied) found during this review pass.
 export const clientInviteLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, limit: 10 }); // client-invite preview + accept
+export const collabInviteLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 10 }); // collaborator invite (owner spam guard)
