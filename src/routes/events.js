@@ -2848,24 +2848,35 @@ router.post("/:id/collaborators", async (req, res, next) => {
 
     const existingUser = await prisma.user.findUnique({ where: { email: normalizedEmail } });
 
+    // Manual approval only: even if the account already exists, do NOT add
+    // them directly — always go through an invite they must Accept.
     if (existingUser) {
-      await prisma.eventCollaborator.upsert({
+      const already = await prisma.eventCollaborator.findUnique({
         where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
-        create: { eventId: event.id, userId: existingUser.id },
-        update: {},
       });
-      return res.json({ status: "added", email: normalizedEmail });
+      if (already) {
+        return res.status(400).json({ error: "That user is already a collaborator on this event" });
+      }
     }
 
-    // No account yet — reuse an existing not-yet-accepted invite for this
-    // event+email if there is one, instead of creating a duplicate row.
+    // No account yet (or existing account, manual flow) — reuse an existing
+    // pending invite for this event+email if there is one, instead of
+    // creating a duplicate row. A previously declined invite is re-opened.
     let invite = await prisma.eventInvite.findFirst({
       where: {
         eventId: event.id,
         acceptedAt: null,
         email: { equals: normalizedEmail, mode: "insensitive" },
       },
+      orderBy: { createdAt: "desc" },
     });
+
+    if (invite?.declinedAt) {
+      invite = await prisma.eventInvite.update({
+        where: { id: invite.id },
+        data: { declinedAt: null },
+      });
+    }
 
     if (!invite) {
       const token = randomBytes(24).toString("base64url");
@@ -2893,7 +2904,15 @@ router.get("/:id/collaborators", async (req, res, next) => {
       include: { user: true },
     });
     const pendingInviteRows = await prisma.eventInvite.findMany({
-      where: { eventId: event.id, acceptedAt: null },
+      where: { eventId: event.id, acceptedAt: null, declinedAt: null },
+    });
+    const acceptedInviteRows = await prisma.eventInvite.findMany({
+      where: { eventId: event.id, acceptedAt: { not: null } },
+      orderBy: { acceptedAt: "desc" },
+    });
+    const declinedInviteRows = await prisma.eventInvite.findMany({
+      where: { eventId: event.id, declinedAt: { not: null }, acceptedAt: null },
+      orderBy: { declinedAt: "desc" },
     });
 
     res.json({
@@ -2901,11 +2920,24 @@ router.get("/:id/collaborators", async (req, res, next) => {
         user_id: c.user.id,
         email: c.user.email,
         name: c.user.name,
+        joined_at: c.createdAt,
       })),
       pending_invites: pendingInviteRows.map((i) => ({
         invite_id: i.id,
         email: i.email,
         invited_at: i.createdAt,
+      })),
+      accepted_invites: acceptedInviteRows.map((i) => ({
+        invite_id: i.id,
+        email: i.email,
+        invited_at: i.createdAt,
+        accepted_at: i.acceptedAt,
+      })),
+      declined_invites: declinedInviteRows.map((i) => ({
+        invite_id: i.id,
+        email: i.email,
+        invited_at: i.createdAt,
+        declined_at: i.declinedAt,
       })),
     });
   } catch (err) {

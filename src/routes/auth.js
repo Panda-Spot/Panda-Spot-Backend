@@ -74,28 +74,9 @@ router.post("/register", registerLimiter, async (req, res, next) => {
       data: { email: email.toLowerCase(), passwordHash, name },
     });
 
-    // Auto-accept any pending collaborator invites sent to this email before
-    // the user ever signed up — a bonus convenience, not load-bearing (the
-    // frontend's explicit /invites/:token accept flow is a safety net for
-    // this too), so failures here must never fail registration itself.
-    try {
-      const pendingInvites = await prisma.eventInvite.findMany({
-        where: { acceptedAt: null, email: { equals: user.email, mode: "insensitive" } },
-      });
-      for (const invite of pendingInvites) {
-        await prisma.eventCollaborator.upsert({
-          where: { eventId_userId: { eventId: invite.eventId, userId: user.id } },
-          create: { eventId: invite.eventId, userId: user.id },
-          update: {},
-        });
-        await prisma.eventInvite.update({
-          where: { id: invite.id },
-          data: { acceptedAt: new Date() },
-        });
-      }
-    } catch (err) {
-      console.error(`Failed to auto-accept invites for new user ${user.id}:`, err);
-    }
+    // Manual collaborator approval: pending invites are NEVER auto-accepted
+    // at signup. The invitee must open /invites/:token and click Accept.
+    // (Kept as a no-op block so the intent is explicit in code history.)
 
     // Soft, non-blocking email verification — sending this must never fail
     // the registration response itself, same pattern as the invite

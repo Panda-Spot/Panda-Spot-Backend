@@ -417,10 +417,10 @@ model EventCollaborator {
 }
 
 /// A pending collaborator invite sent to an email address that may not have
-/// a PandaSpot account yet. Accepted (see routes/invites.js) either right
-/// away if the account already existed, or once the invitee registers/logs
-/// in via the invite link — at which point an EventCollaborator row is
-/// created and acceptedAt is stamped.
+/// a PandaSpot account yet. Manual approval only (see routes/invites.js):
+/// the invitee must explicitly Accept (creates EventCollaborator + stamps
+/// acceptedAt) or Decline (stamps declinedAt). No auto-join on page open or
+/// at signup — the invite link is the only way in.
 model EventInvite {
   id         String    @id @default(uuid())
   eventId    String
@@ -429,6 +429,7 @@ model EventInvite {
   token      String    @unique
   createdAt  DateTime  @default(now())
   acceptedAt DateTime?
+  declinedAt DateTime?
 
   @@index([eventId])
   @@index([email])
