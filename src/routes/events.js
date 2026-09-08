@@ -534,7 +534,7 @@ router.post("/:id/features/toggle", async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
     if (!accessible) return;
-    const { event } = accessible;
+    const { event, role } = accessible;
 
     const { feature, enabled } = req.body || {};
     const FEATURE_COLUMNS = {
@@ -546,6 +546,13 @@ router.post("/:id/features/toggle", async (req, res, next) => {
     };
     if (!Object.hasOwn(FEATURE_COLUMNS, feature)) {
       return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", "pandashoots", "advancedTools", or "subGalleries"' });
+    }
+
+    // Turning a feature OFF is owner-only — collaborators may turn features
+    // on, but never off by themselves. The UI additionally requires typing
+    // the event name for owner offs.
+    if (enabled === false && role !== "owner") {
+      return res.status(403).json({ error: "Only the event owner can turn this feature off." });
     }
 
     const updated = await prisma.event.update({
