@@ -3164,12 +3164,19 @@ router.post("/:id/clients/create", async (req, res, next) => {
     if (!accessible) return;
     const { event } = accessible;
 
-    const { email, name, password, favourite_cap: favouriteCap } = req.body || {};
+    const { email, name, password, favourite_cap: favouriteCap, expires_at: expiresAtRaw } = req.body || {};
     if (!email || typeof email !== "string" || !EMAIL_RE.test(email)) {
       return res.status(400).json({ error: "A valid email address is required" });
     }
     if (favouriteCap != null && (!Number.isInteger(favouriteCap) || favouriteCap < 1)) {
       return res.status(400).json({ error: "favourite_cap must be a positive integer, or omitted for no cap" });
+    }
+    let expiresAt = null;
+    if (expiresAtRaw != null && expiresAtRaw !== "") {
+      expiresAt = new Date(expiresAtRaw);
+      if (Number.isNaN(expiresAt.getTime())) {
+        return res.status(400).json({ error: "expires_at must be a valid date, or omitted for no expiry" });
+      }
     }
     if (password != null && (typeof password !== "string" || password.length < 8)) {
       return res.status(400).json({ error: "password must be at least 8 characters" });
@@ -3181,10 +3188,15 @@ router.post("/:id/clients/create", async (req, res, next) => {
       if (existingUser.role !== "USER") {
         return res.status(409).json({ error: "This email already has a different kind of PandaSpot account" });
       }
+      // Same client, (possibly another) event: refresh the provided grant
+      // fields, leave the rest untouched.
+      const grantUpdate = {};
+      if (favouriteCap !== undefined) grantUpdate.favouriteCap = favouriteCap ?? null;
+      if (expiresAt !== null) grantUpdate.accessExpires = expiresAt;
       await prisma.eventUserMapping.upsert({
         where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
-        create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null },
-        update: {},
+        create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null, accessExpires: expiresAt },
+        update: grantUpdate,
       });
       return res.json({ status: "added", email: normalizedEmail, generated_password: null });
     }
@@ -3201,7 +3213,7 @@ router.post("/:id/clients/create", async (req, res, next) => {
       },
     });
     await prisma.eventUserMapping.create({
-      data: { eventId: event.id, userId: created.id, favouriteCap: favouriteCap ?? null },
+      data: { eventId: event.id, userId: created.id, favouriteCap: favouriteCap ?? null, accessExpires: expiresAt },
     });
     res.status(201).json({
       status: "created",
@@ -3251,21 +3263,34 @@ router.post("/:id/clients/invite", async (req, res, next) => {  try {
     if (!accessible) return;
     const { event } = accessible;
 
-    const { email, favourite_cap: favouriteCap } = req.body || {};
+    const { email, favourite_cap: favouriteCap, expires_at: expiresAtRaw } = req.body || {};
     if (!email || typeof email !== "string" || !EMAIL_RE.test(email)) {
       return res.status(400).json({ error: "A valid email address is required" });
     }
     if (favouriteCap != null && (!Number.isInteger(favouriteCap) || favouriteCap < 1)) {
       return res.status(400).json({ error: "favourite_cap must be a positive integer, or omitted for no cap" });
     }
+    let expiresAt = null;
+    if (expiresAtRaw != null && expiresAtRaw !== "") {
+      expiresAt = new Date(expiresAtRaw);
+      if (Number.isNaN(expiresAt.getTime())) {
+        return res.status(400).json({ error: "expires_at must be a valid date, or omitted for no expiry" });
+      }
+    }
     const normalizedEmail = email.toLowerCase();
 
     const existingUser = await prisma.user.findUnique({ where: { email: normalizedEmail } });
     if (existingUser && existingUser.role === "USER") {
+      // Same client on this event (possibly invited to other events with
+      // different caps/expiry — each mapping is per-event): refresh the
+      // provided grant fields, no email needed.
+      const grantUpdate = {};
+      if (favouriteCap !== undefined) grantUpdate.favouriteCap = favouriteCap ?? null;
+      if (expiresAt !== null) grantUpdate.accessExpires = expiresAt;
       await prisma.eventUserMapping.upsert({
         where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
-        create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null },
-        update: {},
+        create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null, accessExpires: expiresAt },
+        update: grantUpdate,
       });
       return res.json({ status: "added", email: normalizedEmail });
     }
@@ -3279,8 +3304,16 @@ router.post("/:id/clients/invite", async (req, res, next) => {  try {
     if (!invite) {
       const token = randomBytes(24).toString("base64url");
       invite = await prisma.clientInvite.create({
-        data: { eventId: event.id, email: normalizedEmail, token, favouriteCap: favouriteCap ?? null },
+        data: { eventId: event.id, email: normalizedEmail, token, favouriteCap: favouriteCap ?? null, expiresAt },
       });
+    } else {
+      // Re-inviting the same email refreshes the pending invite's terms.
+      const inviteUpdate = {};
+      if (favouriteCap !== undefined) inviteUpdate.favouriteCap = favouriteCap ?? null;
+      if (expiresAt !== null) inviteUpdate.expiresAt = expiresAt;
+      if (Object.keys(inviteUpdate).length > 0) {
+        invite = await prisma.clientInvite.update({ where: { id: invite.id }, data: inviteUpdate });
+      }
     }
 
     const inviteUrl = `${PUBLIC_WEB_URL}/client-invites/${invite.token}`;
@@ -3327,6 +3360,8 @@ router.get("/:id/clients", async (req, res, next) => {
         invite_id: i.id,
         email: i.email,
         invited_at: i.createdAt,
+        favourite_cap: i.favouriteCap,
+        expires_at: i.expiresAt,
       })),
     });
   } catch (err) {

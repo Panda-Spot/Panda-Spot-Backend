@@ -29,6 +29,8 @@ router.get("/:token", clientInviteLimiter, async (req, res, next) => {
       event_id: invite.event.id,
       event_name: invite.event.name,
       email: invite.email,
+      favourite_cap: invite.favouriteCap,
+      expires_at: invite.expiresAt,
       // Lets the frontend show "log in" vs. "set a password" — an
       // existing account (e.g. invited to a second event) doesn't need a
       // new password.
@@ -44,6 +46,9 @@ router.post("/:token/accept", clientInviteLimiter, async (req, res, next) => {
     const invite = await prisma.clientInvite.findUnique({ where: { token: req.params.token } });
     if (!invite || invite.acceptedAt) {
       return res.status(404).json({ error: "Invite not found" });
+    }
+    if (invite.expiresAt && new Date(invite.expiresAt) < new Date()) {
+      return res.status(410).json({ error: "This invite has expired — ask the studio for a fresh one." });
     }
 
     let user = await prisma.user.findUnique({ where: { email: invite.email.toLowerCase() } });
@@ -70,8 +75,9 @@ router.post("/:token/accept", clientInviteLimiter, async (req, res, next) => {
 
     await prisma.eventUserMapping.upsert({
       where: { eventId_userId: { eventId: invite.eventId, userId: user.id } },
-      create: { eventId: invite.eventId, userId: user.id, favouriteCap: invite.favouriteCap },
-      update: {},
+      create: { eventId: invite.eventId, userId: user.id, favouriteCap: invite.favouriteCap, accessExpires: invite.expiresAt },
+      // Studio may have re-invited with new terms since the mapping was made.
+      update: { favouriteCap: invite.favouriteCap, accessExpires: invite.expiresAt },
     });
 
     await prisma.clientInvite.update({ where: { id: invite.id }, data: { acceptedAt: new Date() } });

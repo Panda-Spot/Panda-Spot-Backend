@@ -621,6 +621,9 @@ model ClientInvite {
   email        String
   token        String    @unique
   favouriteCap Int?
+  /// Per-event access expiry chosen at invite time — copied onto the
+  /// EventUserMapping when the invite is accepted. Null = no expiry.
+  expiresAt    DateTime?
   createdAt    DateTime  @default(now())
   acceptedAt   DateTime?
 
