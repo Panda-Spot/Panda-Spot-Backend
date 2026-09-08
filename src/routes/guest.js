@@ -773,9 +773,15 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
           fileSize: file.buffer.length,
           source: "guest",
           approvalStatus: "pending",
+          // Manual face-routing (same policy as direct uploads): guest
+          // photos wait for explicit Add-to-AI-Search after approval —
+          // approval itself never indexes. Selection auto-joins while the
+          // feature is on (harmless pre-approval: client surfaces filter
+          // to approved photos).
           // Videos are browsed by clients, never face-matched by guests —
           // false keeps every guest face-search surface filtering them out.
-          faceSearchVisible: isVideo ? false : event.faceSearchEnabled,
+          faceSearchVisible: false,
+          photoSelectionVisible: event.photoSelectionEnabled,
           moderationFlagged,
           uploadedByGuestClientId: guestClientId,
           originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),

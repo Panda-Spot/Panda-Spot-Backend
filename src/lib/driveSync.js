@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { prisma } from "./prisma.js";
-import { detectFacesForPhoto, replacePhotoFaces } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
 import { deleteFileIfExists } from "./storage.js";
 import { downloadFile, downloadPartial, guessExtension, listImageFiles } from "./googleDrive.js";
@@ -9,7 +8,7 @@ import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.
 import { emitJobEvent } from "./jobQueue.js";
 import { checkAndNotifyForNewPhotos } from "./guestAlerts.js";
 import { publishLiveEvent } from "./liveEvents.js";
-import { assertQuotaAvailable, consumeAiPhotoCredits, consumeQuota } from "./subscriptionAccess.js";
+import { assertQuotaAvailable, consumeQuota } from "./subscriptionAccess.js";
 
 // Once per day — see runDueAutoSyncs below.
 const AUTO_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -46,17 +45,12 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
     return { skipped: `${file.name} (file content doesn't match its extension)` };
   }
 
-  let faces = [];
   let thumbnailPath = null;
   const photoId = randomUUID();
   if (!isVideo) {
-    try {
-      if (event.faceSearchEnabled) {
-        faces = await detectFacesForPhoto(buffer, file.name);
-      }
-    } catch (err) {
-      return { skipped: `${file.name} (${err.isFaceEngineError ? err.message : "could not process image"})` };
-    }
+    // Manual face-routing (same policy as direct uploads): thumbnails only
+    // at import. Faces are indexed later, only for photos explicitly added
+    // to AI Search — PandaShoots live capture is the sole auto exception.
     thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
   }
 
@@ -68,23 +62,19 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
       storagePath: null,
       driveFileId: file.id,
       thumbnailPath,
-      faceCount: faces.length,
+      faceCount: 0,
       fileSize,
       source: "drive_import",
       // Videos are browsed, never face-matched (see the import branch
       // above) — false keeps every guest face-search surface filtering
       // them out, same as direct-uploaded video.
-      faceSearchVisible: isVideo ? false : event.faceSearchEnabled,
+      faceSearchVisible: false,
+      photoSelectionVisible: event.photoSelectionEnabled,
       // No local original to expire — full-res is always fetched from
       // Drive live on demand, see lib/googleDrive.js.
       originalExpiresAt: null,
     },
   });
-
-  if (event.faceSearchEnabled && !isVideo) {
-    await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces });
-    await consumeAiPhotoCredits(event.ownerId);
-  }
 
   usedBytesRef.value += fileSize;
   if (quotaRef?.subscription) quotaRef.used += 1;
@@ -102,7 +92,7 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
   // source landing during a live event, not just Shoots.
   publishLiveEvent(event.id, { type: "photo_added", ...photoShape });
 
-  return { fileSize, facesFound: faces.length, photoId: photo.id, photo: photoShape };
+  return { fileSize, facesFound: 0, photoId: photo.id, photo: photoShape };
 }
 
 /** Removes a Photo whose Drive source file is gone: its Face rows, its

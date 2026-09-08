@@ -69,10 +69,12 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   let driveFileId = null;
   let platformDriveBackup = false;
 
-  if (event.driveBackupEnabled && event.driveFolderId) {
+  if (event.driveBackupEnabled && (event.exportDriveFolderId || event.driveFolderId)) {
     try {
       const driveFile = await uploadToDriveFolder({
-        folderId: event.driveFolderId,
+        // Explicit export folder wins; otherwise the import folder doubles
+        // as the export target (see Event.exportDriveFolderId).
+        folderId: event.exportDriveFolderId || event.driveFolderId,
         filename: originalFilename,
         mimeType: MIME_BY_EXT[ext] || "application/octet-stream",
         buffer,
@@ -102,7 +104,11 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       faceCount: faces.length,
       fileSize: buffer.length,
       source: "shoots",
+      // PandaShoots is the deliberate auto exception to manual
+      // face-routing: live capture can't be triaged per image, so captures
+      // join AI Search immediately while the feature is on.
       faceSearchVisible: event.faceSearchEnabled,
+      photoSelectionVisible: event.photoSelectionEnabled,
       // Only the platform's global default-retention clock — Drive-backed
       // captures are governed by driveBackupStartedAt/platformDriveBackup
       // above instead (a separate, stricter lifecycle).

@@ -303,10 +303,17 @@ router.get("/:id", async (req, res, next) => {
       photo_count: photoCount,
       ai_indexed_photo_count: aiIndexedPhotoCount,
       face_search_searchable_photo_count: faceSearchSearchablePhotoCount,
+      // Effective selfie-match strictness (0-1): per-event override when a
+      // guest's "not me" feedback nudged it, else the global default. Shown
+      // on the studio AI Search page so a too-strict threshold is visible
+      // instead of looking like "search is broken".
+      match_threshold: getEffectiveThreshold(event),
       storage_used_bytes: storageUsedBytes,
       storage_limit_bytes: effectiveStorageLimitBytes(owner),
       role,
       drive_folder_url: event.driveFolderUrl,
+      export_drive_folder_id: event.exportDriveFolderId,
+      export_drive_folder_url: event.exportDriveFolderUrl,
       drive_sync_enabled: event.driveSyncEnabled,
       last_drive_sync_at: event.lastDriveSyncAt,
       shoots_connected: !!event.ftpUsername,
@@ -1729,6 +1736,7 @@ async function processUploadJob(jobId, event, files) {
             fileSize: file.buffer.length,
             source: "upload",
             faceSearchVisible: false,
+            photoSelectionVisible: event.photoSelectionEnabled,
             originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
           },
         });
@@ -1747,59 +1755,47 @@ async function processUploadJob(jobId, event, files) {
         };
         publishLiveEvent(event.id, { type: "photo_added", ...addedPhoto });
       } else {
-        let faces = [];
-        try {
-          if (event.faceSearchEnabled) {
-            faces = await detectFacesForPhoto(file.buffer, file.originalname);
-          }
-        } catch (err) {
-          skipped.push(`${file.originalname} (${err.isFaceEngineError ? err.message : "could not process image"})`);
-          faces = null;
-        }
+        // Manual face-routing: uploads land with thumbnails only — no face
+        // detection, no Face rows, no AI credits spent here. Faces are
+        // indexed later, and only for photos the studio explicitly adds to
+        // AI Search (bulk-features → background index job). PandaShoots is
+        // the exception (live capture can't be triaged per image).
+        const photoId = randomUUID();
+        const storedFilename = `${photoId}${ext}`;
+        const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
+        const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
 
-        if (faces) {
-          const photoId = randomUUID();
-          const storedFilename = `${photoId}${ext}`;
-          const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
-          const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
+        const photo = await prisma.photo.create({
+          data: {
+            id: photoId,
+            eventId: event.id,
+            filename: file.originalname,
+            storagePath,
+            thumbnailPath,
+            faceCount: 0,
+            fileSize: file.buffer.length,
+            source: "upload",
+            faceSearchVisible: false,
+            photoSelectionVisible: event.photoSelectionEnabled,
+            originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
+          },
+        });
 
-          const photo = await prisma.photo.create({
-            data: {
-              id: photoId,
-              eventId: event.id,
-              filename: file.originalname,
-              storagePath,
-              thumbnailPath,
-              faceCount: faces.length,
-              fileSize: file.buffer.length,
-              source: "upload",
-              faceSearchVisible: event.faceSearchEnabled,
-              originalExpiresAt: new Date(Date.now() + effectivePhotoRetentionDays(owner) * 24 * 60 * 60 * 1000),
-            },
-          });
-
-          if (event.faceSearchEnabled) {
-            await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces });
-            await consumeAiPhotoCredits(event.ownerId);
-          }
-
-          facesFoundSoFar += faces.length;
-          usedBytes += file.buffer.length;
-          newPhotoIds.push(photo.id);
-          await consumeQuota(event.ownerId);
-          addedPhoto = {
-            photo_id: photo.id,
-            filename: photo.filename,
-            face_count: photo.faceCount,
-            createdAt: photo.createdAt,
-            url: `/files/events/${event.id}/photos/${photo.id}`,
-            thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
-            source: photo.source,
-          };
-          // So the public slideshow (guest.js's /:slug/live/stream) reflects
-          // every source landing during a live event, not just Shoots.
-          publishLiveEvent(event.id, { type: "photo_added", ...addedPhoto });
-        }
+        usedBytes += file.buffer.length;
+        newPhotoIds.push(photo.id);
+        await consumeQuota(event.ownerId);
+        addedPhoto = {
+          photo_id: photo.id,
+          filename: photo.filename,
+          face_count: 0,
+          createdAt: photo.createdAt,
+          url: `/files/events/${event.id}/photos/${photo.id}`,
+          thumbnail_url: `/files/events/${event.id}/photos/${photo.id}/thumb`,
+          source: photo.source,
+        };
+        // So the public slideshow (guest.js's /:slug/live/stream) reflects
+        // every source landing during a live event, not just Shoots.
+        publishLiveEvent(event.id, { type: "photo_added", ...addedPhoto });
       }
 
       completed += 1;
@@ -2003,6 +1999,69 @@ router.post("/:id/drive/connect", driveImportLimiter, async (req, res, next) => 
   }
 });
 
+// Separate export folder: backups/exports go here instead of the import
+// folder. Verified (readable + Editor) but never imported from — unlike
+// /drive/connect above this starts no job. Clearing it (DELETE) falls back
+// to exporting into the import folder.
+router.post("/:id/export-folder", driveImportLimiter, async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    if (!event.startedAt) {
+      return res.status(400).json({ error: "Start this event before connecting an export folder." });
+    }
+
+    const { folder_url } = req.body || {};
+    let folderId;
+    try {
+      folderId = extractFolderId(folder_url);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    try {
+      const { folderName, role } = await testFolderAccess(folderId);
+      if (role && role !== "writer") {
+        return res.status(400).json({ error: "Export needs the folder shared as Editor, not Viewer or Commenter." });
+      }
+      const updated = await prisma.event.update({
+        where: { id: event.id },
+        data: { exportDriveFolderId: folderId, exportDriveFolderUrl: folder_url },
+      });
+      res.json({
+        export_drive_folder_id: updated.exportDriveFolderId,
+        export_drive_folder_url: updated.exportDriveFolderUrl,
+        folder_name: folderName,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete("/:id/export-folder", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { exportDriveFolderId: null, exportDriveFolderUrl: null },
+    });
+    res.json({
+      export_drive_folder_id: updated.exportDriveFolderId,
+      export_drive_folder_url: updated.exportDriveFolderUrl,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Manual "Sync now" — requires an already-connected folder. Diffs the
 // folder's current contents against what's already imported: new files get
 // downloaded and processed, and photos whose Drive file was deleted get
@@ -2198,7 +2257,7 @@ router.post("/:id/drive-backup/toggle", async (req, res, next) => {
     if (!accessible) return;
     const { event } = accessible;
 
-    if (!event.driveFolderId) {
+    if (!event.driveFolderId && !event.exportDriveFolderId) {
       return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
     }
     if (!isDriveBackupConfigured()) {
@@ -2254,7 +2313,7 @@ router.post("/:id/drive-backup/backup-existing", driveImportLimiter, async (req,
     if (!accessible) return;
     const { event } = accessible;
 
-    if (!event.driveFolderId) {
+    if (!event.driveFolderId && !event.exportDriveFolderId) {
       return res.status(400).json({ error: "No Google Drive folder is connected for this event yet." });
     }
     if (!isDriveBackupConfigured()) {
@@ -2302,7 +2361,9 @@ async function processBackupExistingJob(jobId, event, photos) {
         const buffer = await fsp.readFile(photo.storagePath);
         const ext = path.extname(photo.storagePath).toLowerCase();
         const driveFile = await uploadToDriveFolder({
-          folderId: event.driveFolderId,
+          // Explicit export folder wins; otherwise the import folder doubles
+          // as the export target (see Event.exportDriveFolderId).
+          folderId: event.exportDriveFolderId || event.driveFolderId,
           filename: photo.filename,
           mimeType: MIME_BY_EXT[ext] || "application/octet-stream",
           buffer,
