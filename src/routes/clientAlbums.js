@@ -56,6 +56,12 @@ async function loadClientAlbum(req, res) {
     res.status(404).json({ error: "Album not found" });
     return null;
   }
+  // Assigned albums are visible only to their client; unassigned (null)
+  // albums stay visible to every event client (legacy behavior).
+  if (album.clientId && album.clientId !== req.user.id) {
+    res.status(404).json({ error: "Album not found" });
+    return null;
+  }
   return { mapping, event: mapping.event, album };
 }
 
@@ -82,6 +88,7 @@ router.get("/", async (req, res, next) => {
       where: {
         eventId: mapping.eventId,
         status: { not: "DRAFT" },
+        OR: [{ clientId: null }, { clientId: req.user.id }],
       },
       include: {
         versions: { select: { id: true, versionNumber: true, printPdfPath: true } },

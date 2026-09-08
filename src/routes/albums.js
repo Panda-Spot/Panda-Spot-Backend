@@ -94,6 +94,7 @@ async function loadAlbum(eventId, albumId, res) {
       versions: { include: { pages: true }, orderBy: { versionNumber: "asc" } },
       sources: { include: { photo: true }, orderBy: { createdAt: "asc" } },
       createdBy: true,
+      client: { select: { id: true, email: true, name: true } },
     },
   });
   if (!album) {
@@ -126,6 +127,8 @@ async function albumDetail(eventId, album) {
     created_at: album.createdAt,
     created_by: authorShape(album.createdBy),
     sent_at: album.sentAt,
+    // Assigned review client (null = every event client may review).
+    client: album.client ? { id: album.client.id, email: album.client.email, name: album.client.name } : null,
     open_pins: openPins,
     theme: resolveThemeForEvent(fullEvent),
     versions: album.versions.map((v) => versionShape(eventId, album.id, v)),
@@ -156,12 +159,31 @@ router.post("/", async (req, res, next) => {
     if (!accessible) return;
     const { event } = accessible;
 
-    const { name, from_favourites: fromFavourites } = req.body || {};
+    const { name, from_favourites: fromFavourites, client_id: clientId } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
     }
+    // Assigned review client: explicit id wins (must hold a grant on this
+    // event); otherwise the event's first client is the default, else null
+    // (every event client may review).
+    let assignedClientId = null;
+    if (clientId !== undefined && clientId !== null) {
+      const grant = await prisma.eventUserMapping.findUnique({
+        where: { eventId_userId: { eventId: event.id, userId: clientId } },
+      });
+      if (!grant) {
+        return res.status(400).json({ error: "That client has no access to this event" });
+      }
+      assignedClientId = grant.userId;
+    } else if (clientId === undefined) {
+      const firstGrant = await prisma.eventUserMapping.findFirst({
+        where: { eventId: event.id, revokedAt: null },
+        orderBy: { createdAt: "asc" },
+      });
+      assignedClientId = firstGrant?.userId ?? null;
+    }
     const album = await prisma.album.create({
-      data: { eventId: event.id, name: name.trim().slice(0, 120), createdById: req.user.id },
+      data: { eventId: event.id, name: name.trim().slice(0, 120), createdById: req.user.id, clientId: assignedClientId },
     });
     // One-tap staging from Photo Selection: every event photo at least one
     // client favourited becomes a zero-cost source ref. Idempotent by the
@@ -189,6 +211,9 @@ router.post("/", async (req, res, next) => {
       created_at: album.createdAt,
       created_by: authorShape({ id: req.user.id, name: req.user.name, email: req.user.email, role: req.user.role }),
       source_count: staged,
+      client: assignedClientId
+        ? await prisma.user.findUnique({ where: { id: assignedClientId }, select: { id: true, email: true, name: true } })
+        : null,
     });
   } catch (err) {
     next(err);
@@ -207,6 +232,7 @@ router.get("/", async (req, res, next) => {
         versions: { select: { id: true, versionNumber: true, createdAt: true } },
         _count: { select: { sources: true } },
         createdBy: true,
+        client: { select: { id: true, email: true, name: true } },
       },
       orderBy: { createdAt: "desc" },
     });
@@ -218,6 +244,7 @@ router.get("/", async (req, res, next) => {
         locked_at: a.lockedAt,
         created_at: a.createdAt,
         created_by: authorShape(a.createdBy),
+        client: a.client ? { id: a.client.id, email: a.client.email, name: a.client.name } : null,
         sent_at: a.sentAt,
         source_count: a._count.sources,
         version_count: a.versions.length,
@@ -289,13 +316,27 @@ router.patch("/:albumId", async (req, res, next) => {
 
     const album = await loadAlbum(event.id, req.params.albumId, res);
     if (!album) return;
-    const { name } = req.body || {};
+    const { name, client_id: clientId } = req.body || {};
     if (name !== undefined && (typeof name !== "string" || !name.trim())) {
       return res.status(400).json({ error: "name must be a non-empty string" });
     }
+    const data = { name: name !== undefined ? name.trim().slice(0, 120) : undefined };
+    if (clientId !== undefined) {
+      if (clientId === null) {
+        data.clientId = null; // back to every event client
+      } else {
+        const grant = await prisma.eventUserMapping.findUnique({
+          where: { eventId_userId: { eventId: event.id, userId: clientId } },
+        });
+        if (!grant) {
+          return res.status(400).json({ error: "That client has no access to this event" });
+        }
+        data.clientId = grant.userId;
+      }
+    }
     const updated = await prisma.album.update({
       where: { id: album.id },
-      data: { name: name !== undefined ? name.trim().slice(0, 120) : undefined },
+      data,
     });
     res.json({ id: updated.id, name: updated.name, status: updated.status });
   } catch (err) {

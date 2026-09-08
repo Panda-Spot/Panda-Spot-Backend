@@ -35,6 +35,9 @@ model User {
   name         String
   createdAt    DateTime @default(now())
   events       Event[]
+  /// Albums assigned to this user for review (Album.clientId) — see the
+  /// Album model's own comment for the visibility rule.
+  clientAlbums Album[] @relation("AlbumClient")
 
   /// Studio-wide branding, applied to every guest page across all of this
   /// photographer's events (not per-event — see server/README.md's branding notes).
@@ -425,6 +428,15 @@ model Event {
   /// disappears, and creating new ones is rejected. Events that already
   /// have sub-galleries were grandfathered on.
   subGalleriesEnabled Boolean @default(false)
+
+  /// Opt-in toggle (owner/collaborator) for Albums proofing on this event.
+  /// Off by default; enable from Danger → Features. While off, the studio
+  /// Albums page shows a guided empty state instead of the workspace.
+  /// Already-sent albums stay reviewable by their clients regardless (same
+  /// survive-the-toggle philosophy as the photoSelectionEnabled comment in
+  /// routes/clientAlbums.js). Events that already have albums were
+  /// grandfathered on.
+  albumsEnabled Boolean @default(false)
 
   /// Self-relation for nested sub-galleries (e.g. "Ceremony"/"Reception"
   /// under one wedding) — a sub-gallery is a fully real Event of its own
@@ -1229,6 +1241,13 @@ model Album {
   lockedAt  DateTime?
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
+  /// Assigned review client (USER role) — null means every event client may
+  /// review once sent. Set explicitly by the studio per album (EventAlbums
+  /// page client picker, defaulting to the event's first client), SetNull
+  /// so the album survives its client. Client list/detail routes enforce:
+  /// an assigned album is visible only to that client.
+  clientId  String?
+  client    User?       @relation("AlbumClient", fields: [clientId], references: [id], onDelete: SetNull)
   /// Phase 4: who created the project (SetNull — the album survives its
   /// creator) and when it was last sent for review. Null on pre-Phase-4 rows.
   createdById String?

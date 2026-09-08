@@ -417,6 +417,7 @@ router.get("/:id", async (req, res, next) => {
       pandashoots_enabled: event.pandashootsEnabled,
       advanced_tools_enabled: event.advancedToolsEnabled,
       sub_galleries_enabled: event.subGalleriesEnabled,
+      albums_enabled: event.albumsEnabled,
       published_at: event.publishedAt,
       archived_at: event.archivedAt,
       allow_download: event.allowDownload,
@@ -629,9 +630,10 @@ router.post("/:id/features/toggle", async (req, res, next) => {
       pandashoots: "pandashootsEnabled",
       advancedTools: "advancedToolsEnabled",
       subGalleries: "subGalleriesEnabled",
+      albums: "albumsEnabled",
     };
     if (!Object.hasOwn(FEATURE_COLUMNS, feature)) {
-      return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", "pandashoots", "advancedTools", or "subGalleries"' });
+      return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", "pandashoots", "advancedTools", "subGalleries", or "albums"' });
     }
 
     // Turning a feature OFF is owner-only — collaborators may turn features
@@ -651,6 +653,7 @@ router.post("/:id/features/toggle", async (req, res, next) => {
       pandashoots_enabled: updated.pandashootsEnabled,
       advanced_tools_enabled: updated.advancedToolsEnabled,
       sub_galleries_enabled: updated.subGalleriesEnabled,
+      albums_enabled: updated.albumsEnabled,
     });
   } catch (err) {
     next(err);
