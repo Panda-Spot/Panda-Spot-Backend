@@ -2440,6 +2440,7 @@ router.get("/:id/photos", async (req, res, next) => {
         photo_id: p.id,
         filename: p.filename,
         face_count: p.faceCount,
+        file_size: p.fileSize,
         createdAt: p.createdAt,
         url: `/files/events/${event.id}/photos/${p.id}`,
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,
