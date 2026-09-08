@@ -264,6 +264,92 @@ router.get("/analytics/summary", async (req, res, next) => {
   }
 });
 
+// Access Board console: every accessible event with its clients, pending
+// invites, and per-client favourite counts in ONE round trip. The board
+// used to fire 1 + N requests (listEvents + listClients per event — 34+
+// with a busy studio), which is what made /access lag. Same event scoping
+// + ?status as GET / above. Read-only.
+router.get("/access-summary", async (req, res, next) => {
+  try {
+    const { status } = req.query || {};
+    if (status !== undefined && !["active", "archived", "all"].includes(status)) {
+      return res.status(400).json({ error: 'status must be "active", "archived", or "all"' });
+    }
+    const archivedFilter =
+      status === "active" ? { archivedAt: null } : status === "archived" ? { archivedAt: { not: null } } : {};
+
+    const owned = await prisma.event.findMany({
+      where: { ownerId: req.user.id, parentEventId: null, ...archivedFilter },
+    });
+    const collabRows = await prisma.eventCollaborator.findMany({
+      where: { userId: req.user.id },
+      include: { event: true },
+    });
+
+    const all = [
+      ...owned,
+      ...collabRows.map((c) => c.event),
+    ].filter((e) =>
+      status === "all" ? true : status === "active" ? !e.archivedAt : !!e.archivedAt
+    );
+    all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const ids = all.map((e) => e.id);
+
+    const [mappings, invites] = await Promise.all([
+      prisma.eventUserMapping.findMany({
+        where: { eventId: { in: ids } },
+        include: { user: { select: { id: true, email: true, name: true } } },
+      }),
+      prisma.clientInvite.findMany({
+        where: { eventId: { in: ids }, acceptedAt: null },
+      }),
+    ]);
+
+    // Per-event favourite counts — small COUNT groupBys, still one request.
+    const countsByEventUser = {};
+    await Promise.all(
+      all.map(async (e) => {
+        const rows = await prisma.clientFavourite.groupBy({
+          by: ["userId"],
+          where: { photo: { eventId: e.id, photoSelectionVisible: true, archivedAt: null } },
+          _count: { userId: true },
+        });
+        for (const r of rows) countsByEventUser[`${e.id}:${r.userId}`] = r._count.userId;
+      })
+    );
+
+    res.json({
+      events: all.map((e) => ({
+        id: e.id,
+        name: e.name,
+        clients: mappings
+          .filter((m) => m.eventId === e.id)
+          .map((m) => ({
+            user_id: m.user.id,
+            email: m.user.email,
+            name: m.user.name,
+            favourite_cap: m.favouriteCap,
+            favourite_count: countsByEventUser[`${e.id}:${m.user.id}`] || 0,
+            submitted_at: m.submittedAt,
+            access_expires: m.accessExpires,
+            revoked_at: m.revokedAt,
+          })),
+        pending_invites: invites
+          .filter((i) => i.eventId === e.id)
+          .map((i) => ({
+            invite_id: i.id,
+            email: i.email,
+            invited_at: i.createdAt,
+            favourite_cap: i.favouriteCap,
+            expires_at: i.expiresAt,
+          })),
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/:id", async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
