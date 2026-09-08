@@ -418,6 +418,14 @@ model Event {
   /// appear on the import pages.
   advancedToolsEnabled Boolean @default(false)
 
+  /// Opt-in toggle (owner/collaborator) for sub-galleries (e.g.
+  /// "Ceremony"/"Reception" child events under this one). Off by default;
+  /// enable from Danger → Features. While off, no trace of sub-galleries
+  /// shows anywhere: the Photos management card hides, the guest picker
+  /// disappears, and creating new ones is rejected. Events that already
+  /// have sub-galleries were grandfathered on.
+  subGalleriesEnabled Boolean @default(false)
+
   /// Self-relation for nested sub-galleries (e.g. "Ceremony"/"Reception"
   /// under one wedding) — a sub-gallery is a fully real Event of its own
   /// (own guestSlug, own photos, own everything), just not advertised with

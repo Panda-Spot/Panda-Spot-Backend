@@ -154,7 +154,10 @@ router.get("/:slug", async (req, res, next) => {
       // When present, the frontend shows a picker instead of the search
       // form directly — a parent with sub-galleries is a pure menu, not a
       // searchable gallery of its own (see routes/events.js's create route).
-      sub_galleries: event.subGalleries.map((s) => ({ name: s.name, slug: s.guestSlug })),
+      // Empty while the studio has Sub-galleries turned off: no trace of
+      // the picker shows anywhere.
+      sub_galleries_enabled: event.subGalleriesEnabled,
+      sub_galleries: event.subGalleriesEnabled ? event.subGalleries.map((s) => ({ name: s.name, slug: s.guestSlug })) : [],
       // Phase 3 (gallery access upgrade): branded prompt/login/expired
       // screens render from these + the studio branding above. Old events
       // are accessMode "public", so nothing already live changes.

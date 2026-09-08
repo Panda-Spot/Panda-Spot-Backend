@@ -330,6 +330,7 @@ router.get("/:id", async (req, res, next) => {
       photo_selection_enabled: event.photoSelectionEnabled,
       pandashoots_enabled: event.pandashootsEnabled,
       advanced_tools_enabled: event.advancedToolsEnabled,
+      sub_galleries_enabled: event.subGalleriesEnabled,
       published_at: event.publishedAt,
       archived_at: event.archivedAt,
       allow_download: event.allowDownload,
@@ -437,6 +438,9 @@ router.post("/:id/sub-galleries", async (req, res, next) => {
     if (event.parentEventId) {
       return res.status(400).json({ error: "Sub-galleries can't themselves have sub-galleries." });
     }
+    if (!event.subGalleriesEnabled) {
+      return res.status(403).json({ error: "Enable Sub-galleries in Danger → Features first." });
+    }
     const { name } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
@@ -538,9 +542,10 @@ router.post("/:id/features/toggle", async (req, res, next) => {
       photoSelection: "photoSelectionEnabled",
       pandashoots: "pandashootsEnabled",
       advancedTools: "advancedToolsEnabled",
+      subGalleries: "subGalleriesEnabled",
     };
     if (!Object.hasOwn(FEATURE_COLUMNS, feature)) {
-      return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", "pandashoots", or "advancedTools"' });
+      return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", "pandashoots", "advancedTools", or "subGalleries"' });
     }
 
     const updated = await prisma.event.update({
@@ -552,6 +557,7 @@ router.post("/:id/features/toggle", async (req, res, next) => {
       photo_selection_enabled: updated.photoSelectionEnabled,
       pandashoots_enabled: updated.pandashootsEnabled,
       advanced_tools_enabled: updated.advancedToolsEnabled,
+      sub_galleries_enabled: updated.subGalleriesEnabled,
     });
   } catch (err) {
     next(err);
