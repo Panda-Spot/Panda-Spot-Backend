@@ -411,6 +411,13 @@ model Event {
   /// routes/events.js's features/toggle).
   pandashootsEnabled Boolean @default(false)
 
+  /// Opt-in toggle (owner/collaborator) for the advanced photographic
+  /// tool filters on Photos & Imports (Sharpness, Faces, Min rating, Color
+  /// tag, Duplicates). Off by default — the studio runs a full analysis on
+  /// the Tools page first, then enables this; only then do the filters
+  /// appear on the import pages.
+  advancedToolsEnabled Boolean @default(false)
+
   /// Self-relation for nested sub-galleries (e.g. "Ceremony"/"Reception"
   /// under one wedding) — a sub-gallery is a fully real Event of its own
   /// (own guestSlug, own photos, own everything), just not advertised with

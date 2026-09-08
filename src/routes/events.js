@@ -65,7 +65,7 @@ async function generateUniqueSlug() {
 
 router.post("/", async (req, res, next) => {
   try {
-    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt, pandashoots_enabled: pandashootsOpt, event_date: eventDate, event_type: eventType } = req.body || {};
+    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt, pandashoots_enabled: pandashootsOpt, advanced_tools_enabled: advancedToolsOpt, event_date: eventDate, event_type: eventType } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
     }
@@ -99,6 +99,7 @@ router.post("/", async (req, res, next) => {
         ...(typeof faceSearchOpt === "boolean" ? { faceSearchEnabled: faceSearchOpt } : {}),
         ...(typeof photoSelectionOpt === "boolean" ? { photoSelectionEnabled: photoSelectionOpt } : {}),
         ...(typeof pandashootsOpt === "boolean" ? { pandashootsEnabled: pandashootsOpt } : {}),
+        ...(typeof advancedToolsOpt === "boolean" ? { advancedToolsEnabled: advancedToolsOpt } : {}),
         ...(parsedEventDate ? { eventDate: parsedEventDate } : {}),
         ...(eventType && typeof eventType === "string" ? { eventType: eventType.trim() } : {}),
       },
@@ -328,6 +329,7 @@ router.get("/:id", async (req, res, next) => {
       face_search_enabled: event.faceSearchEnabled,
       photo_selection_enabled: event.photoSelectionEnabled,
       pandashoots_enabled: event.pandashootsEnabled,
+      advanced_tools_enabled: event.advancedToolsEnabled,
       published_at: event.publishedAt,
       archived_at: event.archivedAt,
       allow_download: event.allowDownload,
@@ -535,9 +537,10 @@ router.post("/:id/features/toggle", async (req, res, next) => {
       faceSearch: "faceSearchEnabled",
       photoSelection: "photoSelectionEnabled",
       pandashoots: "pandashootsEnabled",
+      advancedTools: "advancedToolsEnabled",
     };
     if (!Object.hasOwn(FEATURE_COLUMNS, feature)) {
-      return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", or "pandashoots"' });
+      return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", "pandashoots", or "advancedTools"' });
     }
 
     const updated = await prisma.event.update({
@@ -548,6 +551,7 @@ router.post("/:id/features/toggle", async (req, res, next) => {
       face_search_enabled: updated.faceSearchEnabled,
       photo_selection_enabled: updated.photoSelectionEnabled,
       pandashoots_enabled: updated.pandashootsEnabled,
+      advanced_tools_enabled: updated.advancedToolsEnabled,
     });
   } catch (err) {
     next(err);
