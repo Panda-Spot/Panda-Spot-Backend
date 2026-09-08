@@ -25,16 +25,27 @@ function guessContentType(filename) {
   return EXT_CONTENT_TYPES[ext] || "image/jpeg";
 }
 
+// Thumbnails and originals are content-addressed by photo id and never
+// modified under the same URL (edits create new files, deletes 404), so
+// browsers may cache them for a year — repeat grid scrolls, revisits, and
+// lightbox navigation then serve straight from the browser cache.
+const IMMUTABLE_FILE_OPTIONS = { maxAge: "1y", immutable: true };
+// Covers and sponsor logos ARE replaced under the same URL — cache briefly,
+// revalidate after.
+const MUTABLE_FILE_OPTIONS = { maxAge: 60000 };
+
 async function sendPhotoFile(res, photo, variant) {
   if (variant === "thumb" && photo.thumbnailPath && existsSync(photo.thumbnailPath)) {
-    return res.sendFile(photo.thumbnailPath);
+    return res.sendFile(photo.thumbnailPath, IMMUTABLE_FILE_OPTIONS);
   }
   if (photo.storagePath && existsSync(photo.storagePath)) {
-    return res.sendFile(photo.storagePath);
+    return res.sendFile(photo.storagePath, IMMUTABLE_FILE_OPTIONS);
   }
   if (photo.driveFileId) {
     const buffer = await downloadFile(photo.driveFileId);
     res.setHeader("Content-Type", guessContentType(photo.filename));
+    // Drive originals can change remotely — cache briefly only.
+    res.setHeader("Cache-Control", "public, max-age=3600");
     return res.send(buffer);
   }
   return res.status(404).json({
@@ -89,12 +100,13 @@ router.get("/events/:eventId/photos/:photoId", async (req, res, next) => {
       return res.status(404).json({ error: "Photo not found" });
     }
     if (photo.storagePath && existsSync(photo.storagePath)) {
-      return res.sendFile(photo.storagePath);
+      return res.sendFile(photo.storagePath, IMMUTABLE_FILE_OPTIONS);
     }
     if (photo.driveFileId) {
       try {
         const buffer = await downloadFile(photo.driveFileId);
         res.setHeader("Content-Type", guessContentType(photo.filename));
+        res.setHeader("Cache-Control", "public, max-age=3600");
         return res.send(buffer);
       } catch (err) {
         return res.status(404).json({
@@ -122,12 +134,12 @@ router.get("/events/:eventId/photos/:photoId/thumb", async (req, res, next) => {
       return res.status(404).json({ error: "Photo not found" });
     }
     if (photo.thumbnailPath && existsSync(photo.thumbnailPath)) {
-      return res.sendFile(photo.thumbnailPath);
+      return res.sendFile(photo.thumbnailPath, IMMUTABLE_FILE_OPTIONS);
     }
     if (!existsSync(photo.storagePath)) {
       return res.status(404).json({ error: "Photo file missing on disk" });
     }
-    res.sendFile(photo.storagePath);
+    res.sendFile(photo.storagePath, IMMUTABLE_FILE_OPTIONS);
   } catch (err) {
     next(err);
   }
@@ -152,7 +164,7 @@ router.get("/events/:eventId/cover", async (req, res, next) => {
       }
       event.coverPhotoPath = recovered;
     }
-    res.sendFile(event.coverPhotoPath);
+    res.sendFile(event.coverPhotoPath, MUTABLE_FILE_OPTIONS);
   } catch (err) {
     next(err);
   }
@@ -168,7 +180,7 @@ router.get("/events/:eventId/sponsor-logo", async (req, res, next) => {
     if (!existsSync(event.sponsorLogoPath)) {
       return res.status(404).json({ error: "Sponsor logo file missing on disk" });
     }
-    res.sendFile(event.sponsorLogoPath);
+    res.sendFile(event.sponsorLogoPath, MUTABLE_FILE_OPTIONS);
   } catch (err) {
     next(err);
   }
