@@ -271,8 +271,8 @@ router.get("/analytics/summary", async (req, res, next) => {
 // + ?status as GET / above. Read-only.
 router.get("/access-summary", async (req, res, next) => {
   try {
-    const { status } = req.query || {};
-    if (status !== undefined && !["active", "archived", "all"].includes(status)) {
+    const status = req.query.status ?? "active";
+    if (!["active", "archived", "all"].includes(status)) {
       return res.status(400).json({ error: 'status must be "active", "archived", or "all"' });
     }
     const archivedFilter =
@@ -3287,6 +3287,12 @@ router.post("/:id/clients/create", async (req, res, next) => {
         create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null, accessExpires: expiresAt },
         update: grantUpdate,
       });
+      // Direct grants supersede any outstanding email invite for the same
+      // client+event — remove it so a later accept can't overwrite these
+      // terms with stale ones.
+      await prisma.clientInvite.deleteMany({
+        where: { eventId: event.id, email: normalizedEmail, acceptedAt: null },
+      });
       return res.json({ status: "added", email: normalizedEmail, generated_password: null });
     }
 
@@ -3380,6 +3386,10 @@ router.post("/:id/clients/invite", async (req, res, next) => {  try {
         where: { eventId_userId: { eventId: event.id, userId: existingUser.id } },
         create: { eventId: event.id, userId: existingUser.id, favouriteCap: favouriteCap ?? null, accessExpires: expiresAt },
         update: grantUpdate,
+      });
+      // Same staleness guard as the create route above.
+      await prisma.clientInvite.deleteMany({
+        where: { eventId: event.id, email: normalizedEmail, acceptedAt: null },
       });
       return res.json({ status: "added", email: normalizedEmail });
     }
