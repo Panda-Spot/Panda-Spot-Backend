@@ -1,7 +1,7 @@
 import { Router } from "express";
 import path from "node:path";
 import { prisma } from "../lib/prisma.js";
-import { existsSync } from "../lib/storage.js";
+import { existsSync, recoverEventCoverPath } from "../lib/storage.js";
 import { downloadFile } from "../lib/googleDrive.js";
 import { verifyMediaToken } from "../lib/mediaTokens.js";
 
@@ -143,7 +143,14 @@ router.get("/events/:eventId/cover", async (req, res, next) => {
       return res.status(404).json({ error: "No cover set" });
     }
     if (!existsSync(event.coverPhotoPath)) {
-      return res.status(404).json({ error: "Cover file missing on disk" });
+      // Stale absolute path (e.g. STORAGE_DIR/cwd changed since the upload,
+      // or the disk was swapped) — fall back to whatever cover.<ext> file
+      // actually lives in the event's directory today before giving up.
+      const recovered = recoverEventCoverPath(req.params.eventId);
+      if (!recovered) {
+        return res.status(404).json({ error: "Cover file missing on disk" });
+      }
+      event.coverPhotoPath = recovered;
     }
     res.sendFile(event.coverPhotoPath);
   } catch (err) {

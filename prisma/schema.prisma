@@ -396,6 +396,14 @@ model Event {
   /// Null falls back to expiresAt, same as everyone else.
   guestUploadWindowDays Int?
 
+  /// Opt-in toggle (owner/collaborator) for PandaShoots camera-to-cloud
+  /// capture on this event. The PandaShoots tab in the Photos upload dialog
+  /// (and new camera-credential setup) only appears while this is on. Off
+  /// by default; enable from Danger → Features. Live events that already
+  /// use camera upload were grandfathered on (see backfill note in
+  /// routes/events.js's features/toggle).
+  pandashootsEnabled Boolean @default(false)
+
   /// Self-relation for nested sub-galleries (e.g. "Ceremony"/"Reception"
   /// under one wedding) — a sub-gallery is a fully real Event of its own
   /// (own guestSlug, own photos, own everything), just not advertised with

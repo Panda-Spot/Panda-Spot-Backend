@@ -1,7 +1,7 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma.js";
-import { signToken, setAuthCookie } from "../middleware/auth.js";
+import { signToken, setAuthCookie, sessionTtlSeconds } from "../middleware/auth.js";
 import { clientInviteLimiter } from "../lib/rateLimiters.js";
 
 const router = Router();
@@ -76,9 +76,19 @@ router.post("/:token/accept", clientInviteLimiter, async (req, res, next) => {
 
     await prisma.clientInvite.update({ where: { id: invite.id }, data: { acceptedAt: new Date() } });
 
-    const token = signToken(user);
-    setAuthCookie(res, token);
-    res.json({ ok: true, event_id: invite.eventId, token });
+    // Clients come back over several days to review/pick photos — give
+    // them the 7-day remember-me session class (no checkbox in this flow).
+    const token = signToken(user, true);
+    setAuthCookie(res, token, true);
+    const expiresIn = sessionTtlSeconds(true);
+    res.json({
+      ok: true,
+      event_id: invite.eventId,
+      token,
+      remember_me: true,
+      expires_in: expiresIn,
+      expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
+    });
   } catch (err) {
     next(err);
   }

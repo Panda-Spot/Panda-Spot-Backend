@@ -5,18 +5,40 @@ import { envSuperAdminUser, isEnvSuperAdminEmail } from "./admin.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const COOKIE_NAME = "pandaspot_token";
-const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days, matches the existing token lifetime
+
+/// Session lifetimes (see routes/auth.js "remember me" design):
+/// - Default sessions (remember-me unchecked): short JWT (30 min), renewed
+///   on activity via POST /auth/refresh, hard-capped at 24 h from login.
+/// - Remember-me sessions: 7-day JWT, never renewed past login + 7 days.
+export const DEFAULT_SESSION_TTL_SECONDS = 30 * 60;
+export const REMEMBER_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
+export const DEFAULT_SESSION_ABSOLUTE_CAP_SECONDS = 24 * 60 * 60;
+export const REMEMBER_SESSION_ABSOLUTE_CAP_SECONDS = 7 * 24 * 60 * 60;
+
+export function sessionTtlSeconds(rememberMe) {
+  return rememberMe ? REMEMBER_SESSION_TTL_SECONDS : DEFAULT_SESSION_TTL_SECONDS;
+}
+
+export function sessionAbsoluteCapSeconds(rememberMe) {
+  return rememberMe ? REMEMBER_SESSION_ABSOLUTE_CAP_SECONDS : DEFAULT_SESSION_ABSOLUTE_CAP_SECONDS;
+}
 
 /// MERGE (Studio-Verse): every token gets a unique `jti` so a single token
 /// can be blocklisted early (real logout, "log out everywhere" after a
 /// password reset) without needing to rotate JWT_SECRET and invalidate
 /// every session at once.
-export function signToken(user) {
+///
+/// `rememberMe` picks the session class: false (default) = 30-minute TTL
+/// renewed on activity via POST /auth/refresh and hard-capped at 24 h from
+/// login; true = 7-day TTL, never renewed past login + 7 days. The `rm`
+/// claim lets /auth/refresh re-issue the same class without a DB lookup.
+export function signToken(user, rememberMe = false) {
+  const rm = rememberMe === true;
   const isEnvSuperAdmin = user.role === "SUPER_ADMIN" && isEnvSuperAdminEmail(user.email) && user.id === "env-super-admin";
   return jwt.sign(
-    { sub: user.id, email: user.email, role: user.role, env_super_admin: isEnvSuperAdmin, jti: randomUUID() },
+    { sub: user.id, email: user.email, role: user.role, env_super_admin: isEnvSuperAdmin, rm, jti: randomUUID() },
     JWT_SECRET,
-    { expiresIn: TOKEN_TTL_SECONDS }
+    { expiresIn: sessionTtlSeconds(rm) }
   );
 }
 
@@ -34,10 +56,10 @@ const COOKIE_OPTIONS = {
   secure: true,
 };
 
-export function setAuthCookie(res, token) {
+export function setAuthCookie(res, token, rememberMe = false) {
   res.cookie(COOKIE_NAME, token, {
     ...COOKIE_OPTIONS,
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+    maxAge: sessionTtlSeconds(rememberMe === true) * 1000,
   });
 }
 
@@ -70,8 +92,8 @@ function extractToken(req) {
  *
  * Also checks User.suspendedAt on every call — a deliberate departure from
  * this being otherwise-stateless JWT verification (the token itself proves
- * nothing about current suspension status, and a token is valid for up to
- * 30 days). Only touches photographer-facing routes, never guest traffic,
+ * nothing about current suspension status, and a token stays valid until
+ * its own expiry). Only touches photographer-facing routes, never guest traffic,
  * so the extra query per request is an acceptable cost for a suspension to
  * actually take effect immediately instead of only at the account's next
  * fresh login. See routes/admin.js for how suspendedAt gets set.
@@ -106,7 +128,7 @@ export async function requireAuth(req, res, next) {
     const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { suspendedAt: true, role: true } });
     if (!user) {
       // Deleted by an admin (see routes/admin.js) — the token is otherwise
-      // still cryptographically valid for up to 30 days, so this needs an
+      // still cryptographically valid until its own expiry, so this needs an
       // explicit check rather than relying on the JWT alone.
       return res.status(401).json({ error: "Invalid or expired session" });
     }

@@ -4,7 +4,7 @@ import jwt from "jsonwebtoken";
 import { randomBytes } from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
 import { prisma } from "../lib/prisma.js";
-import { signToken, setAuthCookie, clearAuthCookie, requireAuth, blocklistToken } from "../middleware/auth.js";
+import { signToken, setAuthCookie, clearAuthCookie, requireAuth, blocklistToken, sessionTtlSeconds, sessionAbsoluteCapSeconds } from "../middleware/auth.js";
 import { sendEmailVerificationEmail, sendPasswordResetEmail } from "../lib/mailer.js";
 import { activateTrial } from "../lib/subscriptionAccess.js";
 import { authLimiter, registerLimiter } from "../lib/rateLimiters.js";
@@ -51,6 +51,32 @@ function publicUser(user) {
     // single Drive account (not per-user — see that file's top comment).
     drive_backup_beta: isDriveBackupBetaUser(user.email),
     drive_backup_configured: isDriveBackupConfigured(),
+  };
+}
+
+/// Session model: "remember me" is an explicit opt-in at login.
+/// - Unchecked (default): 30-minute token, renewed on activity via
+///   POST /auth/refresh, hard-capped at 24 h from the original login.
+/// - Checked: 7-day token, never renewed — the session simply ends 7 days
+///   after login. Exempt from the frontend's 30-minute idle logout.
+function parseRememberMe(body, defaultValue = false) {
+  const v = body?.remember_me ?? body?.rememberMe;
+  if (v === undefined || v === null) return defaultValue;
+  return v === true || v === "true" || v === 1 || v === "1";
+}
+
+/// Issues a token + cookie for `user` and returns the JSON body the
+/// frontend needs to run its session timers (absolute expiry + class).
+function issueSession(res, user, rememberMe) {
+  const token = signToken(user, rememberMe);
+  setAuthCookie(res, token, rememberMe);
+  const expiresIn = sessionTtlSeconds(rememberMe);
+  return {
+    ...publicUser(user),
+    token,
+    remember_me: rememberMe,
+    expires_in: expiresIn,
+    expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
   };
 }
 
@@ -105,9 +131,10 @@ router.post("/register", registerLimiter, async (req, res, next) => {
       console.error(`Failed to auto-activate trial for new user ${user.id}:`, err.message);
     }
 
-    const token = signToken(user);
-    setAuthCookie(res, token);
-    res.status(201).json({ ...publicUser(user), token });
+    // Self-registration opts into remember-me (7-day session) — there is
+    // no checkbox on the register form; only the login form asks.
+    const rememberMe = parseRememberMe(req.body, true);
+    res.status(201).json(issueSession(res, user, rememberMe));
   } catch (err) {
     next(err);
   }
@@ -122,9 +149,7 @@ router.post("/login", authLimiter, async (req, res, next) => {
 
     if (isEnvSuperAdminCredentials(String(email), String(password))) {
       const admin = envSuperAdminUser();
-      const token = signToken(admin);
-      setAuthCookie(res, token);
-      return res.json({ ...publicUser(admin), token });
+      return res.json(issueSession(res, admin, true));
     }
 
     const user = await prisma.user.findUnique({ where: { email: String(email).toLowerCase() } });
@@ -173,9 +198,49 @@ router.post("/login", authLimiter, async (req, res, next) => {
       await prisma.user.update({ where: { id: user.id }, data: { failedLoginAttempts: 0, lockedUntil: null } });
     }
 
-    const token = signToken(user);
-    setAuthCookie(res, token);
-    res.json({ ...publicUser(user), token });
+    const rememberMe = parseRememberMe(req.body, false);
+    res.json(issueSession(res, user, rememberMe));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/// Sliding renewal for default (non-remember) sessions: while the user is
+/// active the frontend calls this before the 30-minute token dies and gets
+/// a fresh one of the same class. Rotation blocklists the presented token
+/// (hourly-pruned, see lib/tokenMaintenance.js). Renewal stops at the
+/// absolute cap measured from the ORIGINAL login (iat): 24 h default,
+/// 7 days remember-me — past that the client must log in again.
+router.post("/refresh", requireAuth, async (req, res, next) => {
+  try {
+    const presented =
+      (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null) ||
+      req.query?.token ||
+      req.cookies?.pandaspot_token;
+    const payload = jwt.verify(presented, process.env.JWT_SECRET);
+    // Tokens minted before the remember-me feature carry no `rm` claim —
+    // treat them as remember-me so existing sessions aren't abruptly cut.
+    const rememberMe = payload.rm !== false;
+    const ageSeconds = Date.now() / 1000 - (payload.iat || 0);
+    if (ageSeconds > sessionAbsoluteCapSeconds(rememberMe)) {
+      return res.status(401).json({ error: "Session expired — please log in again", code: "session_expired" });
+    }
+    const user = payload.env_super_admin && payload.sub === "env-super-admin"
+      ? envSuperAdminUser()
+      : { id: payload.sub, email: payload.email, role: req.user.role };
+    if (!user) {
+      return res.status(401).json({ error: "Invalid or expired session" });
+    }
+    await blocklistToken(payload);
+    const token = signToken(user, rememberMe);
+    setAuthCookie(res, token, rememberMe);
+    const expiresIn = sessionTtlSeconds(rememberMe);
+    res.json({
+      token,
+      remember_me: rememberMe,
+      expires_in: expiresIn,
+      expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
+    });
   } catch (err) {
     next(err);
   }
@@ -183,8 +248,8 @@ router.post("/login", authLimiter, async (req, res, next) => {
 
 router.post("/logout", async (req, res) => {
   // MERGE (Studio-Verse): real token invalidation, not just clearing the
-  // cookie — a Bearer token in localStorage would otherwise keep working
-  // for up to 30 days after "logging out". Best-effort: an already-
+  // cookie — a Bearer token in storage would otherwise keep working until
+  // its own expiry after "logging out". Best-effort: an already-
   // invalid/missing token just means there's nothing to blocklist.
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : req.query?.token || req.cookies?.pandaspot_token;
@@ -394,9 +459,7 @@ router.post("/google", async (req, res, next) => {
     if (isEnvSuperAdminEmail(email)) {
       const admin = envSuperAdminUser();
       if (admin) {
-        const token = signToken(admin);
-        setAuthCookie(res, token);
-        return res.json({ ...publicUser(admin), token });
+        return res.json(issueSession(res, admin, true));
       }
     }
 
@@ -423,9 +486,10 @@ router.post("/google", async (req, res, next) => {
       return res.status(403).json({ error: "This account has been suspended" });
     }
 
-    const token = signToken(user);
-    setAuthCookie(res, token);
-    res.json({ ...publicUser(user), token });
+    // Google one-tap has no remember-me checkbox — default to the 7-day
+    // session (explicit opt-out isn't offered in this flow).
+    const rememberMe = parseRememberMe(req.body, true);
+    res.json(issueSession(res, user, rememberMe));
   } catch (err) {
     next(err);
   }

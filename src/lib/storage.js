@@ -103,6 +103,22 @@ export async function saveEventCover(eventId, filename, buffer) {
   return newPath;
 }
 
+/** Best-effort recovery for a cover whose DB path no longer resolves
+ * (STORAGE_DIR/cwd changed since the upload, disk swapped, …): returns the
+ * absolute path of whatever `cover.<image-ext>` file actually lives in the
+ * event's directory today, or null. Sync — used for quick checks before
+ * streaming. */
+export function recoverEventCoverPath(eventId) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(eventDir(eventId));
+  } catch {
+    return null;
+  }
+  const hit = entries.find((e) => e.startsWith("cover.") && IMAGE_EXTENSIONS.has(path.extname(e).toLowerCase()));
+  return hit ? path.join(eventDir(eventId), hit) : null;
+}
+
 /** Sponsor logo for the live TV wall overlay — same single-file pattern
  * as the event cover (replacing deletes the old file). Served at
  * GET /files/events/:eventId/sponsor-logo. */

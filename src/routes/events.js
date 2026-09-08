@@ -65,7 +65,7 @@ async function generateUniqueSlug() {
 
 router.post("/", async (req, res, next) => {
   try {
-    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt, event_date: eventDate, event_type: eventType } = req.body || {};
+    const { name, face_search_enabled: faceSearchOpt, photo_selection_enabled: photoSelectionOpt, pandashoots_enabled: pandashootsOpt, event_date: eventDate, event_type: eventType } = req.body || {};
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
     }
@@ -98,6 +98,7 @@ router.post("/", async (req, res, next) => {
         // photo selection off), e.g. for inquiry-converted events.
         ...(typeof faceSearchOpt === "boolean" ? { faceSearchEnabled: faceSearchOpt } : {}),
         ...(typeof photoSelectionOpt === "boolean" ? { photoSelectionEnabled: photoSelectionOpt } : {}),
+        ...(typeof pandashootsOpt === "boolean" ? { pandashootsEnabled: pandashootsOpt } : {}),
         ...(parsedEventDate ? { eventDate: parsedEventDate } : {}),
         ...(eventType && typeof eventType === "string" ? { eventType: eventType.trim() } : {}),
       },
@@ -319,6 +320,7 @@ router.get("/:id", async (req, res, next) => {
       started: !!event.startedAt,
       face_search_enabled: event.faceSearchEnabled,
       photo_selection_enabled: event.photoSelectionEnabled,
+      pandashoots_enabled: event.pandashootsEnabled,
       published_at: event.publishedAt,
       archived_at: event.archivedAt,
       allow_download: event.allowDownload,
@@ -510,12 +512,11 @@ router.post("/:id/guest-uploads/window", async (req, res, next) => {
   }
 });
 
-// MERGE (Studio-Verse): the central "one event, two independent feature
+// MERGE (Studio-Verse): the central "one event, independent feature
 // toggles" requirement (see MERGE_PLAN.md D6) — a studio can run Face
-// Search and/or Photo Selection on the same event, at the same time.
-// Owner or collaborator, matching every other event-settings toggle here.
-// Both can be true; both can be false (an event with neither is just a
-// plain gallery for now, which is a valid state, not an error).
+// Search, Photo Selection, and/or PandaShoots camera capture on the same
+// event, at the same time. Owner or collaborator, matching every other
+// event-settings toggle here. Any combination (including none) is valid.
 router.post("/:id/features/toggle", async (req, res, next) => {
   try {
     const accessible = await loadAccessibleEvent(req, res);
@@ -523,15 +524,23 @@ router.post("/:id/features/toggle", async (req, res, next) => {
     const { event } = accessible;
 
     const { feature, enabled } = req.body || {};
-    if (feature !== "faceSearch" && feature !== "photoSelection") {
-      return res.status(400).json({ error: 'feature must be "faceSearch" or "photoSelection"' });
+    const FEATURE_COLUMNS = {
+      faceSearch: "faceSearchEnabled",
+      photoSelection: "photoSelectionEnabled",
+      pandashoots: "pandashootsEnabled",
+    };
+    if (!Object.hasOwn(FEATURE_COLUMNS, feature)) {
+      return res.status(400).json({ error: 'feature must be "faceSearch", "photoSelection", or "pandashoots"' });
     }
 
-    const data = feature === "faceSearch" ? { faceSearchEnabled: !!enabled } : { photoSelectionEnabled: !!enabled };
-    const updated = await prisma.event.update({ where: { id: event.id }, data });
+    const updated = await prisma.event.update({
+      where: { id: event.id },
+      data: { [FEATURE_COLUMNS[feature]]: !!enabled },
+    });
     res.json({
       face_search_enabled: updated.faceSearchEnabled,
       photo_selection_enabled: updated.photoSelectionEnabled,
+      pandashoots_enabled: updated.pandashootsEnabled,
     });
   } catch (err) {
     next(err);
@@ -2098,6 +2107,9 @@ router.post("/:id/shoots/credentials", shootsCredentialLimiter, async (req, res,
 
     if (!event.startedAt) {
       return res.status(400).json({ error: "Start this event before setting up camera upload." });
+    }
+    if (!event.pandashootsEnabled) {
+      return res.status(403).json({ error: "Enable PandaShoots in Danger → Features first." });
     }
 
     // The shortened, human-typeable username alphabet (see
