@@ -158,6 +158,12 @@ router.get("/:slug", async (req, res, next) => {
       // the picker shows anywhere.
       sub_galleries_enabled: event.subGalleriesEnabled,
       sub_galleries: event.subGalleriesEnabled ? event.subGalleries.map((s) => ({ name: s.name, slug: s.guestSlug })) : [],
+      // Photos uploaded straight to the parent (outside any sub-gallery)
+      // would otherwise be orphaned once sub-galleries exist — the picker
+      // gains a "Main gallery" entry when this is non-zero.
+      own_photo_count: await prisma.photo.count({
+        where: { eventId: event.id, approvalStatus: "approved", faceSearchVisible: true, archivedAt: null },
+      }),
       // Phase 3 (gallery access upgrade): branded prompt/login/expired
       // screens render from these + the studio branding above. Old events
       // are accessMode "public", so nothing already live changes.
