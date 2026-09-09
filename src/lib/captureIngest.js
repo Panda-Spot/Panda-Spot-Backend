@@ -104,7 +104,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       driveFileId,
       platformDriveBackup,
       driveBackupStartedAt: platformDriveBackup ? new Date() : null,
-      faceCount: faces.length,
+      faceCount: event.faceSearchEnabled ? faces.length : 0,
       fileSize: buffer.length,
       source: "shoots",
       // PandaShoots is the deliberate auto exception to manual
