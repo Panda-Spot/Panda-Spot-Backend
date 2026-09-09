@@ -1,7 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { prisma } from "./prisma.js";
-import { detectFacesForPhoto, replacePhotoFaces } from "./faces.js";
+import { detectFacesForPhoto, normalizeOrientation, replacePhotoFaces } from "./faces.js";
 import { generateThumbnail } from "./thumbnails.js";
 import { IMAGE_EXTENSIONS } from "./storage.js";
 import { getStorageProvider } from "./storageProvider.js";
@@ -54,9 +54,13 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   }
 
   let faces = [];
+  // Detect on upright pixels (detector ignores EXIF) so stored bboxes
+  // live in displayed space, matching dims + thumbnail extraction.
+  let faceBuffer = null;
   try {
     if (event.faceSearchEnabled) {
-      faces = await detectFacesForPhoto(buffer, originalFilename);
+      faceBuffer = await normalizeOrientation(buffer);
+      faces = await detectFacesForPhoto(faceBuffer, originalFilename);
     }
   } catch (err) {
     return skip(event.id, originalFilename, err.isFaceEngineError ? err.message : "could not process image");
@@ -122,7 +126,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   });
 
   if (event.faceSearchEnabled) {
-    await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces, buffer });
+    await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces, buffer: faceBuffer || buffer });
     await consumeAiPhotoCredits(event.ownerId);
   }
 

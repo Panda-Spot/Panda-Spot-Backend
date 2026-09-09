@@ -15,11 +15,14 @@ import { getEffectiveThreshold } from "./threshold.js";
  * we'd return for the same selfie end up in the same group.
  *
  * No schema change and no persistence: results are cached in memory per
- * event and invalidated whenever the event's face count changes (new
- * uploads/indexing naturally bust the cache). Bounded to the 10 most
- * recently used events so one giant wedding can't grow memory forever.
+ * event and invalidated whenever the event's faces change. The key is the
+ * face COUNT plus the newest row's createdAt: re-indexing a photo deletes
+ * and recreates its Face rows (same count, fresh timestamps AND fresh ids),
+ * so count alone would serve dead face ids — whose thumbnail URLs 404 and
+ * render as black tiles. Bounded to the 10 most recently used events so
+ * one giant wedding can't grow memory forever.
  */
-const groupCache = new Map(); // eventId -> { faceCount, threshold, result }
+const groupCache = new Map(); // eventId -> { faceKey, threshold, result }
 const MAX_CACHED_EVENTS = 10;
 
 function parseEmbedding(text) {
@@ -72,15 +75,19 @@ export function resolveClusteringThreshold(event) {
 }
 
 export async function getFaceGroups(eventId, threshold) {
-  const faceCount = await prisma.face.count({ where: { eventId } });
+  // Count + newest-row timestamp: any add, delete, or re-index changes
+  // the key, so cached representatives never point at deleted face ids.
+  const keyRows = await prisma.$queryRaw`SELECT COUNT(*)::int AS count, MAX("createdAt") AS newest FROM "Face" WHERE "eventId" = ${eventId}`;
+  const faceKey = `${keyRows?.[0]?.count ?? 0}|${keyRows?.[0]?.newest ? new Date(keyRows[0].newest).getTime() : 0}`;
+  const faceCount = Number(keyRows?.[0]?.count ?? 0);
   if (faceCount === 0) {
     const empty = { groups: [], face_count: 0, group_count: 0, threshold };
-    remember(eventId, { faceCount, threshold, result: empty });
+    remember(eventId, { faceKey, threshold, result: empty });
     return empty;
   }
 
   const cached = groupCache.get(eventId);
-  if (cached && cached.faceCount === faceCount && cached.threshold === threshold) {
+  if (cached && cached.faceKey === faceKey && cached.threshold === threshold) {
     return cached.result;
   }
 
@@ -171,7 +178,7 @@ export async function getFaceGroups(eventId, threshold) {
     group_count: groups.length,
     threshold,
   };
-  remember(eventId, { faceCount, threshold, result });
+  remember(eventId, { faceKey, threshold, result });
   return result;
 }
 

@@ -4,7 +4,7 @@ import { prisma } from "../lib/prisma.js";
 import { existsSync, recoverEventCoverPath } from "../lib/storage.js";
 import { downloadFile, findDriveFileByName } from "../lib/googleDrive.js";
 import { verifyMediaToken } from "../lib/mediaTokens.js";
-import { loadPhotoOriginalBuffer, saveFaceThumbnail } from "../lib/faces.js";
+import { loadPhotoOriginalBuffer, rawDimensions, saveFaceThumbnail } from "../lib/faces.js";
 import { originalDimensions } from "../lib/thumbnails.js";
 
 const router = Router();
@@ -217,11 +217,16 @@ router.get("/events/:eventId/faces/:faceId", async (req, res, next) => {
       return res.sendFile(face.thumbnailPath, IMMUTABLE_FILE_OPTIONS);
     }
     // Lazy backfill for legacy rows: re-extract from the original now.
+    // Legacy rows (bboxSpace NULL) were detected on raw bytes where the
+    // detector ignores EXIF, so they extract from the UNROTATED canvas
+    // with raw dims; 'displayed' rows use the rotated canvas. Either way
+    // the crop matches the exact face this row belongs to.
     try {
       const buffer = await loadPhotoOriginalBuffer(face.photo);
-      const { width, height } = await originalDimensions(buffer);
+      const legacy = !face.bboxSpace || face.bboxSpace === "raw";
+      const { width, height } = legacy ? await rawDimensions(buffer) : await originalDimensions(buffer);
       if (!width || !height) {
-        return res.status(404).json({ error: "Face thumbnail unavailable" });
+        return res.status(404).set("Cache-Control", "no-store").json({ error: "Face thumbnail unavailable" });
       }
       const saved = await saveFaceThumbnail({
         eventId: face.eventId,
@@ -231,6 +236,7 @@ router.get("/events/:eventId/faces/:faceId", async (req, res, next) => {
         bbox: face.bbox,
         origWidth: width,
         origHeight: height,
+        rawSpace: legacy,
       });
       if (saved) {
         await prisma.face.update({ where: { id: face.id }, data: { thumbnailPath: saved } });
@@ -239,7 +245,7 @@ router.get("/events/:eventId/faces/:faceId", async (req, res, next) => {
     } catch (err) {
       console.error(`Face thumbnail backfill failed for face ${face.id}:`, err?.message || err);
     }
-    return res.status(404).json({ error: "Face thumbnail unavailable" });
+    return res.status(404).set("Cache-Control", "no-store").json({ error: "Face thumbnail unavailable" });
   } catch (err) {
     next(err);
   }

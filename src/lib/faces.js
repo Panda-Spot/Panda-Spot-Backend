@@ -26,14 +26,14 @@ function toVectorLiteral(embedding) {
  * parameters (template literal placeholders), so this is not string
  * concatenation / SQL injection prone.
  */
-export async function insertFace({ id, photoId, eventId, bbox, embedding, detScore, thumbnailPath }) {
+export async function insertFace({ id, photoId, eventId, bbox, embedding, detScore, thumbnailPath, bboxSpace }) {
   const faceId = id || randomUUID();
   const vectorLiteral = toVectorLiteral(embedding);
   const bboxJson = JSON.stringify(bbox);
 
   await prisma.$executeRaw`
-    INSERT INTO "Face" (id, "photoId", "eventId", bbox, embedding, "detScore", "thumbnailPath", "createdAt")
-    VALUES (${faceId}, ${photoId}, ${eventId}, ${bboxJson}::jsonb, ${vectorLiteral}::vector, ${detScore}, ${thumbnailPath}, now())
+    INSERT INTO "Face" (id, "photoId", "eventId", bbox, embedding, "detScore", "thumbnailPath", "bboxSpace", "createdAt")
+    VALUES (${faceId}, ${photoId}, ${eventId}, ${bboxJson}::jsonb, ${vectorLiteral}::vector, ${detScore}, ${thumbnailPath}, ${bboxSpace || null}, now())
   `;
 
   return faceId;
@@ -45,12 +45,56 @@ export async function detectFacesForPhoto(buffer, filename) {
 }
 
 /**
- * Extracts one padded-square face closeup (192px JPEG) from the full image
- * buffer and saves it under the face's id. Bbox is original-image pixels
- * in displayed (rotated) orientation. Best-effort per face — returns the
- * absolute path or null, never throws (one bad box must not fail indexing).
+ * Bakes EXIF orientation into the pixels (upright JPEG) BEFORE detection.
+ * The detector (cv2) ignores EXIF, so without this, bboxes for portrait/
+ * phone photos live in the sideways raw grid while everything displayed
+ * (thumbnails, viewer, crops) is EXIF-rotated — wrong-face/empty closeups.
+ * With this, detection, storage dims, extraction, and display all share
+ * the displayed coordinate space. Already-upright images pass through
+ * near-untouched (sharp .rotate() is a no-op for orientation 1).
  */
-export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox, origWidth, origHeight }) {
+export async function normalizeOrientation(buffer) {
+  try {
+    return await sharp(buffer).rotate().jpeg({ quality: 92 }).toBuffer();
+  } catch {
+    return buffer;
+  }
+}
+
+/**
+ * Raw (EXIF-ignored) pixel dims of a buffer — the grid legacy face rows
+ * (bboxSpace NULL, detected on raw bytes) live in. Used only by the
+ * thumbnail backfill for those rows; everything else uses
+ * originalDimensions() (orientation-corrected).
+ */
+export async function rawDimensions(buffer) {
+  try {
+    const meta = await sharp(buffer).metadata();
+    if (meta?.width && meta?.height) return { width: meta.width, height: meta.height };
+  } catch {
+    // fall through to nulls
+  }
+  return { width: null, height: null };
+}
+
+/**
+ * Extracts one padded-square face closeup (192px JPEG) from the full image
+ * buffer and saves it under the face's id.
+ *
+ * Coordinate spaces (the whole point of `space`): the detector reads raw
+ * bytes with cv2, which IGNORES EXIF orientation, so bboxes from rows
+ * indexed before orientation normalization ('raw' space, or legacy rows
+ * with bboxSpace NULL) live in the UNROTATED pixel grid and must be
+ * extracted from the unrotated buffer with unrotated dims. Rows indexed
+ * after normalization (bboxSpace 'displayed') live in the displayed
+ * (EXIF-rotated) grid and extract from the .rotate()d canvas with
+ * orientation-corrected dims. Mixing the two is what produced wrong-face
+ * and empty crops on phone/portrait uploads.
+ *
+ * Best-effort per face — returns the absolute path or null, never throws
+ * (one bad box must not fail indexing).
+ */
+export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox, origWidth, origHeight, rawSpace = false }) {
   try {
     const [x1, y1, x2, y2] = (Array.isArray(bbox) ? bbox : []).map(Number);
     if (![x1, y1, x2, y2].every(Number.isFinite) || !origWidth || !origHeight) return null;
@@ -69,11 +113,18 @@ export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox
     sqSize = Math.min(sqSize, 1 - sqLeft, 1 - sqTop);
     if (!(sqSize > 0)) return null;
     const outPath = faceThumbPath(eventId, photoId, faceId);
-    await fsp.mkdir(new URL(".", `file://${outPath}/`).pathname.replace(/\/$/, ""), { recursive: true }).catch(() => {});
-    const { width: rw, height: rh } = await originalDimensions(buffer);
+    await ensurePhotoFacesDir(eventId, photoId);
+    // Dims must come from the SAME canvas the extract runs on: rotated
+    // canvas for displayed-space bboxes, raw metadata for raw-space ones.
+    const meta = await sharp(buffer).metadata().catch(() => null);
+    if (!meta?.width || !meta?.height) return null;
+    const swap = !rawSpace && [5, 6, 7, 8].includes(meta.orientation);
+    const rw = swap ? meta.height : meta.width;
+    const rh = swap ? meta.width : meta.height;
     if (!rw || !rh) return null;
-    await sharp(buffer)
-      .rotate()
+    let pipeline = sharp(buffer);
+    if (!rawSpace) pipeline = pipeline.rotate();
+    await pipeline
       .extract({
         left: Math.round(sqLeft * rw),
         top: Math.round(sqTop * rh),
@@ -92,8 +143,10 @@ export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox
 
 export async function replacePhotoFaces({ photoId, eventId, faces, buffer }) {
   // Original dims once (not per face) — the denominator for every bbox.
-  // Callers pass the image bytes they already hold; without bytes there
-  // are no thumbnails (rows still write normally).
+  // Callers pass orientation-normalized bytes (see normalizeOrientation):
+  // bboxes are detected in displayed space, so dims + extraction below
+  // must be displayed-space too. Without bytes there are no thumbnails
+  // (rows still write normally).
   let origWidth = null;
   let origHeight = null;
   if (buffer) {
@@ -118,6 +171,9 @@ export async function replacePhotoFaces({ photoId, eventId, faces, buffer }) {
       embedding: face.embedding,
       detScore: face.det_score,
       thumbnailPath,
+      // Bboxes are detected on the orientation-normalized buffer (see
+      // indexExistingPhotoFaces / captureIngest), i.e. displayed space.
+      bboxSpace: "displayed",
     });
   }
   await prisma.photo.update({ where: { id: photoId }, data: { faceCount: faces.length, faceIndexedAt: new Date() } });
@@ -160,7 +216,11 @@ export async function loadPhotoOriginalBuffer(photo) {
 }
 
 export async function indexExistingPhotoFaces(photo) {
-  const buffer = await loadPhotoOriginalBuffer(photo);
+  const raw = await loadPhotoOriginalBuffer(photo);
+  // Detect on upright pixels so stored bboxes match displayed orientation
+  // (the detector itself ignores EXIF). The normalized bytes also feed
+  // thumbnail extraction below via replacePhotoFaces.
+  const buffer = await normalizeOrientation(raw);
   const faces = await detectFacesForPhoto(buffer, photo.filename);
   return replacePhotoFaces({ photoId: photo.id, eventId: photo.eventId, faces, buffer });
 }

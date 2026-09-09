@@ -806,6 +806,12 @@ model Face {
   /// crop math or original files. Null until generated (lazy backfill on
   /// first serve covers legacy rows).
   thumbnailPath String?
+  /// Coordinate space of bbox: 'displayed' (detected on
+  /// orientation-normalized pixels — everything indexed after the
+  /// normalizeOrientation fix) vs NULL (legacy rows, detected on raw
+  /// bytes where the detector ignores EXIF). The face-thumb backfill
+  /// extracts from the matching canvas. Never touches grouping.
+  bboxSpace String?
   createdAt DateTime                @default(now())
 
   @@index([eventId])
