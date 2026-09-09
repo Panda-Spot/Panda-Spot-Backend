@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { prisma } from "./prisma.js";
 import { generateThumbnail } from "./thumbnails.js";
-import { deleteFileIfExists } from "./storage.js";
+import { deleteFileIfExists, deletePhotoFacesDir } from "./storage.js";
 import { downloadFile, downloadPartial, guessExtension, listImageFiles } from "./googleDrive.js";
 import { contentMatchesExtension, isVideoExtension } from "./fileValidation.js";
 import { eventStorageUsedBytes, effectiveStorageLimitBytes } from "./planLimits.js";
@@ -108,6 +108,7 @@ async function removePhoto(photo) {
   await prisma.face.deleteMany({ where: { photoId: photo.id } });
   await prisma.photo.delete({ where: { id: photo.id } });
   await deleteFileIfExists(photo.thumbnailPath);
+  await deletePhotoFacesDir(photo.eventId, photo.id);
 }
 
 function emitProgress(jobId, { total, completed, currentFile, startedAt, facesFoundSoFar, skipped, photo }) {

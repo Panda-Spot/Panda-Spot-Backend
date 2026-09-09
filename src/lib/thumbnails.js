@@ -5,6 +5,25 @@ const THUMB_MAX_DIMENSION = 480;
 const THUMB_JPEG_QUALITY = 78;
 
 /**
+ * Orientation-corrected original dimensions of an image buffer ({width,
+ * height}, nulls when unreadable). Shared by generateThumbnail (below) and
+ * face-closeup extraction (lib/faces.js) so both agree on the coordinate
+ * space the detector's bboxes live in.
+ */
+export async function originalDimensions(buffer) {
+  try {
+    const meta = await sharp(buffer).metadata();
+    if (meta?.width && meta?.height) {
+      const swap = [5, 6, 7, 8].includes(meta.orientation);
+      return { width: swap ? meta.height : meta.width, height: swap ? meta.width : meta.height };
+    }
+  } catch {
+    // fall through to nulls
+  }
+  return { width: null, height: null };
+}
+
+/**
  * Generates a resized JPEG preview (~480px on the long edge) from an
  * already-in-memory image buffer and saves it to disk, for fast gallery
  * grids — full-size originals are only fetched on download/share/zip.
@@ -16,19 +35,7 @@ const THUMB_JPEG_QUALITY = 78;
  * never fail the whole upload over a missing thumbnail; dims are null then.
  */
 export async function generateThumbnail(buffer, eventId, photoId) {
-  let width = null;
-  let height = null;
-  try {
-    const meta = await sharp(buffer).metadata();
-    if (meta?.width && meta?.height) {
-      // EXIF orientation 5-8 swaps axes once rotate() is applied below.
-      const swap = [5, 6, 7, 8].includes(meta.orientation);
-      width = swap ? meta.height : meta.width;
-      height = swap ? meta.width : meta.height;
-    }
-  } catch {
-    // metadata read failed — thumbnail attempt below decides
-  }
+  const { width, height } = await originalDimensions(buffer);
   try {
     await ensureEventThumbDir(eventId);
     const outPath = eventThumbPath(eventId, photoId);

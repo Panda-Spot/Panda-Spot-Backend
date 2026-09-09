@@ -214,6 +214,30 @@ export async function ensureEventThumbDir(eventId) {
   return dir;
 }
 
+/** Absolute directory for one photo's face-closeup thumbnails
+ * (events/<eventId>/faces/<photoId>/), kept beside the thumbs dir. */
+export function photoFacesDir(eventId, photoId) {
+  return path.join(eventDir(eventId), "faces", photoId);
+}
+
+/** Absolute path for one face closeup — always .jpg. */
+export function faceThumbPath(eventId, photoId, faceId) {
+  return path.join(photoFacesDir(eventId, photoId), `${faceId}.jpg`);
+}
+
+/** Removes one photo's whole face-closeup directory (called whenever its
+ * Face rows are replaced or the photo is deleted) — best-effort. */
+export async function deletePhotoFacesDir(eventId, photoId) {
+  await fsp.rm(photoFacesDir(eventId, photoId), { recursive: true, force: true }).catch(() => {});
+}
+
+/** Ensures one photo's face-closeup directory exists on disk. */
+export async function ensurePhotoFacesDir(eventId, photoId) {
+  const dir = photoFacesDir(eventId, photoId);
+  await fsp.mkdir(dir, { recursive: true });
+  return dir;
+}
+
 /** Deletes a single file if it exists — best-effort, never throws (a missing
  * file on disk shouldn't block deleting the DB row that pointed to it). */
 export async function deleteFileIfExists(filePath) {

@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
+import sharp from "sharp";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma.js";
 import { detectFaces } from "./faceEngine.js";
 import { downloadFile } from "./googleDrive.js";
-import { existsSync } from "./storage.js";
+import { deletePhotoFacesDir, ensurePhotoFacesDir, existsSync, faceThumbPath } from "./storage.js";
+import { originalDimensions } from "./thumbnails.js";
+
+const FACE_THUMB_SIZE = 192;
 
 /**
  * Converts a plain JS number array into the pgvector text literal format,
@@ -22,17 +26,17 @@ function toVectorLiteral(embedding) {
  * parameters (template literal placeholders), so this is not string
  * concatenation / SQL injection prone.
  */
-export async function insertFace({ photoId, eventId, bbox, embedding, detScore }) {
-  const id = randomUUID();
+export async function insertFace({ id, photoId, eventId, bbox, embedding, detScore, thumbnailPath }) {
+  const faceId = id || randomUUID();
   const vectorLiteral = toVectorLiteral(embedding);
   const bboxJson = JSON.stringify(bbox);
 
   await prisma.$executeRaw`
-    INSERT INTO "Face" (id, "photoId", "eventId", bbox, embedding, "detScore", "createdAt")
-    VALUES (${id}, ${photoId}, ${eventId}, ${bboxJson}::jsonb, ${vectorLiteral}::vector, ${detScore}, now())
+    INSERT INTO "Face" (id, "photoId", "eventId", bbox, embedding, "detScore", "thumbnailPath", "createdAt")
+    VALUES (${faceId}, ${photoId}, ${eventId}, ${bboxJson}::jsonb, ${vectorLiteral}::vector, ${detScore}, ${thumbnailPath}, now())
   `;
 
-  return id;
+  return faceId;
 }
 
 export async function detectFacesForPhoto(buffer, filename) {
@@ -40,15 +44,80 @@ export async function detectFacesForPhoto(buffer, filename) {
   return detection.faces || [];
 }
 
-export async function replacePhotoFaces({ photoId, eventId, faces }) {
+/**
+ * Extracts one padded-square face closeup (192px JPEG) from the full image
+ * buffer and saves it under the face's id. Bbox is original-image pixels
+ * in displayed (rotated) orientation. Best-effort per face — returns the
+ * absolute path or null, never throws (one bad box must not fail indexing).
+ */
+export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox, origWidth, origHeight }) {
+  try {
+    const [x1, y1, x2, y2] = (Array.isArray(bbox) ? bbox : []).map(Number);
+    if (![x1, y1, x2, y2].every(Number.isFinite) || !origWidth || !origHeight) return null;
+    const left = Math.max(0, Math.min(x1 / origWidth, 1));
+    const top = Math.max(0, Math.min(y1 / origHeight, 1));
+    const right = Math.max(0, Math.min(x2 / origWidth, 1));
+    const bottom = Math.max(0, Math.min(y2 / origHeight, 1));
+    const cx = (left + right) / 2;
+    const cy = (top + bottom) / 2;
+    const half = Math.max(right - left, bottom - top) * 0.85;
+    let sqLeft = Math.max(0, cx - half);
+    let sqTop = Math.max(0, cy - half);
+    let sqSize = half * 2;
+    if (sqLeft + sqSize > 1) sqLeft = Math.max(0, 1 - sqSize);
+    if (sqTop + sqSize > 1) sqTop = Math.max(0, 1 - sqSize);
+    sqSize = Math.min(sqSize, 1 - sqLeft, 1 - sqTop);
+    if (!(sqSize > 0)) return null;
+    const outPath = faceThumbPath(eventId, photoId, faceId);
+    await fsp.mkdir(new URL(".", `file://${outPath}/`).pathname.replace(/\/$/, ""), { recursive: true }).catch(() => {});
+    const { width: rw, height: rh } = await originalDimensions(buffer);
+    if (!rw || !rh) return null;
+    await sharp(buffer)
+      .rotate()
+      .extract({
+        left: Math.round(sqLeft * rw),
+        top: Math.round(sqTop * rh),
+        width: Math.max(1, Math.round(sqSize * rw)),
+        height: Math.max(1, Math.round(sqSize * rh)),
+      })
+      .resize(FACE_THUMB_SIZE, FACE_THUMB_SIZE, { fit: "cover" })
+      .jpeg({ quality: 80 })
+      .toFile(outPath);
+    return outPath;
+  } catch (err) {
+    console.error(`Face thumbnail failed for face ${faceId}:`, err?.message || err);
+    return null;
+  }
+}
+
+export async function replacePhotoFaces({ photoId, eventId, faces, buffer }) {
+  // Original dims once (not per face) — the denominator for every bbox.
+  // Callers pass the image bytes they already hold; without bytes there
+  // are no thumbnails (rows still write normally).
+  let origWidth = null;
+  let origHeight = null;
+  if (buffer) {
+    try {
+      ({ width: origWidth, height: origHeight } = await originalDimensions(buffer));
+    } catch {
+      // dims stay null — thumbnails below simply skip
+    }
+  }
   await prisma.face.deleteMany({ where: { photoId } });
+  await deletePhotoFacesDir(eventId, photoId);
   for (const face of faces) {
+    const faceId = randomUUID();
+    const thumbnailPath = buffer && origWidth && origHeight
+      ? await saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox: face.bbox, origWidth, origHeight })
+      : null;
     await insertFace({
+      id: faceId,
       photoId,
       eventId,
       bbox: face.bbox,
       embedding: face.embedding,
       detScore: face.det_score,
+      thumbnailPath,
     });
   }
   await prisma.photo.update({ where: { id: photoId }, data: { faceCount: faces.length, faceIndexedAt: new Date() } });
@@ -68,7 +137,7 @@ export async function loadPhotoOriginalBuffer(photo) {
 export async function indexExistingPhotoFaces(photo) {
   const buffer = await loadPhotoOriginalBuffer(photo);
   const faces = await detectFacesForPhoto(buffer, photo.filename);
-  return replacePhotoFaces({ photoId: photo.id, eventId: photo.eventId, faces });
+  return replacePhotoFaces({ photoId: photo.id, eventId: photo.eventId, faces, buffer });
 }
 
 /**

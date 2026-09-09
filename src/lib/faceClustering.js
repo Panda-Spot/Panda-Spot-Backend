@@ -88,6 +88,7 @@ export async function getFaceGroups(eventId, threshold) {
     SELECT f.id AS "faceId", f."photoId" AS "photoId",
            f.embedding::text AS embedding,
            f.bbox AS bbox, f."detScore" AS "detScore",
+           f."thumbnailPath" AS "thumbnailPath",
            p.filename AS filename, p.width AS width, p.height AS height
     FROM "Face" f
     INNER JOIN "Photo" p ON p.id = f."photoId"
@@ -114,7 +115,7 @@ export async function getFaceGroups(eventId, threshold) {
       }
     }
     if (best && bestSim >= threshold) {
-      best.members.push({ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, bbox, detScore: Number(row.detScore) || 0 });
+      best.members.push({ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, bbox, detScore: Number(row.detScore) || 0 });
       // Incremental centroid mean.
       const n = best.members.length;
       const c = best.centroid;
@@ -123,7 +124,7 @@ export async function getFaceGroups(eventId, threshold) {
       }
     } else {
       groups.push({
-        members: [{ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, bbox, detScore: Number(row.detScore) || 0 }],
+        members: [{ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, bbox, detScore: Number(row.detScore) || 0 }],
         centroid: Float32Array.from(vec),
       });
     }
@@ -136,10 +137,17 @@ export async function getFaceGroups(eventId, threshold) {
       const rep = g.members[0];
       const nameByPhotoId = {};
       const dimsByPhotoId = {};
+      const repThumbByPhotoId = {};
       for (const m of g.members) {
         if (m.filename && !nameByPhotoId[m.photoId]) nameByPhotoId[m.photoId] = m.filename;
         if (m.width && m.height && !dimsByPhotoId[m.photoId]) dimsByPhotoId[m.photoId] = { width: Number(m.width), height: Number(m.height) };
       }
+      // Representative thumbnail: prefer the rep face's own stored thumb;
+      // fall back to any member face id of the same photo (the files route
+      // lazy-generates on first serve for legacy rows).
+      const repThumbFace = g.members.find((m) => m.photoId === rep.photoId && m.thumbnailPath)
+        || g.members.find((m) => m.photoId === rep.photoId)
+        || {};
       return {
         group_index: index,
         face_count: g.members.length,
@@ -148,7 +156,15 @@ export async function getFaceGroups(eventId, threshold) {
         // real names and exact crop math (previously the client faked
         // `${photoId}.jpg` and measured wrong files).
         photos: photoIds.map((pid) => ({ photo_id: pid, filename: nameByPhotoId[pid] || `${pid}.jpg`, ...(dimsByPhotoId[pid] || {}) })),
-        representative: { photo_id: rep.photoId, filename: rep.filename || `${rep.photoId}.jpg`, ...(rep.width && rep.height ? { width: Number(rep.width), height: Number(rep.height) } : {}), bbox: rep.bbox, det_score: rep.detScore },
+        representative: {
+          photo_id: rep.photoId,
+          filename: rep.filename || `${rep.photoId}.jpg`,
+          ...(rep.width && rep.height ? { width: Number(rep.width), height: Number(rep.height) } : {}),
+          // Direct closeup URL (lazy-generates server-side for legacy rows).
+          thumbnail_url: repThumbFace.faceId ? `/files/events/${eventId}/faces/${repThumbFace.faceId}` : null,
+          bbox: rep.bbox,
+          det_score: rep.detScore,
+        },
       };
     }),
     face_count: rows.length,

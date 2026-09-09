@@ -2,7 +2,7 @@ import path from "node:path";
 import { prisma } from "./prisma.js";
 import { downloadFile } from "./googleDrive.js";
 import { deleteFileFromDrive } from "./driveBackup.js";
-import { deleteFileIfExists } from "./storage.js";
+import { deleteFileIfExists, deletePhotoFacesDir } from "./storage.js";
 import { getStorageProvider } from "./storageProvider.js";
 import { sendDriveBackupReclaimNoticeEmail } from "./mailer.js";
 
@@ -84,6 +84,7 @@ async function purgePhoto(photo) {
   if (photo.driveFileId) await deleteFileFromDrive(photo.driveFileId).catch(() => {});
   await getStorageProvider().deleteOriginal(photo.storagePath);
   await deleteFileIfExists(photo.thumbnailPath);
+  await deletePhotoFacesDir(photo.eventId, photo.id);
   await prisma.face.deleteMany({ where: { photoId: photo.id } });
   await prisma.photo.delete({ where: { id: photo.id } });
 }

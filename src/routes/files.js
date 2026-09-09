@@ -4,6 +4,8 @@ import { prisma } from "../lib/prisma.js";
 import { existsSync, recoverEventCoverPath } from "../lib/storage.js";
 import { downloadFile } from "../lib/googleDrive.js";
 import { verifyMediaToken } from "../lib/mediaTokens.js";
+import { loadPhotoOriginalBuffer, saveFaceThumbnail } from "../lib/faces.js";
+import { originalDimensions } from "../lib/thumbnails.js";
 
 const router = Router();
 
@@ -171,6 +173,53 @@ router.get("/events/:eventId/cover", async (req, res, next) => {
     // through sendFile's per-call `headers` so it's not clobbered by
     // express's default caching of the response.
     res.sendFile(event.coverPhotoPath, { ...MUTABLE_FILE_OPTIONS, headers: { "Cache-Control": "no-store" } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Serves one pre-extracted face closeup (192px JPEG, written at index
+// time — see lib/faces.js). UUID trust model like the photo routes: the
+// face id is not enumerable. Face thumbs never change under their URL, so
+// they cache immutably. Missing files self-heal: if the row predates
+// thumbnails (or its file was lost), the original is loaded and the crop
+// re-extracted on demand, then served.
+router.get("/events/:eventId/faces/:faceId", async (req, res, next) => {
+  try {
+    const face = await prisma.face.findFirst({
+      where: { id: req.params.faceId, eventId: req.params.eventId },
+      include: { photo: true },
+    });
+    if (!face) {
+      return res.status(404).json({ error: "Face not found" });
+    }
+    if (face.thumbnailPath && existsSync(face.thumbnailPath)) {
+      return res.sendFile(face.thumbnailPath, IMMUTABLE_FILE_OPTIONS);
+    }
+    // Lazy backfill for legacy rows: re-extract from the original now.
+    try {
+      const buffer = await loadPhotoOriginalBuffer(face.photo);
+      const { width, height } = await originalDimensions(buffer);
+      if (!width || !height) {
+        return res.status(404).json({ error: "Face thumbnail unavailable" });
+      }
+      const saved = await saveFaceThumbnail({
+        eventId: face.eventId,
+        photoId: face.photoId,
+        faceId: face.id,
+        buffer,
+        bbox: face.bbox,
+        origWidth: width,
+        origHeight: height,
+      });
+      if (saved) {
+        await prisma.face.update({ where: { id: face.id }, data: { thumbnailPath: saved } });
+        return res.sendFile(saved, IMMUTABLE_FILE_OPTIONS);
+      }
+    } catch (err) {
+      console.error(`Face thumbnail backfill failed for face ${face.id}:`, err?.message || err);
+    }
+    return res.status(404).json({ error: "Face thumbnail unavailable" });
   } catch (err) {
     next(err);
   }

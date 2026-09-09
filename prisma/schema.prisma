@@ -800,6 +800,12 @@ model Face {
   bbox      Json
   embedding Unsupported("vector(512)")
   detScore  Float
+  /// Closeup thumbnail extracted at index time
+  /// (events/<eventId>/faces/<photoId>/<id>.jpg) — served at
+  /// GET /files/events/:eventId/faces/:faceId so face tiles never need
+  /// crop math or original files. Null until generated (lazy backfill on
+  /// first serve covers legacy rows).
+  thumbnailPath String?
   createdAt DateTime                @default(now())
 
   @@index([eventId])

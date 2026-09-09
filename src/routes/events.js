@@ -13,6 +13,7 @@ import {
   IMAGE_EXTENSIONS,
   appendUploadPart,
   deleteFileIfExists,
+  deletePhotoFacesDir,
   deleteUploadPart,
   saveEventCover,
   saveEventSponsorLogo,
@@ -2623,12 +2624,17 @@ router.get("/:id/photos/:photoId/faces", async (req, res, next) => {  try {
 
     const faces = await prisma.face.findMany({
       where: { photoId: photo.id },
-      select: { id: true, bbox: true, detScore: true },
+      select: { id: true, bbox: true, detScore: true, thumbnailPath: true },
       orderBy: { detScore: "desc" },
     });
     res.json({
       photo_id: photo.id,
-      faces: faces.map((f) => ({ id: f.id, bbox: f.bbox, det_score: f.detScore })),
+      faces: faces.map((f) => ({
+        id: f.id,
+        bbox: f.bbox,
+        det_score: f.detScore,
+        thumbnail_url: f.thumbnailPath ? `/files/events/${event.id}/faces/${f.id}` : null,
+      })),
     });
   } catch (err) {
     next(err);
@@ -2995,6 +3001,7 @@ router.delete("/:id/photos/:photoId", async (req, res, next) => {
 
     await getStorageProvider().deleteOriginal(photo.storagePath);
     await deleteFileIfExists(photo.thumbnailPath);
+    await deletePhotoFacesDir(event.id, photo.id);
 
     res.status(204).end();
   } catch (err) {

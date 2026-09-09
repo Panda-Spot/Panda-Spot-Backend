@@ -122,7 +122,7 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   });
 
   if (event.faceSearchEnabled) {
-    await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces });
+    await replacePhotoFaces({ photoId: photo.id, eventId: event.id, faces, buffer });
     await consumeAiPhotoCredits(event.ownerId);
   }
 
