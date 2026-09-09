@@ -586,8 +586,7 @@ model Photo {
   /// exact-duplicate detection (null until analyzed), Laplacian-variance
   /// sharpness (higher = sharper; null until analyzed/unmeasurable),
   /// EXIF snapshot (null when absent — e.g. screenshots, PNG exports),
-  /// Lightroom-style color tag + 0-5 star rating.
-  fileHash       String?
+  /// Lightroom-style color tag + 0-5 star rating.  fileHash       String?
   /// Phase 9 (near-duplicates): 64-bit dHash as 16 hex chars — photos
   /// that look alike cluster by Hamming distance, even when bytes differ.
   phash          String?
@@ -600,6 +599,13 @@ model Photo {
   exifCapturedAt DateTime?
   colorTag       String?
   rating         Int      @default(0)
+  /// Original-image pixel dimensions (orientation-corrected), captured at
+  /// thumbnail time — face bboxes are stored in original pixels while only
+  /// thumbnails are ever displayed, so closeup math needs these. Null for
+  /// videos, failed reads, and rows predating this field (those fall back
+  /// to full-thumbnail tiles instead of crops).
+  width          Int?
+  height         Int?
 
   /// Soft per-photo archive (mirrors Studio-Verse's media archive): an
   /// archived photo is hidden from guests (search/gallery/slideshow/

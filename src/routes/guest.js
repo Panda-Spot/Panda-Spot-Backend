@@ -760,7 +760,8 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
       // first frame natively) and moderation (an image heuristic); both
       // helpers would just burn CPU and resolve uselessly on video bytes.
       const isVideo = isVideoExtension(ext);
-      const thumbnailPath = isVideo ? null : await generateThumbnail(file.buffer, event.id, photoId);
+      const thumb = isVideo ? { path: null, width: null, height: null } : await generateThumbnail(file.buffer, event.id, photoId);
+      const thumbnailPath = thumb.path;
       // Best-effort only, guest uploads exclusively — see checkModeration's
       // own doc comment for exactly what this does and doesn't catch.
       const moderationFlagged = isVideo ? false : await checkModeration(file.buffer, file.originalname);
@@ -772,6 +773,8 @@ router.post("/:slug/upload", guestUploadLimiter, upload.array("files", 10), asyn
           filename: file.originalname,
           storagePath,
           thumbnailPath,
+          width: thumb.width,
+          height: thumb.height,
           faceCount: 0,
           fileSize: file.buffer.length,
           source: "guest",

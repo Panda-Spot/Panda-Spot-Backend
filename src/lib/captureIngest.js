@@ -63,7 +63,8 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
   }
 
   const photoId = randomUUID();
-  const thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
+  const thumb = await generateThumbnail(buffer, event.id, photoId);
+  const thumbnailPath = thumb.path;
 
   let storagePath = null;
   let driveFileId = null;
@@ -98,6 +99,8 @@ export async function ingestCapturedFile(event, originalFilename, buffer) {
       filename: originalFilename,
       storagePath,
       thumbnailPath,
+      width: thumb.width,
+      height: thumb.height,
       driveFileId,
       platformDriveBackup,
       driveBackupStartedAt: platformDriveBackup ? new Date() : null,

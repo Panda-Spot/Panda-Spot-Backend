@@ -573,9 +573,9 @@ router.post("/:albumId/versions", versionUpload, async (req, res, next) => {
         },
       });
       try {
-        const thumbnailPath = await generateThumbnail(file.buffer, event.id, page.id);
-        if (thumbnailPath) {
-          await prisma.albumPage.update({ where: { id: page.id }, data: { thumbnailPath } });
+        const thumb = await generateThumbnail(file.buffer, event.id, page.id);
+        if (thumb.path) {
+          await prisma.albumPage.update({ where: { id: page.id }, data: { thumbnailPath: thumb.path } });
         }
       } catch {
         // Thumbnails are a fast-path nicety — the flipbook falls back to
@@ -746,7 +746,7 @@ router.put("/:albumId/versions/:versionId/pages/:pageId/file", upload.single("im
     if (page.thumbnailPath) await deleteFileIfExists(page.thumbnailPath);
     let thumbnailPath = null;
     try {
-      thumbnailPath = await generateThumbnail(req.file.buffer, event.id, page.id);
+      thumbnailPath = (await generateThumbnail(req.file.buffer, event.id, page.id)).path;
     } catch {
       // Flipbook falls back to the full file.
     }
@@ -821,9 +821,9 @@ router.post("/:albumId/versions/duplicate", async (req, res, next) => {
         },
       });
       try {
-        const thumbnailPath = await generateThumbnail(buffer, event.id, page.id);
-        if (thumbnailPath) {
-          await prisma.albumPage.update({ where: { id: page.id }, data: { thumbnailPath } });
+        const thumb = await generateThumbnail(buffer, event.id, page.id);
+        if (thumb.path) {
+          await prisma.albumPage.update({ where: { id: page.id }, data: { thumbnailPath: thumb.path } });
         }
       } catch {
         // Same nicety rule as uploads — thumbnails never fail a duplication.

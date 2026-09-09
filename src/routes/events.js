@@ -1869,7 +1869,8 @@ async function processUploadJob(jobId, event, files) {
         const photoId = randomUUID();
         const storedFilename = `${photoId}${ext}`;
         const storagePath = await getStorageProvider().writeOriginal(event.id, storedFilename, file.buffer);
-        const thumbnailPath = await generateThumbnail(file.buffer, event.id, photoId);
+        const thumb = await generateThumbnail(file.buffer, event.id, photoId);
+        const thumbnailPath = thumb.path;
 
         const photo = await prisma.photo.create({
           data: {
@@ -1878,6 +1879,8 @@ async function processUploadJob(jobId, event, files) {
             filename: file.originalname,
             storagePath,
             thumbnailPath,
+            width: thumb.width,
+            height: thumb.height,
             faceCount: 0,
             fileSize: file.buffer.length,
             source: "upload",
@@ -2543,6 +2546,8 @@ router.get("/:id/photos", async (req, res, next) => {
         filename: p.filename,
         face_count: p.faceCount,
         file_size: p.fileSize,
+        width: p.width,
+        height: p.height,
         createdAt: p.createdAt,
         url: `/files/events/${event.id}/photos/${p.id}`,
         thumbnail_url: `/files/events/${event.id}/photos/${p.id}/thumb`,

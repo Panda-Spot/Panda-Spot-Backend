@@ -46,12 +46,17 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
   }
 
   let thumbnailPath = null;
+  let width = null;
+  let height = null;
   const photoId = randomUUID();
   if (!isVideo) {
     // Manual face-routing (same policy as direct uploads): thumbnails only
     // at import. Faces are indexed later, only for photos explicitly added
     // to AI Search — PandaShoots live capture is the sole auto exception.
-    thumbnailPath = await generateThumbnail(buffer, event.id, photoId);
+    const thumb = await generateThumbnail(buffer, event.id, photoId);
+    thumbnailPath = thumb.path;
+    width = thumb.width;
+    height = thumb.height;
   }
 
   const photo = await prisma.photo.create({
@@ -62,6 +67,8 @@ async function importOneDriveFile(event, file, usedBytesRef, storageLimitBytes, 
       storagePath: null,
       driveFileId: file.id,
       thumbnailPath,
+      width,
+      height,
       faceCount: 0,
       fileSize,
       source: "drive_import",
