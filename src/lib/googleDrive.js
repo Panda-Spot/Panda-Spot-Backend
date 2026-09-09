@@ -62,6 +62,22 @@ export async function listMediaFiles(folderId) {
 export const listImageFiles = listMediaFiles;
 
 /**
+ * Finds one file in a Drive folder by photo filename, tolerating the
+ * renames Drive users actually do: exact match first, then stripping any
+ * number of leading "Copy of " prefixes, then case-insensitive. Returns
+ * the file object or null. Used by the original-serving and face-indexing
+ * fallbacks when the stored file id goes stale.
+ */
+export async function findDriveFileByName(folderId, filename) {
+  const files = await listMediaFiles(folderId);
+  const stripCopies = (s) => String(s || "").replace(/^(copy of )+ */i, "").trim();
+  const exact = files.find((f) => f.name === filename);
+  if (exact) return exact;
+  const want = stripCopies(filename).toLowerCase();
+  return files.find((f) => stripCopies(f.name).toLowerCase() === want) || null;
+}
+
+/**
  * Verifies a folder link is actually reachable before committing to a full
  * connect/import — checks it resolves to a folder (not a file), and, best
  * effort, what access level the "anyone with the link" share grants.

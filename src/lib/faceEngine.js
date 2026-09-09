@@ -1,4 +1,21 @@
 const FACE_ENGINE_URL = process.env.FACE_ENGINE_URL || "http://127.0.0.1:8001";
+const DETECT_TIMEOUT_MS = parseInt(process.env.FACE_ENGINE_TIMEOUT_MS || "120000", 10);
+const MODERATE_TIMEOUT_MS = parseInt(process.env.FACE_ENGINE_MODERATE_TIMEOUT_MS || "30000", 10);
+
+async function fetchWithTimeout(url, options, timeoutMs, what) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw Object.assign(new Error(`${what} timed out after ${Math.round(timeoutMs / 1000)}s — the face engine may be overloaded`), { isFaceEngineError: true });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Sends raw image bytes to the face-engine microservice's /detect endpoint
@@ -14,10 +31,10 @@ export async function detectFaces(imageBuffer, filename) {
 
   let response;
   try {
-    response = await fetch(`${FACE_ENGINE_URL}/detect`, {
+    response = await fetchWithTimeout(`${FACE_ENGINE_URL}/detect`, {
       method: "POST",
       body: form,
-    });
+    }, DETECT_TIMEOUT_MS, "Face detection");
   } catch (err) {
     const error = new Error(`Could not reach face-engine at ${FACE_ENGINE_URL}: ${err.message}`);
     error.cause = err;
@@ -53,7 +70,7 @@ export async function checkModeration(imageBuffer, filename) {
   try {
     const form = new FormData();
     form.append("image", new Blob([imageBuffer]), filename);
-    const response = await fetch(`${FACE_ENGINE_URL}/moderate`, { method: "POST", body: form });
+    const response = await fetchWithTimeout(`${FACE_ENGINE_URL}/moderate`, { method: "POST", body: form }, MODERATE_TIMEOUT_MS, "Moderation check");
     if (!response.ok) return false;
     const data = await response.json();
     return !!data.flagged;

@@ -4,7 +4,7 @@ import sharp from "sharp";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma.js";
 import { detectFaces } from "./faceEngine.js";
-import { downloadFile, listMediaFiles } from "./googleDrive.js";
+import { downloadFile, findDriveFileByName } from "./googleDrive.js";
 import { deletePhotoFacesDir, ensurePhotoFacesDir, existsSync, faceThumbPath } from "./storage.js";
 import { originalDimensions } from "./thumbnails.js";
 
@@ -144,8 +144,7 @@ export async function loadPhotoOriginalBuffer(photo) {
     const event = await prisma.event.findUnique({ where: { id: photo.eventId } });
     const folderId = event?.exportDriveFolderId || event?.driveFolderId;
     if (folderId && photo.filename) {
-      const files = await listMediaFiles(folderId);
-      const match = files.find((f) => f.name === photo.filename);
+      const match = await findDriveFileByName(folderId, photo.filename);
       if (match) {
         const buffer = await downloadFile(match.id);
         if (match.id !== photo.driveFileId) {

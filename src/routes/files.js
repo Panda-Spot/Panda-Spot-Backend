@@ -2,7 +2,7 @@ import { Router } from "express";
 import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { existsSync, recoverEventCoverPath } from "../lib/storage.js";
-import { downloadFile, listMediaFiles } from "../lib/googleDrive.js";
+import { downloadFile, findDriveFileByName } from "../lib/googleDrive.js";
 import { verifyMediaToken } from "../lib/mediaTokens.js";
 import { loadPhotoOriginalBuffer, saveFaceThumbnail } from "../lib/faces.js";
 import { originalDimensions } from "../lib/thumbnails.js";
@@ -125,8 +125,7 @@ router.get("/events/:eventId/photos/:photoId", async (req, res, next) => {
       const event = await prisma.event.findUnique({ where: { id: req.params.eventId } });
       const folderId = event?.exportDriveFolderId || event?.driveFolderId;
       if (folderId) {
-        const files = await listMediaFiles(folderId);
-        const match = files.find((f) => f.name === photo.filename);
+        const match = await findDriveFileByName(folderId, photo.filename);
         if (match) {
           const buffer = await downloadFile(match.id);
           if (match.id !== photo.driveFileId) {
