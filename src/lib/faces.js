@@ -4,7 +4,7 @@ import sharp from "sharp";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma.js";
 import { detectFaces } from "./faceEngine.js";
-import { downloadFile } from "./googleDrive.js";
+import { downloadFile, listMediaFiles } from "./googleDrive.js";
 import { deletePhotoFacesDir, ensurePhotoFacesDir, existsSync, faceThumbPath } from "./storage.js";
 import { originalDimensions } from "./thumbnails.js";
 
@@ -128,8 +128,34 @@ export async function loadPhotoOriginalBuffer(photo) {
   if (photo.storagePath && existsSync(photo.storagePath)) {
     return fsp.readFile(photo.storagePath);
   }
+  // Drive imports keep no local original — pull the bytes on demand. The
+  // stored file id can go stale (replaced/restricted in Drive), so on any
+  // failure fall back to an exact filename lookup in the event's connected
+  // folder (same repair the file-serving route uses), then proceed purely
+  // in memory — nothing is persisted, so nothing needs deleting after.
   if (photo.driveFileId) {
-    return downloadFile(photo.driveFileId);
+    try {
+      return await downloadFile(photo.driveFileId);
+    } catch {
+      // fall through to the by-name lookup below
+    }
+  }
+  try {
+    const event = await prisma.event.findUnique({ where: { id: photo.eventId } });
+    const folderId = event?.exportDriveFolderId || event?.driveFolderId;
+    if (folderId && photo.filename) {
+      const files = await listMediaFiles(folderId);
+      const match = files.find((f) => f.name === photo.filename);
+      if (match) {
+        const buffer = await downloadFile(match.id);
+        if (match.id !== photo.driveFileId) {
+          await prisma.photo.update({ where: { id: photo.id }, data: { driveFileId: match.id } }).catch(() => {});
+        }
+        return buffer;
+      }
+    }
+  } catch {
+    // folder unreachable — fall through to the throw below
   }
   throw new Error("This photo's original is no longer accessible for AI indexing.");
 }
