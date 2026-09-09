@@ -269,7 +269,7 @@ router.get("/analytics/summary", async (req, res, next) => {
 // used to fire 1 + N requests (listEvents + listClients per event — 34+
 // with a busy studio), which is what made /access lag. Same event scoping
 // + ?status as GET / above. Read-only.
-router.get("/access-summary", async (req, res, next) => {
+router.get("/access-summary", requireAuth, async (req, res, next) => {
   try {
     const status = req.query.status ?? "active";
     if (!["active", "archived", "all"].includes(status)) {

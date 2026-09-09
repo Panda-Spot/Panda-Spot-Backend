@@ -87,7 +87,8 @@ export async function getFaceGroups(eventId, threshold) {
   const rows = await prisma.$queryRaw`
     SELECT f.id AS "faceId", f."photoId" AS "photoId",
            f.embedding::text AS embedding,
-           f.bbox AS bbox, f."detScore" AS "detScore"
+           f.bbox AS bbox, f."detScore" AS "detScore",
+           p.filename AS filename
     FROM "Face" f
     INNER JOIN "Photo" p ON p.id = f."photoId"
     WHERE f."eventId" = ${eventId}
@@ -97,7 +98,7 @@ export async function getFaceGroups(eventId, threshold) {
     ORDER BY f."detScore" DESC
   `;
 
-  // Each group: { members: [{faceId, photoId, bbox, detScore}], centroid: Float32Array, membersCount }
+  // Each group: { members: [{faceId, photoId, filename, bbox, detScore}], centroid: Float32Array, membersCount }
   const groups = [];
   for (const row of rows) {
     const vec = parseEmbedding(row.embedding);
@@ -113,7 +114,7 @@ export async function getFaceGroups(eventId, threshold) {
       }
     }
     if (best && bestSim >= threshold) {
-      best.members.push({ faceId: row.faceId, photoId: row.photoId, bbox, detScore: Number(row.detScore) || 0 });
+      best.members.push({ faceId: row.faceId, photoId: row.photoId, filename: row.filename, bbox, detScore: Number(row.detScore) || 0 });
       // Incremental centroid mean.
       const n = best.members.length;
       const c = best.centroid;
@@ -122,7 +123,7 @@ export async function getFaceGroups(eventId, threshold) {
       }
     } else {
       groups.push({
-        members: [{ faceId: row.faceId, photoId: row.photoId, bbox, detScore: Number(row.detScore) || 0 }],
+        members: [{ faceId: row.faceId, photoId: row.photoId, filename: row.filename, bbox, detScore: Number(row.detScore) || 0 }],
         centroid: Float32Array.from(vec),
       });
     }
@@ -133,11 +134,18 @@ export async function getFaceGroups(eventId, threshold) {
     groups: groups.map((g, index) => {
       const photoIds = [...new Set(g.members.map((m) => m.photoId))];
       const rep = g.members[0];
+      const nameByPhotoId = {};
+      for (const m of g.members) {
+        if (m.filename && !nameByPhotoId[m.photoId]) nameByPhotoId[m.photoId] = m.filename;
+      }
       return {
         group_index: index,
         face_count: g.members.length,
         photo_ids: photoIds,
-        representative: { photo_id: rep.photoId, bbox: rep.bbox, det_score: rep.detScore },
+        // Per-photo filenames so click-through opens the viewer with real
+        // names (previously the client faked `${photoId}.jpg`).
+        photos: photoIds.map((pid) => ({ photo_id: pid, filename: nameByPhotoId[pid] || `${pid}.jpg` })),
+        representative: { photo_id: rep.photoId, filename: rep.filename || `${rep.photoId}.jpg`, bbox: rep.bbox, det_score: rep.detScore },
       };
     }),
     face_count: rows.length,
