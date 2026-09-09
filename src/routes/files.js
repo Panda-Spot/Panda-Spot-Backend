@@ -2,7 +2,7 @@ import { Router } from "express";
 import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { existsSync, recoverEventCoverPath } from "../lib/storage.js";
-import { downloadFile } from "../lib/googleDrive.js";
+import { downloadFile, listMediaFiles } from "../lib/googleDrive.js";
 import { verifyMediaToken } from "../lib/mediaTokens.js";
 import { loadPhotoOriginalBuffer, saveFaceThumbnail } from "../lib/faces.js";
 import { originalDimensions } from "../lib/thumbnails.js";
@@ -104,21 +104,42 @@ router.get("/events/:eventId/photos/:photoId", async (req, res, next) => {
     if (photo.storagePath && existsSync(photo.storagePath)) {
       return res.sendFile(photo.storagePath, IMMUTABLE_FILE_OPTIONS);
     }
+    const serveDriveBuffer = (buffer) => {
+      res.setHeader("Content-Type", guessContentType(photo.filename));
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      return res.send(buffer);
+    };
     if (photo.driveFileId) {
       try {
-        const buffer = await downloadFile(photo.driveFileId);
-        res.setHeader("Content-Type", guessContentType(photo.filename));
-        res.setHeader("Cache-Control", "public, max-age=3600");
-        return res.send(buffer);
-      } catch (err) {
-        return res.status(404).json({
-          error:
-            "This photo's original is no longer accessible — the Google Drive folder may have been made private or the file may have been removed.",
-        });
+        return serveDriveBuffer(await downloadFile(photo.driveFileId));
+      } catch {
+        // Stored file id went stale (replaced/restricted in Drive) — fall
+        // through to the by-name lookup below before giving up.
       }
     }
+    // No local original (Drive imports) and the stored file id failed or was
+    // never set: find this exact filename in the event's connected folder
+    // right now, download it alone, and serve it — repairing the stored id
+    // for next time.
+    try {
+      const event = await prisma.event.findUnique({ where: { id: req.params.eventId } });
+      const folderId = event?.exportDriveFolderId || event?.driveFolderId;
+      if (folderId) {
+        const files = await listMediaFiles(folderId);
+        const match = files.find((f) => f.name === photo.filename);
+        if (match) {
+          const buffer = await downloadFile(match.id);
+          if (match.id !== photo.driveFileId) {
+            await prisma.photo.update({ where: { id: photo.id }, data: { driveFileId: match.id } }).catch(() => {});
+          }
+          return serveDriveBuffer(buffer);
+        }
+      }
+    } catch {
+      // Folder unreachable — fall through to the 404 below.
+    }
     return res.status(404).json({
-      error: "This photo's original has expired and is no longer available for download — search still works.",
+      error: "This photo's original is no longer accessible — the Google Drive folder may have been made private or the file may have been removed.",
     });
   } catch (err) {
     next(err);
