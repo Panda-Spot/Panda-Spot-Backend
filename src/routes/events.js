@@ -148,6 +148,22 @@ router.get("/", async (req, res, next) => {
     );
     all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
+    // Sub-galleries for the expand/collapse on event cards — one batched
+    // query, not N. Only parents with the feature on expose children.
+    const children = await prisma.event.findMany({
+      where: { parentEventId: { in: all.filter((e) => e.subGalleriesEnabled).map((e) => e.id) } },
+      include: { _count: { select: { photos: true } } },
+      orderBy: { createdAt: "asc" },
+    });
+    const childrenByParent = {};
+    for (const c of children) {
+      (childrenByParent[c.parentEventId] = childrenByParent[c.parentEventId] || []).push({
+        id: c.id,
+        name: c.name,
+        photo_count: c._count.photos,
+      });
+    }
+
     res.json(
       all.map((e) => ({
         id: e.id,
@@ -166,6 +182,8 @@ router.get("/", async (req, res, next) => {
         shoots_connected: !!e.ftpUsername,
         event_date: e.eventDate,
         event_type: e.eventType,
+        sub_galleries_enabled: e.subGalleriesEnabled,
+        sub_galleries: e.subGalleriesEnabled ? childrenByParent[e.id] || [] : [],
       }))
     );
   } catch (err) {
