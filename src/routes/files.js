@@ -164,7 +164,13 @@ router.get("/events/:eventId/cover", async (req, res, next) => {
       }
       event.coverPhotoPath = recovered;
     }
-    res.sendFile(event.coverPhotoPath, MUTABLE_FILE_OPTIONS);
+    // Covers get replaced fairly often (every "Set cover" upload) and the
+    // URL is the same after a replace, so a permissive max-age would
+    // leave stale pixels in the browser for up to a minute. no-store
+    // guarantees the next page render fetches the new bytes — pass it
+    // through sendFile's per-call `headers` so it's not clobbered by
+    // express's default caching of the response.
+    res.sendFile(event.coverPhotoPath, { ...MUTABLE_FILE_OPTIONS, headers: { "Cache-Control": "no-store" } });
   } catch (err) {
     next(err);
   }
@@ -180,7 +186,7 @@ router.get("/events/:eventId/sponsor-logo", async (req, res, next) => {
     if (!existsSync(event.sponsorLogoPath)) {
       return res.status(404).json({ error: "Sponsor logo file missing on disk" });
     }
-    res.sendFile(event.sponsorLogoPath, MUTABLE_FILE_OPTIONS);
+    res.sendFile(event.sponsorLogoPath, { ...MUTABLE_FILE_OPTIONS, headers: { "Cache-Control": "no-store" } });
   } catch (err) {
     next(err);
   }
