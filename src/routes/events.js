@@ -2765,8 +2765,29 @@ router.post("/:id/photos/bulk-features", async (req, res, next) => {
       return res.status(400).json({ error: "Provide photo_ids[] or an `all` selector." });
     }
 
-    if (targets.length > 0) {
-      await prisma.photo.updateMany({ where: { id: { in: targets } }, data });
+    // Idempotent adds: when turning a flag ON, only photos missing it are
+    // touched — already-members are counted and reported, not rewritten.
+    // Removals (false) still touch every target (harmless no-ops).
+    let already = 0;
+    let effectiveTargets = targets;
+    const addFlag = data.faceSearchVisible === true
+      ? "faceSearchVisible"
+      : data.photoSelectionVisible === true
+        ? "photoSelectionVisible"
+        : null;
+    if (addFlag) {
+      already = await prisma.photo.count({ where: { id: { in: targets }, [addFlag]: true } });
+      if (already > 0) {
+        const missing = await prisma.photo.findMany({
+          where: { id: { in: targets }, [addFlag]: false },
+          select: { id: true },
+        });
+        effectiveTargets = missing.map((r) => r.id);
+      }
+    }
+
+    if (effectiveTargets.length > 0) {
+      await prisma.photo.updateMany({ where: { id: { in: effectiveTargets } }, data });
     }
 
     // Newly added-to-AI images that were never indexed need faces before
@@ -2776,7 +2797,7 @@ router.post("/:id/photos/bulk-features", async (req, res, next) => {
     if (data.faceSearchVisible && event.faceSearchEnabled) {
       const candidates = await prisma.photo.findMany({
         where: {
-          id: { in: targets },
+          id: { in: effectiveTargets },
           approvalStatus: "approved",
           faceSearchVisible: true,
           faceIndexedAt: null,
@@ -2795,7 +2816,7 @@ router.post("/:id/photos/bulk-features", async (req, res, next) => {
       }
     }
 
-    res.status(202).json({ updated: targets.length, skipped, job_id: jobId });
+    res.status(202).json({ updated: effectiveTargets.length, already, skipped, job_id: jobId });
   } catch (err) {
     next(err);
   }
