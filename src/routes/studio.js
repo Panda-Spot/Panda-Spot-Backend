@@ -270,6 +270,42 @@ router.get("/calendar", async (req, res, next) => {
   }
 });
 
+// Global studio-only people search: named faces across the owner's
+// events (studio auth wall — never guest-reachable, and personName is
+// never included in any guest response). Sample thumbnail reuses the
+// existing face file route.
+router.get("/face-names", async (req, res, next) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (q.length < 2) return res.json({ query: q, people: [] });
+    const rows = await prisma.$queryRaw`
+      SELECT f."personName" AS name, f."eventId" AS "eventId", e.name AS "eventName",
+             COUNT(*)::int AS faces, COUNT(DISTINCT f."photoId")::int AS photos,
+             MIN(f.id) AS "sampleFaceId"
+      FROM "Face" f
+      INNER JOIN "Event" e ON e.id = f."eventId"
+      WHERE e."ownerId" = ${req.user.id}
+        AND f."personName" ILIKE ${"%" + q + "%"}
+      GROUP BY f."personName", f."eventId", e.name
+      ORDER BY f."personName" ASC
+      LIMIT 50
+    `;
+    res.json({
+      query: q,
+      people: rows.map((r) => ({
+        person_name: r.name,
+        event_id: r.eventId,
+        event_name: r.eventName,
+        face_count: Number(r.faces) || 0,
+        photo_count: Number(r.photos) || 0,
+        thumbnail_url: r.sampleFaceId ? `/files/events/${r.eventId}/faces/${r.sampleFaceId}` : null,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- Packages ---
 
 function packageShape(p) {

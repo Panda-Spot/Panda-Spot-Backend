@@ -2622,6 +2622,31 @@ router.get("/:id/face-groups", async (req, res, next) => {
   }
 });
 
+// Studio-only person naming for face groups: sets (or clears, with an
+// empty name) personName on the given faces of this event. Group display
+// names resolve by majority vote, so renames survive regrouping.
+// Never exposed to guests — no guest route reads personName.
+router.patch("/:id/faces/name", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { face_ids: faceIds, person_name: personName } = req.body || {};
+    if (!Array.isArray(faceIds) || faceIds.length === 0 || faceIds.length > 5000) {
+      return res.status(400).json({ error: "Provide face_ids[] (1–5000 ids)." });
+    }
+    const name = typeof personName === "string" ? personName.trim().slice(0, 60) : "";
+    const { count } = await prisma.face.updateMany({
+      where: { id: { in: faceIds }, eventId: event.id },
+      data: { personName: name === "" ? null : name },
+    });
+    res.json({ updated: count, person_name: name === "" ? null : name });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Face boxes for one photo (Phase 22 viewer + groups): bbox is stored in
 // original-image pixels (face-engine runs on the full upload), so the
 // frontend converts to percentages against the loaded image's natural
@@ -2642,7 +2667,7 @@ router.get("/:id/photos/:photoId/faces", async (req, res, next) => {  try {
 
     const faces = await prisma.face.findMany({
       where: { photoId: photo.id },
-      select: { id: true, bbox: true, detScore: true, thumbnailPath: true },
+      select: { id: true, bbox: true, detScore: true, thumbnailPath: true, personName: true },
       orderBy: { detScore: "desc" },
     });
     res.json({
@@ -2651,6 +2676,7 @@ router.get("/:id/photos/:photoId/faces", async (req, res, next) => {  try {
         id: f.id,
         bbox: f.bbox,
         det_score: f.detScore,
+        person_name: f.personName || null,
         thumbnail_url: f.thumbnailPath ? `/files/events/${event.id}/faces/${f.id}` : null,
       })),
     });

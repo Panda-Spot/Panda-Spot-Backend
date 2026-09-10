@@ -100,6 +100,7 @@ export async function getFaceGroups(eventId, threshold) {
            f.embedding::text AS embedding,
            f.bbox AS bbox, f."detScore" AS "detScore",
            f."thumbnailPath" AS "thumbnailPath",
+           f."personName" AS "personName",
            p.filename AS filename, p.width AS width, p.height AS height
     FROM "Face" f
     INNER JOIN "Photo" p ON p.id = f."photoId"
@@ -126,7 +127,7 @@ export async function getFaceGroups(eventId, threshold) {
       }
     }
     if (best && bestSim >= threshold) {
-      best.members.push({ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, bbox, detScore: Number(row.detScore) || 0 });
+      best.members.push({ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, personName: row.personName || null, bbox, detScore: Number(row.detScore) || 0 });
       // Incremental centroid mean.
       const n = best.members.length;
       const c = best.centroid;
@@ -135,7 +136,7 @@ export async function getFaceGroups(eventId, threshold) {
       }
     } else {
       groups.push({
-        members: [{ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, bbox, detScore: Number(row.detScore) || 0 }],
+        members: [{ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, personName: row.personName || null, bbox, detScore: Number(row.detScore) || 0 }],
         centroid: Float32Array.from(vec),
       });
     }
@@ -159,10 +160,25 @@ export async function getFaceGroups(eventId, threshold) {
       const repThumbFace = g.members.find((m) => m.photoId === rep.photoId && m.thumbnailPath)
         || g.members.find((m) => m.photoId === rep.photoId)
         || {};
+      // Studio-only person label: majority vote across named members so
+      // the name survives regrouping; null keeps the "Person N" fallback.
+      const votes = {};
+      for (const m of g.members) {
+        if (m.personName) votes[m.personName] = (votes[m.personName] || 0) + 1;
+      }
+      let personName = null;
+      let bestVotes = 0;
+      for (const [name, n] of Object.entries(votes)) {
+        if (n > bestVotes) { bestVotes = n; personName = name; }
+      }
       return {
         group_index: index,
         face_count: g.members.length,
         photo_ids: photoIds,
+        person_name: personName,
+        // Member face ids so the studio can rename the whole group in
+        // one PATCH /faces/name call (data only — grouping untouched).
+        face_ids: g.members.map((m) => m.faceId),
         // Per-photo filenames + dims so click-through opens the viewer with
         // real names and exact crop math (previously the client faked
         // `${photoId}.jpg` and measured wrong files).

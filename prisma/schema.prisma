@@ -819,6 +819,11 @@ model Face {
   /// Excluded from groups/search by every query (they join the photo's
   /// faceSearchVisible flag), so grouping logic is untouched.
   deletedAt DateTime?
+  /// Studio-only person label for named face groups (e.g. "Ananya").
+  /// Set by the photographer/team, never exposed to guests. Group
+  /// display names resolve by majority vote across member rows so
+  /// renames survive regrouping and re-indexing.
+  personName String?
   createdAt DateTime                @default(now())
 
   @@index([eventId])
