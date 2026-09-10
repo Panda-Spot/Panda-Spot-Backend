@@ -829,6 +829,19 @@ model Face {
   @@index([eventId])
 }
 
+/// Studio dismissal of one "same person?" merge suggestion, keyed by the
+/// two representative face ids at dismissal time. Orphaned rows (faces
+/// gone after a re-index) are simply ignored by the suggestion query.
+model FaceMergeDismissal {
+  id        String   @id @default(uuid())
+  eventId   String
+  faceA     String
+  faceB     String
+  createdAt DateTime @default(now())
+
+  @@index([eventId])
+}
+
 /// One row per guest selfie search — stores the (averaged, if multi-selfie)
 /// query embedding so a later "not me" feedback report can be tied back to
 /// it, and doubles as the analytics source (search counts, unique guests via

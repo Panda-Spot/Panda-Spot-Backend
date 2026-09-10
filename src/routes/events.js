@@ -29,7 +29,7 @@ import { ACCESS_MODES, setAccessKey } from "../lib/galleryAccess.js";
 import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension, isVideoExtension, isVideoFilename } from "../lib/fileValidation.js";
 import { getEffectiveThreshold } from "../lib/threshold.js";
-import { getFaceGroups } from "../lib/faceClustering.js";
+import { getFaceGroups, getMergeSuggestions } from "../lib/faceClustering.js";
 import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter, collabInviteLimiter } from "../lib/rateLimiters.js";
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
 import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
@@ -2642,6 +2642,46 @@ router.patch("/:id/faces/name", async (req, res, next) => {
       data: { personName: name === "" ? null : name },
     });
     res.json({ updated: count, person_name: name === "" ? null : name });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Same/different-person review queue (Google Photos concept): pairs of
+// face groups just below the auto-merge threshold, for the studio to
+// confirm. Merging reuses PATCH /faces/name (dominant name wins, groups
+// sharing one name display as one person); "different" dismisses here.
+router.get("/:id/merge-suggestions", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const threshold = getEffectiveThreshold(event);
+    const result = await getMergeSuggestions(event.id, threshold);
+    res.json({ event_id: event.id, ...result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Dismisses one suggestion ("different people") by representative face
+// ids — stable until a re-index replaces the faces, at which point the
+// pair may legitimately be suggested again.
+router.post("/:id/merge-suggestions/dismiss", async (req, res, next) => {
+  try {
+    const accessible = await loadAccessibleEvent(req, res);
+    if (!accessible) return;
+    const { event } = accessible;
+
+    const { face_a: faceA, face_b: faceB } = req.body || {};
+    if (!faceA || !faceB) {
+      return res.status(400).json({ error: "Provide face_a and face_b." });
+    }
+    await prisma.faceMergeDismissal.create({
+      data: { eventId: event.id, faceA: String(faceA), faceB: String(faceB) },
+    });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }

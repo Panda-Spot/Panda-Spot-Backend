@@ -74,6 +74,67 @@ export function resolveClusteringThreshold(event) {
   return getEffectiveThreshold(event);
 }
 
+// Searchable faces for one event, best detection first. Shared by
+// grouping, merge suggestions, and (via getFaceGroups) guest recall.
+async function fetchSearchableFaces(eventId) {
+  return prisma.$queryRaw`
+    SELECT f.id AS "faceId", f."photoId" AS "photoId",
+           f.embedding::text AS embedding,
+           f.bbox AS bbox, f."detScore" AS "detScore",
+           f."thumbnailPath" AS "thumbnailPath",
+           f."personName" AS "personName",
+           p.filename AS filename, p.width AS width, p.height AS height
+    FROM "Face" f
+    INNER JOIN "Photo" p ON p.id = f."photoId"
+    WHERE f."eventId" = ${eventId}
+      AND p."approvalStatus" = 'approved'
+      AND p."faceSearchVisible" = true
+      AND p."archivedAt" IS NULL
+    ORDER BY f."detScore" DESC
+  `;
+}
+
+// Greedy single-pass clustering over ArcFace embeddings (already
+// L2-normalized, so cosine similarity is a dot product). Faces arrive
+// ordered by detection score (best first); each face joins the most
+// similar group whose centroid scores >= the event's effective search
+// threshold, else starts a new group. Centroids update incrementally.
+// Using the *search* threshold as the join cutoff is deliberate: faces
+// we'd return for the same selfie end up in the same group.
+// Each group: { members: [...], centroid: Float32Array }
+function clusterMembers(sourceRows, threshold) {
+  const clustered = [];
+  for (const row of sourceRows) {
+    const vec = parseEmbedding(row.embedding);
+    const bbox = normalizeBbox(row.bbox);
+    if (!vec || !bbox) continue;
+    let best = null;
+    let bestSim = -Infinity;
+    for (const g of clustered) {
+      const sim = dotSimilarity(vec, g.centroid);
+      if (sim > bestSim) {
+        bestSim = sim;
+        best = g;
+      }
+    }
+    if (best && bestSim >= threshold) {
+      best.members.push({ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, personName: row.personName || null, bbox, detScore: Number(row.detScore) || 0 });
+      // Incremental centroid mean.
+      const n = best.members.length;
+      const c = best.centroid;
+      for (let i = 0; i < c.length; i += 1) {
+        c[i] += (vec[i] - c[i]) / n;
+      }
+    } else {
+      clustered.push({
+        members: [{ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, personName: row.personName || null, bbox, detScore: Number(row.detScore) || 0 }],
+        centroid: Float32Array.from(vec),
+      });
+    }
+  }
+  return clustered;
+}
+
 export async function getFaceGroups(eventId, threshold) {
   // Count + newest-row timestamp + VISIBLE-face count: any add, delete,
   // re-index, archive, or membership flip changes the key, so cached
@@ -95,56 +156,68 @@ export async function getFaceGroups(eventId, threshold) {
     return cached.result;
   }
 
-  const rows = await prisma.$queryRaw`
-    SELECT f.id AS "faceId", f."photoId" AS "photoId",
-           f.embedding::text AS embedding,
-           f.bbox AS bbox, f."detScore" AS "detScore",
-           f."thumbnailPath" AS "thumbnailPath",
-           f."personName" AS "personName",
-           p.filename AS filename, p.width AS width, p.height AS height
-    FROM "Face" f
-    INNER JOIN "Photo" p ON p.id = f."photoId"
-    WHERE f."eventId" = ${eventId}
-      AND p."approvalStatus" = 'approved'
-      AND p."faceSearchVisible" = true
-      AND p."archivedAt" IS NULL
-    ORDER BY f."detScore" DESC
-  `;
+  const rows = await fetchSearchableFaces(eventId);
 
-  // Each group: { members: [{faceId, photoId, filename, bbox, detScore}], centroid: Float32Array, membersCount }
-  const groups = [];
-  for (const row of rows) {
-    const vec = parseEmbedding(row.embedding);
-    const bbox = normalizeBbox(row.bbox);
-    if (!vec || !bbox) continue;
-    let best = null;
-    let bestSim = -Infinity;
-    for (const g of groups) {
-      const sim = dotSimilarity(vec, g.centroid);
-      if (sim > bestSim) {
-        bestSim = sim;
-        best = g;
-      }
-    }
-    if (best && bestSim >= threshold) {
-      best.members.push({ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, personName: row.personName || null, bbox, detScore: Number(row.detScore) || 0 });
-      // Incremental centroid mean.
-      const n = best.members.length;
-      const c = best.centroid;
-      for (let i = 0; i < c.length; i += 1) {
-        c[i] += (vec[i] - c[i]) / n;
-      }
-    } else {
-      groups.push({
-        members: [{ faceId: row.faceId, photoId: row.photoId, filename: row.filename, width: row.width, height: row.height, thumbnailPath: row.thumbnailPath, personName: row.personName || null, bbox, detScore: Number(row.detScore) || 0 }],
-        centroid: Float32Array.from(vec),
-      });
-    }
-  }
+  const groups = clusterMembers(rows, threshold);
 
   groups.sort((a, b) => b.members.length - a.members.length);
+  // Display merge: groups sharing one studio-assigned person name
+  // present as a single person (members concatenated, best face first).
+  // Clustering above is untouched — this only affects studio display,
+  // and gives "same person" merges somewhere to land.
+  const displayGroups = mergeNamedGroups(groups);
   const result = {
-    groups: groups.map((g, index) => {
+    groups: displayGroups.map((g, index) => buildGroupSummary(g, index, eventId)),
+    face_count: rows.length,
+    group_count: displayGroups.length,
+    threshold,
+  };
+  remember(eventId, { faceKey, threshold, result });
+  return result;
+}
+
+// Concatenates groups carrying the same non-null studio person name.
+// Best-detection face first within each merged group (rows arrive in
+// detScore order, so a stable sort by detScore restores it).
+function mergeNamedGroups(groups) {
+  const named = new Map();
+  const out = [];
+  for (const g of groups) {
+    const name = groupPersonName(g);
+    if (!name) {
+      out.push(g);
+      continue;
+    }
+    if (!named.has(name)) {
+      named.set(name, g);
+      out.push(g);
+    } else {
+      const target = named.get(name);
+      target.members.push(...g.members);
+    }
+  }
+  for (const g of named.values()) {
+    g.members.sort((a, b) => (b.detScore || 0) - (a.detScore || 0));
+  }
+  out.sort((a, b) => b.members.length - a.members.length);
+  return out;
+}
+
+// Majority vote across named members; null keeps "Person N".
+function groupPersonName(g) {
+  const votes = {};
+  for (const m of g.members) {
+    if (m.personName) votes[m.personName] = (votes[m.personName] || 0) + 1;
+  }
+  let personName = null;
+  let bestVotes = 0;
+  for (const [name, n] of Object.entries(votes)) {
+    if (n > bestVotes) { bestVotes = n; personName = name; }
+  }
+  return personName;
+}
+
+function buildGroupSummary(g, index, eventId) {
       const photoIds = [...new Set(g.members.map((m) => m.photoId))];
       const rep = g.members[0];
       const nameByPhotoId = {};
@@ -162,15 +235,7 @@ export async function getFaceGroups(eventId, threshold) {
         || {};
       // Studio-only person label: majority vote across named members so
       // the name survives regrouping; null keeps the "Person N" fallback.
-      const votes = {};
-      for (const m of g.members) {
-        if (m.personName) votes[m.personName] = (votes[m.personName] || 0) + 1;
-      }
-      let personName = null;
-      let bestVotes = 0;
-      for (const [name, n] of Object.entries(votes)) {
-        if (n > bestVotes) { bestVotes = n; personName = name; }
-      }
+      const personName = groupPersonName(g);
       return {
         group_index: index,
         face_count: g.members.length,
@@ -184,6 +249,7 @@ export async function getFaceGroups(eventId, threshold) {
         // `${photoId}.jpg` and measured wrong files).
         photos: photoIds.map((pid) => ({ photo_id: pid, filename: nameByPhotoId[pid] || `${pid}.jpg`, ...(dimsByPhotoId[pid] || {}) })),
         representative: {
+          face_id: rep.faceId,
           photo_id: rep.photoId,
           filename: rep.filename || `${rep.photoId}.jpg`,
           ...(rep.width && rep.height ? { width: Number(rep.width), height: Number(rep.height) } : {}),
@@ -193,18 +259,78 @@ export async function getFaceGroups(eventId, threshold) {
           det_score: rep.detScore,
         },
       };
-    }),
-    face_count: rows.length,
-    group_count: groups.length,
-    threshold,
-  };
-  remember(eventId, { faceKey, threshold, result });
-  return result;
 }
 
 /** For tests/diagnostics: how many events currently hold cached groups. */
 export function faceGroupCacheSize() {
   return groupCache.size;
+}
+
+// Lookalike window below the join threshold: group pairs this similar
+// didn't merge on their own but are close enough that a human should
+// confirm same vs different person. Tunable.
+export const MERGE_SUGGEST_MARGIN = 0.12;
+export const MAX_MERGE_SUGGESTIONS = 20;
+
+/**
+ * Same/different-person review queue (Google Photos concept): pairs of
+ * freshly-clustered groups whose centroids score just BELOW the join
+ * threshold. Clustering is untouched — this only reads the same groups.
+ * Pairs already sharing one studio name, or dismissed by the studio
+ * (FaceMergeDismissal by representative face ids), are skipped.
+ */
+export async function getMergeSuggestions(eventId, threshold) {
+  const rows = await fetchSearchableFaces(eventId);
+  const groups = clusterMembers(rows, threshold);
+  if (groups.length < 2) return { suggestions: [], threshold };
+
+  let dismissed = [];
+  try {
+    dismissed = await prisma.faceMergeDismissal.findMany({
+      where: { eventId },
+      select: { faceA: true, faceB: true },
+    });
+  } catch {
+    dismissed = [];
+  }
+  return buildMergeSuggestions(eventId, threshold, groups, dismissed);
+}
+
+function buildMergeSuggestions(eventId, threshold, groups, dismissed) {
+  const liveFaceIds = new Set();
+  for (const g of groups) for (const m of g.members) liveFaceIds.add(m.faceId);
+  const dismissedKeys = new Set();
+  for (const d of dismissed || []) {
+    if (!d?.faceA || !d?.faceB) continue;
+    if (!liveFaceIds.has(d.faceA) || !liveFaceIds.has(d.faceB)) continue;
+    dismissedKeys.add([d.faceA, d.faceB].sort().join(":"));
+  }
+  const scored = [];
+  for (let i = 0; i < groups.length; i += 1) {
+    for (let j = i + 1; j < groups.length; j += 1) {
+      const sim = dotSimilarity(groups[i].centroid, groups[j].centroid);
+      if (!(sim >= threshold - MERGE_SUGGEST_MARGIN && sim < threshold)) continue;
+      const nameA = groupPersonName(groups[i]);
+      const nameB = groupPersonName(groups[j]);
+      if (nameA && nameA === nameB) continue;
+      const repA = groups[i].members[0]?.faceId;
+      const repB = groups[j].members[0]?.faceId;
+      if (!repA || !repB) continue;
+      const key = [repA, repB].sort().join(":");
+      if (dismissedKeys.has(key)) continue;
+      scored.push({ i, j, sim, key });
+    }
+  }
+  scored.sort((a, b) => b.sim - a.sim);
+  return {
+    threshold,
+    suggestions: scored.slice(0, MAX_MERGE_SUGGESTIONS).map((s) => ({
+      id: s.key,
+      similarity: Math.round(s.sim * 1000) / 1000,
+      group_a: buildGroupSummary(groups[s.i], 0, eventId),
+      group_b: buildGroupSummary(groups[s.j], 1, eventId),
+    })),
+  };
 }
 
 // Seeds above the search threshold PLUS this margin may pull in their
