@@ -104,14 +104,6 @@ export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox
     const bottom = Math.max(0, Math.min(y2 / origHeight, 1));
     const cx = (left + right) / 2;
     const cy = (top + bottom) / 2;
-    const half = Math.max(right - left, bottom - top) * 0.85;
-    let sqLeft = Math.max(0, cx - half);
-    let sqTop = Math.max(0, cy - half);
-    let sqSize = half * 2;
-    if (sqLeft + sqSize > 1) sqLeft = Math.max(0, 1 - sqSize);
-    if (sqTop + sqSize > 1) sqTop = Math.max(0, 1 - sqSize);
-    sqSize = Math.min(sqSize, 1 - sqLeft, 1 - sqTop);
-    if (!(sqSize > 0)) return null;
     const outPath = faceThumbPath(eventId, photoId, faceId);
     await ensurePhotoFacesDir(eventId, photoId);
     // Dims must come from the SAME canvas the extract runs on: rotated
@@ -122,14 +114,24 @@ export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox
     const rw = swap ? meta.height : meta.width;
     const rh = swap ? meta.width : meta.height;
     if (!rw || !rh) return null;
+    // Pixel-square window (not a fraction square): on a non-square photo
+    // a fraction square is a wide/tall pixel rect, and cover-resizing it
+    // to 192px crops the face off-center. Center on the face in pixels.
+    const fwPx = Math.max(0, (right - left) * rw);
+    const fhPx = Math.max(0, (bottom - top) * rh);
+    let side = Math.max(fwPx, fhPx) * 1.7;
+    side = Math.min(side, rw, rh);
+    if (!(side > 0)) return null;
+    const x0 = Math.min(Math.max(cx * rw - side / 2, 0), Math.max(0, rw - side));
+    const y0 = Math.min(Math.max(cy * rh - side / 2, 0), Math.max(0, rh - side));
     let pipeline = sharp(buffer);
     if (!rawSpace) pipeline = pipeline.rotate();
     await pipeline
       .extract({
-        left: Math.round(sqLeft * rw),
-        top: Math.round(sqTop * rh),
-        width: Math.max(1, Math.round(sqSize * rw)),
-        height: Math.max(1, Math.round(sqSize * rh)),
+        left: Math.round(x0),
+        top: Math.round(y0),
+        width: Math.max(1, Math.round(side)),
+        height: Math.max(1, Math.round(side)),
       })
       .resize(FACE_THUMB_SIZE, FACE_THUMB_SIZE, { fit: "cover" })
       .jpeg({ quality: 80 })
