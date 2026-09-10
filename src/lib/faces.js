@@ -7,6 +7,7 @@ import { detectFaces } from "./faceEngine.js";
 import { downloadFile, findDriveFileByName } from "./googleDrive.js";
 import { deletePhotoFacesDir, ensurePhotoFacesDir, existsSync, faceThumbPath } from "./storage.js";
 import { originalDimensions } from "./thumbnails.js";
+import { getEffectiveThreshold } from "./threshold.js";
 
 const FACE_THUMB_SIZE = 192;
 
@@ -26,14 +27,14 @@ function toVectorLiteral(embedding) {
  * parameters (template literal placeholders), so this is not string
  * concatenation / SQL injection prone.
  */
-export async function insertFace({ id, photoId, eventId, bbox, embedding, detScore, thumbnailPath, bboxSpace }) {
+export async function insertFace({ id, photoId, eventId, bbox, embedding, detScore, thumbnailPath, bboxSpace, personName }) {
   const faceId = id || randomUUID();
   const vectorLiteral = toVectorLiteral(embedding);
   const bboxJson = JSON.stringify(bbox);
 
   await prisma.$executeRaw`
-    INSERT INTO "Face" (id, "photoId", "eventId", bbox, embedding, "detScore", "thumbnailPath", "bboxSpace", "createdAt")
-    VALUES (${faceId}, ${photoId}, ${eventId}, ${bboxJson}::jsonb, ${vectorLiteral}::vector, ${detScore}, ${thumbnailPath}, ${bboxSpace || null}, now())
+    INSERT INTO "Face" (id, "photoId", "eventId", bbox, embedding, "detScore", "thumbnailPath", "bboxSpace", "personName", "createdAt")
+    VALUES (${faceId}, ${photoId}, ${eventId}, ${bboxJson}::jsonb, ${vectorLiteral}::vector, ${detScore}, ${thumbnailPath}, ${bboxSpace || null}, ${personName || null}, now())
   `;
 
   return faceId;
@@ -143,6 +144,49 @@ export async function saveFaceThumbnail({ eventId, photoId, faceId, buffer, bbox
   }
 }
 
+/**
+ * Pre-names fresh faces from already-named lookalikes in the same event.
+ * For each detected face, the nearest NAMED, live face at or above the
+ * event's search threshold lends its personName (mutates the face objects
+ * in place before insert). Faces with no confident named match stay null.
+ * Best-effort and silent — never fails indexing.
+ */
+export async function inheritPersonNames({ eventId, faces }) {
+  try {
+    if (!Array.isArray(faces) || faces.length === 0) return;
+    const namedCount = await prisma.face.count({
+      where: { eventId, personName: { not: null }, deletedAt: null },
+    });
+    if (namedCount === 0) return;
+    const event = await prisma.event.findUnique({ where: { id: eventId } });
+    if (!event) return;
+    const threshold = getEffectiveThreshold(event);
+    for (const face of faces) {
+      if (!face?.embedding || !Array.isArray(face.embedding)) continue;
+      const vectorLiteral = toVectorLiteral(face.embedding);
+      const hit = await prisma.$queryRaw`
+        SELECT f."personName" AS name, (1 - (f.embedding <=> ${vectorLiteral}::vector)) AS sim
+        FROM "Face" f
+        INNER JOIN "Photo" p ON p.id = f."photoId"
+        WHERE f."eventId" = ${eventId}
+          AND f."personName" IS NOT NULL
+          AND f."deletedAt" IS NULL
+          AND p."approvalStatus" = 'approved'
+          AND p."faceSearchVisible" = true
+          AND p."archivedAt" IS NULL
+        ORDER BY f.embedding <=> ${vectorLiteral}::vector ASC
+        LIMIT 1
+      `;
+      const best = hit?.[0];
+      if (best?.name && Number(best.sim) >= threshold) {
+        face.personName = best.name;
+      }
+    }
+  } catch (err) {
+    console.error(`Person-name inherit failed for event ${eventId}:`, err?.message || err);
+  }
+}
+
 export async function replacePhotoFaces({ photoId, eventId, faces, buffer }) {
   // Original dims once (not per face) — the denominator for every bbox.
   // Callers pass orientation-normalized bytes (see normalizeOrientation):
@@ -158,8 +202,16 @@ export async function replacePhotoFaces({ photoId, eventId, faces, buffer }) {
       // dims stay null — thumbnails below simply skip
     }
   }
+  await inheritPersonNames({ eventId, faces });
   await prisma.face.deleteMany({ where: { photoId } });
   await deletePhotoFacesDir(eventId, photoId);
+  // Known-person inherit: new faces matching an already-NAMED face in
+  // this event (at the event's own search threshold) arrive pre-named,
+  // so fresh uploads of known people show names with no manual rename.
+  // Runs BEFORE the old rows for this photo are replaced, so a re-index
+  // keeps its own names too. Skipped entirely when the event has no
+  // named faces (one cheap COUNT) — zero overhead for unnamed studios.
+  await inheritPersonNames({ eventId, faces });
   for (const face of faces) {
     const faceId = randomUUID();
     const thumbnailPath = buffer && origWidth && origHeight
@@ -176,6 +228,9 @@ export async function replacePhotoFaces({ photoId, eventId, faces, buffer }) {
       // Bboxes are detected on the orientation-normalized buffer (see
       // indexExistingPhotoFaces / captureIngest), i.e. displayed space.
       bboxSpace: "displayed",
+      // Pre-named by inheritPersonNames above when this face matches a
+      // known person; otherwise null until the studio names it.
+      personName: face.personName || null,
     });
   }
   await prisma.photo.update({ where: { id: photoId }, data: { faceCount: faces.length, faceIndexedAt: new Date() } });
