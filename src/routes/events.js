@@ -29,7 +29,7 @@ import { ACCESS_MODES, setAccessKey } from "../lib/galleryAccess.js";
 import { sendCollaboratorInviteEmail, sendClientInviteEmail } from "../lib/mailer.js";
 import { contentMatchesExtension, isVideoExtension, isVideoFilename } from "../lib/fileValidation.js";
 import { getEffectiveThreshold } from "../lib/threshold.js";
-import { getFaceGroups, getMergeSuggestions } from "../lib/faceClustering.js";
+import { bustFaceGroups, getFaceGroups, getMergeSuggestions } from "../lib/faceClustering.js";
 import { uploadLimiter, driveImportLimiter, shootsCredentialLimiter, collabInviteLimiter } from "../lib/rateLimiters.js";
 import { generateShootsCredentials } from "../lib/ftpShoots.js";
 import { publishLiveEvent, subscribeLiveEvents } from "../lib/liveEvents.js";
@@ -2641,6 +2641,9 @@ router.patch("/:id/faces/name", async (req, res, next) => {
       where: { id: { in: faceIds }, eventId: event.id },
       data: { personName: name === "" ? null : name },
     });
+    // Renames touch no count/timestamp, so the group cache can't see
+    // them — bust explicitly or regroups keep showing the old name.
+    bustFaceGroups(event.id);
     res.json({ updated: count, person_name: name === "" ? null : name });
   } catch (err) {
     next(err);

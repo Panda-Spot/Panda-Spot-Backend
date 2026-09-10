@@ -266,6 +266,12 @@ export function faceGroupCacheSize() {
   return groupCache.size;
 }
 
+// Person renames change no count/timestamp, so the key above can't see
+// them — the rename endpoint calls this to force a fresh regroup.
+export function bustFaceGroups(eventId) {
+  groupCache.delete(eventId);
+}
+
 // Lookalike window below the join threshold: group pairs this similar
 // didn't merge on their own but are close enough that a human should
 // confirm same vs different person. Tunable.
