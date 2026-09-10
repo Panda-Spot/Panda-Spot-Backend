@@ -27,6 +27,7 @@ import { startPhotoRetentionScheduler } from "./lib/photoRetention.js";
 import { startGuestDataRetentionScheduler } from "./lib/facePrivacy.js";
 import { startTokenMaintenanceScheduler } from "./lib/tokenMaintenance.js";
 import { startFaceIndexSweepScheduler } from "./lib/faceIndexSweep.js";
+import { startFaceRetentionScheduler } from "./lib/faceRetention.js";
 
 const app = express();
 
@@ -106,4 +107,5 @@ app.listen(PORT, () => {
   startGuestDataRetentionScheduler();
   startTokenMaintenanceScheduler();
   startFaceIndexSweepScheduler();
+  startFaceRetentionScheduler();
 });

@@ -21,7 +21,7 @@ import {
   uploadPartSize,
 } from "../lib/storage.js";
 import { getStorageProvider } from "../lib/storageProvider.js";
-import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces } from "../lib/faces.js";
+import { detectFacesForPhoto, indexExistingPhotoFaces, replacePhotoFaces, restorePhotoFaces, softDeletePhotoFaces } from "../lib/faces.js";
 import { createJob, emitJobEvent, getJob } from "../lib/jobQueue.js";
 import { groupNearDuplicates, loadPhotoBytes, renderVariant, startAnalyzeJob, suggestCovers } from "../lib/photoTools.js";
 import { loadAccessibleEvent } from "../lib/access.js";
@@ -2790,6 +2790,27 @@ router.post("/:id/photos/bulk-features", async (req, res, next) => {
       await prisma.photo.updateMany({ where: { id: { in: effectiveTargets } }, data });
     }
 
+    // Leaving AI Search deletes each photo's face closeups at once and
+    // stamps its embeddings for the 15-day hold (see lib/faces.js);
+    // rejoining restores the rows without a re-detect.
+    if (data.faceSearchVisible === false) {
+      for (const pid of effectiveTargets) {
+        try {
+          await softDeletePhotoFaces({ eventId: event.id, photoId: pid });
+        } catch (err) {
+          console.error(`Face cleanup failed on AI Search removal for photo ${pid}:`, err?.message || err);
+        }
+      }
+    } else if (data.faceSearchVisible === true) {
+      for (const pid of effectiveTargets) {
+        try {
+          await restorePhotoFaces({ photoId: pid });
+        } catch (err) {
+          console.error(`Face restore failed on AI Search re-add for photo ${pid}:`, err?.message || err);
+        }
+      }
+    }
+
     // Newly added-to-AI images that were never indexed need faces before
     // selfie search can return them — index in the background so a big
     // "select all" never blocks the response.
@@ -2921,6 +2942,22 @@ router.patch("/:id/photos/:photoId/features", async (req, res, next) => {
       where: { id: photo.id },
       data,
     });
+
+    // Same removal semantics as the bulk path above: closeups go at once,
+    // embeddings enter the 15-day hold; re-adding restores them.
+    if (data.faceSearchVisible === false) {
+      try {
+        await softDeletePhotoFaces({ eventId: event.id, photoId: photo.id });
+      } catch (err) {
+        console.error(`Face cleanup failed on AI Search removal for photo ${photo.id}:`, err?.message || err);
+      }
+    } else if (data.faceSearchVisible === true) {
+      try {
+        await restorePhotoFaces({ photoId: photo.id });
+      } catch (err) {
+        console.error(`Face restore failed on AI Search re-add for photo ${photo.id}:`, err?.message || err);
+      }
+    }
 
     res.json({
       photo_id: updated.id,

@@ -226,6 +226,34 @@ export async function indexExistingPhotoFaces(photo) {
 }
 
 /**
+ * AI-Search removal path: the photo leaves Face Search but its file stays
+ * in the manager. Face closeups are deleted from disk AT ONCE (rows keep
+ * bbox + embedding, thumbnailPath nulled), and rows are stamped deletedAt
+ * so the daily retention sweep can hard-purge embeddings past 15 days.
+ * Idempotent — re-removing an already-removed photo is a no-op.
+ */
+export async function softDeletePhotoFaces({ eventId, photoId }) {
+  await deletePhotoFacesDir(eventId, photoId).catch(() => {});
+  await prisma.face.updateMany({
+    where: { photoId, deletedAt: null },
+    data: { deletedAt: new Date(), thumbnailPath: null },
+  });
+}
+
+/**
+ * Re-add path (within the 15-day hold): resurrects the photo's faces so
+ * embeddings keep working without a costly re-detect. Closeups were
+ * deleted on removal — they lazy-regenerate on first serve via the files
+ * route backfill (bbox + space marker were retained).
+ */
+export async function restorePhotoFaces({ photoId }) {
+  await prisma.face.updateMany({
+    where: { photoId, deletedAt: { not: null } },
+    data: { deletedAt: null },
+  });
+}
+
+/**
  * Finds photos in an event whose faces best match a query embedding, using
  * pgvector cosine distance (`<=>`). Returns rows above `threshold`
  * similarity (1 - cosine distance), one row per matching photo, best

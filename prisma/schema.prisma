@@ -812,6 +812,13 @@ model Face {
   /// bytes where the detector ignores EXIF). The face-thumb backfill
   /// extracts from the matching canvas. Never touches grouping.
   bboxSpace String?
+  /// Soft-delete for the 15-day embedding retention: set when the photo
+  /// is removed from AI Search (face closeups are deleted immediately,
+  /// embeddings are held). Cleared if the photo rejoins within 15 days;
+  /// the daily face-retention sweep hard-deletes rows older than that.
+  /// Excluded from groups/search by every query (they join the photo's
+  /// faceSearchVisible flag), so grouping logic is untouched.
+  deletedAt DateTime?
   createdAt DateTime                @default(now())
 
   @@index([eventId])
