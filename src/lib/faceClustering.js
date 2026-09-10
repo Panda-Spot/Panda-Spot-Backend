@@ -75,10 +75,14 @@ export function resolveClusteringThreshold(event) {
 }
 
 export async function getFaceGroups(eventId, threshold) {
-  // Count + newest-row timestamp: any add, delete, or re-index changes
-  // the key, so cached representatives never point at deleted face ids.
-  const keyRows = await prisma.$queryRaw`SELECT COUNT(*)::int AS count, MAX("createdAt") AS newest FROM "Face" WHERE "eventId" = ${eventId}`;
-  const faceKey = `${keyRows?.[0]?.count ?? 0}|${keyRows?.[0]?.newest ? new Date(keyRows[0].newest).getTime() : 0}`;
+  // Count + newest-row timestamp + VISIBLE-face count: any add, delete,
+  // re-index, archive, or membership flip changes the key, so cached
+  // groups always reflect exactly the live AI-Search members — never
+  // deleted/removed photos. (Clustering itself below is untouched.)
+  const keyRows = await prisma.$queryRaw`SELECT COUNT(*)::int AS count, MAX(f."createdAt") AS newest,
+    COUNT(*) FILTER (WHERE p."approvalStatus" = 'approved' AND p."faceSearchVisible" = true AND p."archivedAt" IS NULL)::int AS visible
+    FROM "Face" f LEFT JOIN "Photo" p ON p.id = f."photoId" WHERE f."eventId" = ${eventId}`;
+  const faceKey = `${keyRows?.[0]?.count ?? 0}|${keyRows?.[0]?.newest ? new Date(keyRows[0].newest).getTime() : 0}|${keyRows?.[0]?.visible ?? 0}`;
   const faceCount = Number(keyRows?.[0]?.count ?? 0);
   if (faceCount === 0) {
     const empty = { groups: [], face_count: 0, group_count: 0, threshold };
